@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     mistral_api_key_2: str | None = None
     mistral_api_key_3: str | None = None
     mistral_api_keys: str | None = None
-    mistral_model: str = "mistral-small-latest"
+    mistral_model: str = "ministral-3b-2512"
 
     def get_groq_keys(self) -> list[str]:
         """Collect all configured Groq API keys."""

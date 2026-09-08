@@ -141,12 +141,21 @@ def _make_openrouter_client(key: str) -> AsyncOpenAI:
     )
 
 
+def _make_mistral_client(key: str) -> AsyncOpenAI:
+    return AsyncOpenAI(
+        api_key=key,
+        base_url="https://api.mistral.ai/v1",
+    )
+
+
 # Provider singleton pools and legacy test client references
 _groq_pool: Optional[ProviderKeyPool] = None
 _gemini_pool: Optional[ProviderKeyPool] = None
 _openrouter_pool: Optional[ProviderKeyPool] = None
+_mistral_pool: Optional[ProviderKeyPool] = None
 _gemini_client: Optional[AsyncOpenAI] = None
 _openrouter_client: Optional[AsyncOpenAI] = None
+_mistral_client: Optional[AsyncOpenAI] = None
 
 
 def get_groq_pool() -> ProviderKeyPool:
@@ -177,14 +186,27 @@ def get_openrouter_pool() -> ProviderKeyPool:
     return _openrouter_pool
 
 
+def get_mistral_pool() -> ProviderKeyPool:
+    global _mistral_pool, _mistral_client
+    if _mistral_client is not None:
+        return ProviderKeyPool("mistral", ["mock-mistral-key"], lambda k: _mistral_client)
+    keys = settings.get_mistral_keys()
+    if _mistral_pool is None or [s.key for s in _mistral_pool.slots] != keys:
+        _mistral_pool = ProviderKeyPool("mistral", keys, _make_mistral_client)
+    return _mistral_pool
+
+
 def reset_pools():
     """Reset singleton pools (primarily used in tests)."""
-    global _groq_pool, _gemini_pool, _openrouter_pool, _gemini_client, _openrouter_client
+    global _groq_pool, _gemini_pool, _openrouter_pool, _mistral_pool, _gemini_client, _openrouter_client, _mistral_client
     _groq_pool = None
     _gemini_pool = None
     _openrouter_pool = None
+    _mistral_pool = None
     _gemini_client = None
     _openrouter_client = None
+    _mistral_client = None
+
 
 
 def get_groq_client() -> AsyncGroq:
@@ -219,12 +241,14 @@ class LLMTarget:
 def get_generation_targets() -> List[LLMTarget]:
     """
     Build the ordered fallback chain for answer generation:
-    1. Groq configured model (e.g. openai/gpt-oss-120b) + Groq alternatives
-    2. Google Gemini (e.g. gemini-1.5-flash)
-    3. OpenRouter (e.g. meta-llama/llama-3.3-70b-instruct)
+    1. Groq configured model + alternatives (LPUs)
+    2. Mistral AI (e.g. ministral-3b-2512 - 500,000 TPM)
+    3. Google Gemini (e.g. gemini-flash-latest)
+    4. OpenRouter (e.g. meta-llama/llama-3.3-70b-instruct)
     """
     targets: List[LLMTarget] = []
     groq_pool = get_groq_pool()
+    mistral_pool = get_mistral_pool()
     gemini_pool = get_gemini_pool()
     openrouter_pool = get_openrouter_pool()
 
@@ -248,7 +272,16 @@ def get_generation_targets() -> List[LLMTarget]:
                     pool=groq_pool,
                 ))
 
-    # Tier 2: Google Gemini (if configured)
+    # Tier 2: Mistral AI (if configured - 500,000 TPM limit)
+    if mistral_pool.is_available():
+        targets.append(LLMTarget(
+            provider="mistral",
+            model=settings.mistral_model or "ministral-3b-2512",
+            client=mistral_pool.get_primary_client(),
+            pool=mistral_pool,
+        ))
+
+    # Tier 3: Google Gemini (if configured)
     if gemini_pool.is_available():
         primary_model = settings.gemini_model
         if primary_model in ("gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"):
@@ -267,7 +300,7 @@ def get_generation_targets() -> List[LLMTarget]:
                 pool=gemini_pool,
             ))
 
-    # Tier 3: OpenRouter (if configured)
+    # Tier 4: OpenRouter (if configured)
     if openrouter_pool.is_available():
         targets.append(LLMTarget(
             provider="openrouter",
@@ -286,6 +319,7 @@ def get_fast_targets() -> List[LLMTarget]:
     """
     targets: List[LLMTarget] = []
     groq_pool = get_groq_pool()
+    mistral_pool = get_mistral_pool()
     gemini_pool = get_gemini_pool()
     openrouter_pool = get_openrouter_pool()
 
@@ -305,7 +339,16 @@ def get_fast_targets() -> List[LLMTarget]:
                 pool=groq_pool,
             ))
 
-    # Tier 2: Gemini Flash
+    # Tier 2: Mistral AI fast models
+    if mistral_pool.is_available():
+        targets.append(LLMTarget(
+            provider="mistral",
+            model=settings.mistral_model or "ministral-3b-2512",
+            client=mistral_pool.get_primary_client(),
+            pool=mistral_pool,
+        ))
+
+    # Tier 3: Gemini Flash
     if gemini_pool.is_available():
         fast_model = settings.gemini_model
         if fast_model in ("gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"):
@@ -317,7 +360,7 @@ def get_fast_targets() -> List[LLMTarget]:
             pool=gemini_pool,
         ))
 
-    # Tier 3: OpenRouter
+    # Tier 4: OpenRouter
     if openrouter_pool.is_available():
         targets.append(LLMTarget(
             provider="openrouter",
@@ -327,6 +370,7 @@ def get_fast_targets() -> List[LLMTarget]:
         ))
 
     return targets
+
 
 
 def is_recoverable_error(err: Exception) -> bool:

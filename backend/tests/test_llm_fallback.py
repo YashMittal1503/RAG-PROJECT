@@ -62,8 +62,10 @@ class TestLLMTargetBuilding:
 
     def test_default_targets_groq_only(self):
         from app.config import Settings
-        with patch.object(Settings, "get_gemini_keys", return_value=[]), \
+        with patch.object(Settings, "get_mistral_keys", return_value=[]), \
+             patch.object(Settings, "get_gemini_keys", return_value=[]), \
              patch.object(Settings, "get_openrouter_keys", return_value=[]), \
+             patch("app.services.llm_provider._mistral_client", None), \
              patch("app.services.llm_provider._gemini_client", None), \
              patch("app.services.llm_provider._openrouter_client", None):
             targets = get_generation_targets()

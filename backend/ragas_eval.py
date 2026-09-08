@@ -205,10 +205,10 @@ class RotatingJudgeLLM(BaseChatModel):
         return "rotating-judge-llm"
 
 
-async def collect_evaluation_data(concurrency: int = 2) -> list[dict]:
+async def collect_evaluation_data(concurrency: int = 1) -> list[dict]:
     """
-    Run the RAG pipeline on all test questions freshly using an asyncio.Semaphore.
-    Uses concurrency=2 with a short pause to stay safely within Groq's 30,000 TPM limit.
+    Run the RAG pipeline on all test questions freshly using sequential pacing.
+    Processes 1 question at a time with a 2.0s pause to stay strictly within Groq's 30,000 TPM limit.
     """
     logger.info(f"Running fresh RAG pipeline on {len(EVAL_DATASET)} test questions with concurrency={concurrency}...")
     sem = asyncio.Semaphore(concurrency)
@@ -226,8 +226,8 @@ async def collect_evaluation_data(concurrency: int = 2) -> list[dict]:
                     f"[{index+1}/{len(EVAL_DATASET)}] Finished in {elapsed_ms:.0f}ms | "
                     f"Contexts: {len(result['contexts'])} | Answer: {len(result['answer'])} chars"
                 )
-                # Small pause to distribute token consumption evenly
-                await asyncio.sleep(0.5)
+                # 2.0-second pause to prevent token accumulation in Groq's 60s window
+                await asyncio.sleep(2.0)
                 return {
                     "question": q,
                     "ground_truth": gt,
@@ -302,10 +302,12 @@ def run_ragas_evaluation(results: list[dict]) -> dict:
         if mistral_keys:
             judge_provider = "Mistral AI"
             base_url = "https://api.mistral.ai/v1"
-            judge_model = settings.mistral_model or "mistral-small-latest"
+            judge_model = settings.mistral_model or "ministral-3b-2512"
+            if judge_model == "mistral-small-latest":
+                judge_model = "ministral-3b-2512"
             active_keys = mistral_keys
-            # Mistral allows 1 RPS (~60 RPM) and 500,000 TPM
-            max_workers = min(4, max(2, len(active_keys) * 2))
+            # ministral-3b-2512 supports 12.5 RPS and 500,000 TPM
+            max_workers = min(3, len(active_keys))
         elif gemini_keys:
             judge_provider = "Google Gemini Flash"
             base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -550,7 +552,7 @@ async def main():
 
     # Step 1: Run RAG pipeline on all test questions freshly
     t1_start = time.time()
-    raw_results = await collect_evaluation_data(concurrency=2)
+    raw_results = await collect_evaluation_data(concurrency=1)
     t1_elapsed = time.time() - t1_start
     logger.info(f"\nPhase 1 (Fresh RAG Generation) completed in {t1_elapsed:.1f}s")
 
