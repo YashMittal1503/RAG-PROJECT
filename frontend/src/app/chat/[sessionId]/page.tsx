@@ -10,6 +10,8 @@ import {
 } from "@/lib/api";
 import {
   Send,
+  ArrowUp,
+  ArrowDown,
   Loader2,
   FileText,
   FileSpreadsheet,
@@ -21,6 +23,12 @@ import {
   Pencil,
   Check,
   X,
+  Pin,
+  PinOff,
+  Share2,
+  Plus,
+  Mic,
+  Copy,
 } from "lucide-react";
 
 import ReactMarkdown from "react-markdown";
@@ -142,7 +150,6 @@ const markdownComponents = {
     const text = String(children).replace(/\n$/, "");
     const isShort = !text.includes("\n") && text.length < 60;
 
-    // Inline code (backticks) or short single-line fenced blocks → compact style
     if (inline || (!className && isShort)) {
       return (
         <code
@@ -154,7 +161,7 @@ const markdownComponents = {
       );
     }
     return (
-      <div className="relative my-3 rounded-xl overflow-hidden border border-[var(--border)] bg-[#0d1117]">
+      <div className="relative my-3 rounded-xl overflow-hidden border border-[var(--border)] bg-[#121214]">
         <pre className="p-3.5 overflow-x-auto font-mono text-xs text-slate-200">
           <code {...props}>{children}</code>
         </pre>
@@ -220,7 +227,7 @@ function CitationChip({
     <div className="inline-block animate-fade-in">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-[var(--primary)]/15 text-[var(--primary)] hover:bg-[var(--primary)]/25 transition-colors border border-[var(--primary)]/30 shadow-sm"
+        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-[var(--primary)]/15 text-[var(--primary)] hover:bg-[var(--primary)]/25 transition-colors border border-[var(--primary)]/30 shadow-xs cursor-pointer"
       >
         <span className="font-semibold">[{index + 1}]</span>
         <span className="max-w-[220px] truncate">{label}</span>
@@ -273,7 +280,21 @@ export default function ChatPage() {
         }
       } catch {}
     }
-    return "Conversation";
+    return "New conversation";
+  });
+
+  // Check if session is pinned
+  const [isPinned, setIsPinned] = useState<boolean>(() => {
+    if (typeof window !== "undefined" && sessionId) {
+      try {
+        const cached = localStorage.getItem("rag_pinned_sessions");
+        if (cached) {
+          const list = JSON.parse(cached);
+          return Array.isArray(list) && list.includes(sessionId);
+        }
+      } catch {}
+    }
+    return false;
   });
 
   const [input, setInput] = useState<string>(() => {
@@ -316,10 +337,27 @@ export default function ChatPage() {
   const [deleting, setDeleting] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [error, setError] = useState("");
+
+  // Claude header dropdown menu
+  const [isHeaderMenuOpen, setIsHeaderMenuOpen] = useState(false);
+  const [copiedShare, setCopiedShare] = useState(false);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+
+  // Scroll to bottom tracking
+  const [showScrollDown, setShowScrollDown] = useState(false);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  const handleScroll = () => {
+    const el = scrollContainerRef.current;
+    if (el) {
+      const isScrolledUp = el.scrollHeight - el.scrollTop - el.clientHeight > 140;
+      setShowScrollDown(isScrolledUp);
+    }
   };
 
   useEffect(() => {
@@ -334,6 +372,12 @@ export default function ChatPage() {
     try {
       const savedDraft = localStorage.getItem(`rag_draft_${sessionId}`) || "";
       setInput(savedDraft);
+
+      const cachedPinned = localStorage.getItem("rag_pinned_sessions");
+      if (cachedPinned) {
+        const list = JSON.parse(cachedPinned);
+        setIsPinned(Array.isArray(list) && list.includes(sessionId));
+      }
 
       const cached = localStorage.getItem(`rag_msgs_${sessionId}`);
       if (cached) {
@@ -378,6 +422,18 @@ export default function ChatPage() {
     };
   }, [sessionId]);
 
+  // Close header menu on outside click
+  useEffect(() => {
+    const handleOutsideClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest("[data-header-dropdown]")) {
+        setIsHeaderMenuOpen(false);
+      }
+    };
+    window.addEventListener("click", handleOutsideClick);
+    return () => window.removeEventListener("click", handleOutsideClick);
+  }, []);
+
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editedTitle, setEditedTitle] = useState("");
 
@@ -412,24 +468,60 @@ export default function ChatPage() {
     }
   };
 
+  const handleTogglePin = (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setIsHeaderMenuOpen(false);
+    if (typeof window !== "undefined") {
+      try {
+        const cached = localStorage.getItem("rag_pinned_sessions");
+        const list: string[] = cached ? JSON.parse(cached) : [];
+        const nextPinned = !isPinned;
+        const updated = nextPinned
+          ? [sessionId, ...list.filter((id) => id !== sessionId)]
+          : list.filter((id) => id !== sessionId);
+        localStorage.setItem("rag_pinned_sessions", JSON.stringify(updated));
+        setIsPinned(nextPinned);
+        window.dispatchEvent(new Event("chat-sessions-changed"));
+      } catch {}
+    }
+  };
+
+  const handleShare = () => {
+    if (typeof window !== "undefined") {
+      navigator.clipboard.writeText(window.location.href);
+      setCopiedShare(true);
+      setTimeout(() => setCopiedShare(false), 2000);
+    }
+  };
+
+  const handleCopyMessage = (msgId: string, content: string) => {
+    navigator.clipboard.writeText(content);
+    setCopiedMessageId(msgId);
+    setTimeout(() => setCopiedMessageId(null), 2000);
+  };
+
   const handleDeleteChat = async () => {
-    // Clear local cache
+    setDeleting(true);
     try {
       localStorage.removeItem(`rag_msgs_${sessionId}`);
       localStorage.removeItem(`rag_draft_${sessionId}`);
+      const cachedPinned = localStorage.getItem("rag_pinned_sessions");
+      if (cachedPinned) {
+        const list: string[] = JSON.parse(cachedPinned);
+        localStorage.setItem("rag_pinned_sessions", JSON.stringify(list.filter((id) => id !== sessionId)));
+      }
     } catch {}
 
-    // Optimistic — navigate away immediately
     window.dispatchEvent(
       new CustomEvent("chat-session-deleted", { detail: { sessionId } })
     );
     router.push("/dashboard");
 
-    // Fire-and-forget: delete in the background
     try {
       await deleteChatSession(sessionId);
     } catch {
       setError("Failed to delete chat session.");
+      setDeleting(false);
     }
   };
 
@@ -474,9 +566,7 @@ export default function ChatPage() {
 
         buffer += decoder.decode(value, { stream: true });
         
-        // SSE messages are separated by double newline \n\n
         const messages = buffer.split("\n\n");
-        // Keep the last potentially incomplete chunk in the buffer
         buffer = messages.pop() || "";
 
         for (const message of messages) {
@@ -486,52 +576,63 @@ export default function ChatPage() {
           let dataStr = "";
 
           for (const line of message.split("\n")) {
-            const trimmed = line.trim();
-            if (trimmed.startsWith("event:")) {
-              eventType = trimmed.slice(6).trim();
-            } else if (trimmed.startsWith("data:")) {
-              dataStr = trimmed.slice(5).trim();
+            if (line.startsWith("event: ")) {
+              eventType = line.slice(7).trim();
+            } else if (line.startsWith("data: ")) {
+              dataStr = line.slice(6);
             }
           }
 
-          if (!dataStr || dataStr === "{}") continue;
+          if (!dataStr) continue;
 
           try {
             const data = JSON.parse(dataStr);
 
-            if (eventType === "token" && data.token) {
-              fullContent += data.token;
+            if (eventType === "token") {
+              fullContent += data.token || "";
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId ? { ...m, content: fullContent } : m
+                )
+              );
+            } else if (eventType === "citation") {
               setMessages((prev) =>
                 prev.map((m) =>
                   m.id === assistantId
-                    ? { ...m, content: fullContent }
+                    ? {
+                        ...m,
+                        citations: [
+                          ...(m.citations || []),
+                          {
+                            chunk_id: data.chunk_id,
+                            filename: data.filename,
+                            page_number: data.page_number,
+                            row_range_start: data.row_range_start,
+                            row_range_end: data.row_range_end,
+                            content_preview: data.content_preview,
+                          },
+                        ],
+                      }
                     : m
                 )
               );
-            } else if (eventType === "sql_query" && data.sql) {
+            } else if (eventType === "sql") {
               setMessages((prev) =>
                 prev.map((m) =>
                   m.id === assistantId
-                    ? { ...m, sql_query: data.sql }
+                    ? { ...m, sql_query: data.query }
                     : m
                 )
               );
-            } else if (eventType === "citations" && data.citations) {
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId
-                    ? { ...m, citations: data.citations }
-                    : m
-                )
-              );
-            } else if (eventType === "title" && data.title) {
-              setSessionTitle(data.title);
+            } else if (eventType === "title") {
+              const newTitle = data.title;
+              setSessionTitle(newTitle);
               try {
                 const cachedSessions = localStorage.getItem("rag_sessions_cache");
                 if (cachedSessions) {
                   const list = JSON.parse(cachedSessions);
                   const updated = list.map((s: any) =>
-                    s.id === sessionId ? { ...s, title: data.title } : s
+                    s.id === sessionId ? { ...s, title: newTitle } : s
                   );
                   localStorage.setItem("rag_sessions_cache", JSON.stringify(updated));
                 }
@@ -554,7 +655,6 @@ export default function ChatPage() {
       );
     } finally {
       setStreaming(false);
-      // Persist full conversation with assistant reply into SWR cache
       setMessages((latest) => {
         if (typeof window !== "undefined" && sessionId) {
           try {
@@ -575,27 +675,24 @@ export default function ChatPage() {
 
   if (loading) {
     return (
-      <div className="flex-1 flex items-center justify-center">
+      <div className="flex-1 flex items-center justify-center bg-[var(--background)]">
         <Loader2 className="w-6 h-6 animate-spin text-[var(--muted-foreground)]" />
       </div>
     );
   }
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden">
-      {/* Chat header */}
-      <div className="border-b border-[var(--border)] px-6 py-3 flex items-center justify-between bg-[var(--background)]/80 backdrop-blur-xs flex-shrink-0">
-        <div className="flex items-center gap-2.5 min-w-0 flex-1 mr-4">
-          <div className="w-7 h-7 rounded-lg bg-[var(--primary)]/10 text-[var(--primary)] flex items-center justify-center flex-shrink-0">
-            <MessageSquare className="w-3.5 h-3.5" />
-          </div>
+    <div className="flex-1 flex flex-col overflow-hidden bg-[var(--background)] relative">
+      {/* Claude-style Chat Header */}
+      <div className="h-14 border-b border-[var(--border)]/60 px-6 flex items-center justify-between bg-[var(--background)]/90 backdrop-blur-xs flex-shrink-0 z-10">
+        <div className="flex items-center gap-2 min-w-0 flex-1 mr-4">
           {isEditingTitle ? (
             <form onSubmit={handleRenameTitle} className="flex items-center gap-1.5 min-w-0 max-w-sm">
               <input
                 type="text"
                 value={editedTitle}
                 onChange={(e) => setEditedTitle(e.target.value)}
-                className="text-sm font-semibold px-2 py-0.5 rounded border border-[var(--primary)] bg-[var(--background)] text-[var(--foreground)] focus:outline-none w-full"
+                className="text-sm font-medium px-2 py-0.5 rounded-lg border border-[var(--primary)] bg-[var(--card)] text-[var(--foreground)] focus:outline-none w-full"
                 autoFocus
                 onKeyDown={(e) => {
                   if (e.key === "Escape") setIsEditingTitle(false);
@@ -618,68 +715,117 @@ export default function ChatPage() {
               </button>
             </form>
           ) : (
-            <div className="flex items-center gap-2 min-w-0 group">
-              <h2
-                className="text-sm font-semibold truncate text-[var(--foreground)] cursor-pointer hover:text-[var(--primary)] transition-colors"
-                title="Click to rename"
-                onClick={() => {
-                  setEditedTitle(sessionTitle);
-                  setIsEditingTitle(true);
-                }}
-              >
-                {sessionTitle}
-              </h2>
+            /* Title with Claude-style chevron dropdown */
+            <div className="relative" data-header-dropdown>
               <button
-                onClick={() => {
-                  setEditedTitle(sessionTitle);
-                  setIsEditingTitle(true);
-                }}
-                title="Rename conversation"
-                className="opacity-0 group-hover:opacity-100 p-1 text-[var(--muted-foreground)] hover:text-[var(--foreground)] rounded transition-opacity cursor-pointer"
+                onClick={() => setIsHeaderMenuOpen(!isHeaderMenuOpen)}
+                className="flex items-center gap-1.5 px-2 py-1 -ml-2 rounded-lg text-sm font-medium text-[var(--foreground)] hover:bg-[var(--secondary)] transition-colors cursor-pointer group max-w-md"
               >
-                <Pencil className="w-3 h-3" />
+                <span className="truncate">{sessionTitle}</span>
+                <ChevronDown className={`w-3.5 h-3.5 text-[var(--muted-foreground)] group-hover:text-[var(--foreground)] transition-transform ${isHeaderMenuOpen ? "rotate-180" : ""}`} />
               </button>
+
+              {/* Header Dropdown Menu */}
+              {isHeaderMenuOpen && (
+                <div className="absolute left-0 top-full mt-1 w-44 bg-[var(--card)] border border-[var(--border)] rounded-xl shadow-xl py-1 z-50 animate-fade-in">
+                  <button
+                    onClick={handleTogglePin}
+                    className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[var(--foreground)] hover:bg-[var(--secondary)] transition-colors text-left cursor-pointer"
+                  >
+                    {isPinned ? (
+                      <>
+                        <PinOff className="w-3.5 h-3.5 text-[var(--muted-foreground)]" />
+                        <span>Unpin from top</span>
+                      </>
+                    ) : (
+                      <>
+                        <Pin className="w-3.5 h-3.5 text-[var(--primary)]" />
+                        <span>Pin to top</span>
+                      </>
+                    )}
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setIsHeaderMenuOpen(false);
+                      setEditedTitle(sessionTitle);
+                      setIsEditingTitle(true);
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-[var(--foreground)] hover:bg-[var(--secondary)] transition-colors text-left cursor-pointer"
+                  >
+                    <Pencil className="w-3.5 h-3.5 text-[var(--muted-foreground)]" />
+                    <span>Rename chat</span>
+                  </button>
+
+                  <div className="my-1 border-t border-[var(--border)]/60" />
+
+                  <button
+                    onClick={() => {
+                      setIsHeaderMenuOpen(false);
+                      setShowDeleteModal(true);
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-red-400 hover:bg-red-500/10 transition-colors text-left cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Delete chat</span>
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>
-        <button
-          onClick={() => setShowDeleteModal(true)}
-          title="Delete this conversation"
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-[var(--muted-foreground)] hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 transition-colors cursor-pointer flex-shrink-0"
-        >
-          <Trash2 className="w-3.5 h-3.5" />
-          <span>Delete chat</span>
-        </button>
+
+        {/* Header Right Actions: Share */}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleShare}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-[var(--foreground)] bg-[var(--secondary)] hover:bg-[var(--secondary)]/80 border border-[var(--border)] transition-colors cursor-pointer"
+          >
+            {copiedShare ? (
+              <>
+                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Copied!</span>
+              </>
+            ) : (
+              <>
+                <Share2 className="w-3.5 h-3.5 text-[var(--muted-foreground)]" />
+                <span>Share</span>
+              </>
+            )}
+          </button>
+        </div>
       </div>
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-6">
-        <div className="max-w-3xl mx-auto space-y-6">
+      {/* Messages Thread */}
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto px-4 py-8 relative"
+      >
+        <div className="max-w-3xl mx-auto space-y-7">
           {messages.length === 0 && (
-            /* Empty state */
-            <div className="text-center py-20 animate-fade-in">
-              <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-[var(--primary)]/10 mb-4">
-                <Sparkles className="w-8 h-8 text-[var(--primary)]" />
+            /* Claude-style clean empty state */
+            <div className="text-center py-20 animate-fade-in max-w-xl mx-auto">
+              <div className="inline-flex items-center justify-center w-12 h-12 rounded-2xl bg-[var(--primary)]/10 text-[var(--primary)] mb-5">
+                <Sparkles className="w-6 h-6" />
               </div>
-              <h3 className="text-lg font-medium">
-                Ask a question about your documents
-              </h3>
-              <p className="text-[var(--muted-foreground)] mt-2 max-w-md mx-auto">
-                I&apos;ll search through your uploaded documents and provide
-                answers with source citations.
+              <h2 className="text-xl font-serif font-medium tracking-tight text-[var(--foreground)]">
+                Start a document inquiry
+              </h2>
+              <p className="text-sm text-[var(--muted-foreground)] mt-2 leading-relaxed">
+                Ask questions about your uploaded PDFs, reports, spreadsheets, and notes with citations.
               </p>
-              <div className="mt-6 flex flex-wrap gap-2 justify-center">
+              <div className="mt-8 flex flex-wrap gap-2 justify-center">
                 {[
                   "What are the key findings?",
                   "Summarize the main points",
-                  "What's the total revenue?",
+                  "What is the total revenue?",
+                  "Compare quarterly figures",
                 ].map((q) => (
                   <button
                     key={q}
-                    onClick={() => {
-                      updateDraft(q);
-                    }}
-                    className="px-3 py-1.5 rounded-lg text-sm border border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:border-[var(--muted-foreground)] transition-colors"
+                    onClick={() => updateDraft(q)}
+                    className="px-3.5 py-2 rounded-xl text-xs border border-[var(--border)] bg-[var(--card)]/40 text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:border-neutral-500 hover:bg-[var(--secondary)] transition-all cursor-pointer shadow-xs"
                   >
                     {q}
                   </button>
@@ -691,90 +837,91 @@ export default function ChatPage() {
           {messages.map((msg) => (
             <div
               key={msg.id}
-              className={`flex gap-3 animate-slide-up ${
-                msg.role === "user" ? "justify-end" : "justify-start"
+              className={`flex flex-col group ${
+                msg.role === "user" ? "items-end" : "items-start"
               }`}
             >
-              {msg.role === "assistant" && (
-                <div className="w-8 h-8 rounded-lg bg-[var(--primary)] flex items-center justify-center flex-shrink-0 mt-1">
-                  <Sparkles className="w-4 h-4 text-white" />
+              {msg.role === "user" ? (
+                /* User Message: Elevated rounded pill on the right */
+                <div className="max-w-[82%] rounded-2xl bg-[#2b2b2e] text-[var(--foreground)] px-4 py-2.5 shadow-xs">
+                  <p className="whitespace-pre-wrap text-sm leading-relaxed">
+                    {msg.content}
+                  </p>
                 </div>
-              )}
+              ) : (
+                /* Assistant Message: Claude Document Flow */
+                <div className="w-full space-y-3">
+                  {msg.sql_query && (
+                    <details className="mb-2 group/sql">
+                      <summary className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20 cursor-pointer hover:bg-amber-500/15 transition-colors select-none">
+                        <FileSpreadsheet className="w-3 h-3" />
+                        <span>SQL Query</span>
+                        <ChevronDown className="w-3 h-3 group-open/sql:hidden" />
+                        <ChevronUp className="w-3 h-3 hidden group-open/sql:inline" />
+                      </summary>
+                      <pre className="mt-2 p-3 rounded-xl bg-[var(--card)] border border-[var(--border)] text-xs text-[var(--muted-foreground)] overflow-x-auto font-mono whitespace-pre-wrap">
+                        {msg.sql_query}
+                      </pre>
+                    </details>
+                  )}
 
-              <div
-                className={`max-w-[88%] min-w-0 ${
-                  msg.role === "user"
-                    ? "rounded-2xl rounded-br-md bg-[var(--primary)] text-white px-4 py-3"
-                    : "space-y-3"
-                }`}
-              >
-                {/* Message content */}
-                <div
-                  className={`${
-                    msg.role === "assistant"
-                      ? "rounded-2xl rounded-bl-md bg-[var(--card)] border border-[var(--border)] px-4 py-3 shadow-xs min-w-0 overflow-hidden"
-                      : ""
-                  }`}
-                >
-                  {msg.role === "user" ? (
-                    <p className="whitespace-pre-wrap text-sm leading-relaxed">
-                      {msg.content}
-                    </p>
-                  ) : (
-                    <div className="relative min-w-0 break-words">
-                      {msg.sql_query && (
-                        <details className="mb-3 group">
-                          <summary className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-violet-500/10 text-violet-400 border border-violet-500/20 cursor-pointer hover:bg-violet-500/15 transition-colors select-none">
-                            <FileSpreadsheet className="w-3 h-3" />
-                            <span>SQL Query</span>
-                            <ChevronDown className="w-3 h-3 group-open:hidden" />
-                            <ChevronUp className="w-3 h-3 hidden group-open:inline" />
-                          </summary>
-                          <pre className="mt-2 p-3 rounded-lg bg-[var(--background)] border border-[var(--border)] text-xs text-[var(--muted-foreground)] overflow-x-auto font-mono whitespace-pre-wrap">
-                            {msg.sql_query}
-                          </pre>
-                        </details>
+                  <div className="text-sm leading-relaxed text-[var(--foreground)] space-y-2">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={markdownComponents}
+                    >
+                      {formatMessageContent(msg.content, msg.citations)}
+                    </ReactMarkdown>
+
+                    {streaming &&
+                      msg.id.startsWith("assistant-") &&
+                      msg.content.length > 0 && (
+                        <span className="inline-block w-1.5 h-4 ml-1 align-middle bg-[var(--primary)] animate-pulse rounded-xs" />
                       )}
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        components={markdownComponents}
-                      >
-                        {formatMessageContent(msg.content, msg.citations)}
-                      </ReactMarkdown>
-                      {streaming &&
-                        msg.id.startsWith("assistant-") &&
-                        msg.content.length > 0 && (
-                          <span className="inline-block w-2 h-4 ml-1 align-middle bg-[var(--primary)] animate-pulse rounded-xs" />
-                        )}
+                  </div>
+
+                  {/* Citations */}
+                  {msg.citations && msg.citations.length > 0 && (
+                    <div className="flex flex-wrap gap-2 pt-2">
+                      {msg.citations.map((citation, i) => (
+                        <CitationChip
+                          key={citation.chunk_id}
+                          citation={citation}
+                          index={i}
+                        />
+                      ))}
                     </div>
                   )}
-                </div>
 
-                {/* Citations */}
-                {msg.citations && msg.citations.length > 0 && (
-                  <div className="flex flex-wrap gap-2 px-1">
-                    {msg.citations.map((citation, i) => (
-                      <CitationChip
-                        key={citation.chunk_id}
-                        citation={citation}
-                        index={i}
-                      />
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {msg.role === "user" && (
-                <div className="w-8 h-8 rounded-lg bg-[var(--secondary)] flex items-center justify-center flex-shrink-0 mt-1">
-                  <MessageSquare className="w-4 h-4 text-[var(--muted-foreground)]" />
+                  {/* Action toolbar on assistant reply */}
+                  {msg.content && !streaming && (
+                    <div className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-2 pt-1 text-[var(--muted-foreground)] text-xs">
+                      <button
+                        onClick={() => handleCopyMessage(msg.id, msg.content)}
+                        title="Copy answer"
+                        className="p-1 rounded hover:text-[var(--foreground)] transition-colors cursor-pointer flex items-center gap-1"
+                      >
+                        {copiedMessageId === msg.id ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            <span className="text-[11px] text-emerald-400">Copied</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            <span className="text-[11px]">Copy</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
           ))}
 
-          {/* Error message */}
           {error && (
-            <div className="rounded-lg bg-red-500/10 border border-red-500/20 px-4 py-3 text-sm text-red-400 animate-fade-in">
+            <div className="p-3.5 rounded-xl bg-red-500/10 border border-red-500/20 text-xs text-red-400 animate-fade-in">
               {error}
             </div>
           )}
@@ -783,35 +930,88 @@ export default function ChatPage() {
         </div>
       </div>
 
-      {/* Input bar */}
-      <div className="border-t border-[var(--border)] p-4">
-        <div className="max-w-3xl mx-auto flex gap-3">
-          <textarea
-            value={input}
-            onChange={(e) => updateDraft(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Ask a question about your documents..."
-            rows={1}
-            className="flex-1 resize-none rounded-xl border border-[var(--border)] bg-[var(--card)] px-4 py-3 text-sm outline-none transition-colors focus:border-[var(--primary)] focus:ring-1 focus:ring-[var(--primary)] placeholder:text-[var(--muted-foreground)]"
-            disabled={streaming}
-          />
-          <button
-            onClick={handleSend}
-            disabled={streaming || !input.trim()}
-            className="rounded-xl bg-[var(--primary)] px-4 py-3 text-white transition-all hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {streaming ? (
-              <Loader2 className="w-5 h-5 animate-spin" />
-            ) : (
-              <Send className="w-5 h-5" />
-            )}
-          </button>
+      {/* Floating Scroll to Bottom Button */}
+      {showScrollDown && (
+        <button
+          onClick={scrollToBottom}
+          title="Scroll to bottom"
+          aria-label="Scroll to bottom"
+          className="absolute bottom-28 right-8 z-30 p-2.5 rounded-full bg-[var(--card)] border border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)] shadow-xl transition-all hover:scale-105 cursor-pointer"
+        >
+          <ArrowDown className="w-4 h-4" />
+        </button>
+      )}
+
+      {/* Claude Signature Floating Prompt Bar */}
+      <div className="px-4 pb-4 pt-2 bg-gradient-to-t from-[var(--background)] via-[var(--background)]/90 to-transparent">
+        <div className="max-w-3xl mx-auto">
+          {/* Elevated Rounded Input Container */}
+          <div className="rounded-2xl bg-[var(--card)] border border-[var(--border)] shadow-xl p-3 focus-within:border-neutral-500/80 transition-all">
+            <div className="flex items-end gap-2.5">
+              {/* Attach Context (+) Button */}
+              <button
+                type="button"
+                onClick={() => router.push("/dashboard")}
+                title="View & Upload Documents"
+                className="p-2 rounded-xl text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--secondary)] transition-colors cursor-pointer flex-shrink-0 mb-0.5"
+              >
+                <Plus className="w-4 h-4" />
+              </button>
+
+              {/* Textarea */}
+              <textarea
+                value={input}
+                onChange={(e) => updateDraft(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Write a message..."
+                rows={1}
+                className="flex-1 resize-none bg-transparent px-1 py-1.5 text-sm outline-none placeholder:text-[var(--muted-foreground)] text-[var(--foreground)] leading-relaxed max-h-36 overflow-y-auto"
+                disabled={streaming}
+              />
+
+              {/* Voice / Mic Indicator (Claude style) */}
+              <button
+                type="button"
+                className="p-2 rounded-xl text-[var(--muted-foreground)]/60 hover:text-[var(--muted-foreground)] transition-colors cursor-pointer flex-shrink-0 hidden sm:block mb-0.5"
+                title="Voice input (coming soon)"
+              >
+                <Mic className="w-4 h-4" />
+              </button>
+
+              {/* Send Button (Claude Arrow Up pill) */}
+              <button
+                onClick={handleSend}
+                disabled={streaming || !input.trim()}
+                title="Send message"
+                className={`w-8 h-8 rounded-full flex items-center justify-center transition-all flex-shrink-0 mb-0.5 cursor-pointer ${
+                  input.trim() && !streaming
+                    ? "bg-[var(--primary)] text-white hover:opacity-90 shadow-sm"
+                    : "bg-[var(--secondary)] text-[var(--muted-foreground)]/50 cursor-not-allowed"
+                }`}
+              >
+                {streaming ? (
+                  <Loader2 className="w-4 h-4 animate-spin text-[var(--foreground)]" />
+                ) : (
+                  <ArrowUp className="w-4 h-4 stroke-[2.5]" />
+                )}
+              </button>
+            </div>
+          </div>
+
+          {/* Bottom Footer Metadata */}
+          <div className="mt-2 px-2 flex items-center justify-between text-[11px] text-[var(--muted-foreground)]/70">
+            <p>DocuChat is AI and can make mistakes. Please double-check responses.</p>
+            <div className="flex items-center gap-1 font-mono text-[10px] bg-[var(--secondary)]/60 px-2 py-0.5 rounded-full border border-[var(--border)]/60">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+              <span>Hybrid RAG • High</span>
+            </div>
+          </div>
         </div>
       </div>
 
       {/* Delete Confirmation Modal */}
       {showDeleteModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-fade-in">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 animate-fade-in">
           <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl max-w-sm w-full p-6 shadow-2xl animate-fade-in">
             <div className="w-10 h-10 rounded-xl bg-red-500/10 text-red-400 flex items-center justify-center mb-4">
               <Trash2 className="w-5 h-5" />
