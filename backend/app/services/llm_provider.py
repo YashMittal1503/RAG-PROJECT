@@ -250,16 +250,19 @@ def get_generation_targets() -> List[LLMTarget]:
 
     # Tier 2: Google Gemini (if configured)
     if gemini_pool.is_available():
+        primary_model = settings.gemini_model
+        if primary_model in ("gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"):
+            primary_model = "gemini-flash-latest"
         targets.append(LLMTarget(
             provider="gemini",
-            model=settings.gemini_model,
+            model=primary_model,
             client=gemini_pool.get_primary_client(),
             pool=gemini_pool,
         ))
-        if settings.gemini_model != "gemini-2.0-flash":
+        if primary_model != "gemini-3.6-flash":
             targets.append(LLMTarget(
                 provider="gemini",
-                model="gemini-2.0-flash",
+                model="gemini-3.6-flash",
                 client=gemini_pool.get_primary_client(),
                 pool=gemini_pool,
             ))
@@ -304,9 +307,12 @@ def get_fast_targets() -> List[LLMTarget]:
 
     # Tier 2: Gemini Flash
     if gemini_pool.is_available():
+        fast_model = settings.gemini_model
+        if fast_model in ("gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"):
+            fast_model = "gemini-flash-latest"
         targets.append(LLMTarget(
             provider="gemini",
-            model="gemini-1.5-flash",
+            model=fast_model,
             client=gemini_pool.get_primary_client(),
             pool=gemini_pool,
         ))

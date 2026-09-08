@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     gemini_api_key_2: str | None = None
     gemini_api_key_3: str | None = None
     gemini_api_keys: str | None = None
-    gemini_model: str = "gemini-1.5-flash"
+    gemini_model: str = "gemini-flash-latest"
 
     openrouter_api_key: str | None = None
     openrouter_api_key_2: str | None = None

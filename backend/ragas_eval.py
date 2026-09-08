@@ -295,7 +295,9 @@ def run_ragas_evaluation(results: list[dict]) -> dict:
         if gemini_keys:
             judge_provider = "Google Gemini Flash"
             base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-            judge_model = settings.gemini_model or "gemini-1.5-flash"
+            judge_model = settings.gemini_model
+            if not judge_model or judge_model in ("gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"):
+                judge_model = "gemini-flash-latest"
             active_keys = gemini_keys
             # Gemini Flash easily handles 4-8 parallel workers without rate limits
             max_workers = min(8, max(4, len(gemini_keys) * 2))
@@ -319,8 +321,8 @@ def run_ragas_evaluation(results: list[dict]) -> dict:
                     model=judge_model,
                     temperature=0.0,
                     max_tokens=2000,
-                    timeout=90,
-                    max_retries=3,
+                    timeout=60,
+                    max_retries=2,
                 )
                 for k in active_keys
             ]
@@ -332,8 +334,8 @@ def run_ragas_evaluation(results: list[dict]) -> dict:
                 model=judge_model,
                 temperature=0.0,
                 max_tokens=2000,
-                timeout=90,
-                max_retries=3,
+                timeout=60,
+                max_retries=2,
             )
             evaluator_llm = LangchainLLMWrapper(single_model)
 
@@ -372,7 +374,7 @@ def run_ragas_evaluation(results: list[dict]) -> dict:
         eval_result = evaluate(
             dataset=eval_dataset,
             metrics=metrics,
-            run_config=RunConfig(max_workers=max_workers, timeout=180, max_retries=5, max_wait=30),
+            run_config=RunConfig(max_workers=max_workers, timeout=60, max_retries=2, max_wait=10),
         )
 
         # Convert to dict
