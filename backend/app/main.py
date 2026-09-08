@@ -47,6 +47,7 @@ async def lifespan(app: FastAPI):
     # ── Startup ───────────────────────────────────────────────────────
     logger.info("Starting up — pre-warming services...")
     embedding.init_model()
+    embedding.init_sparse_model()
     reranker.init_ranker()
     warm_up_auth()
     await warm_up_db()

@@ -469,16 +469,19 @@ async def retrieve_chunks(
     3. If aggregation detected, also fetch summary chunks and prepend them
     """
     with logfire.span("rag.retrieve_chunks", question=question, is_aggregation=is_aggregation) as span:
-        # Embed the query
+        # Embed the query with dense vector (semantic) and sparse BM25 vector (keyword)
         query_vector = embedding.embed_query(question)
+        query_sparse = embedding.embed_sparse_query(question)
 
-        # Dense candidate retrieval — top 10 candidates for cross-encoder reranking
+        # Hybrid candidate retrieval (Dense + BM25 via server-side RRF) — top 10 candidates
         candidates = await vector_store.search(
             user_id=user_id,
             query_vector=query_vector,
+            query_sparse_vector=query_sparse,
             limit=10,
         )
         span.set_attribute("candidates_retrieved", len(candidates))
+        span.set_attribute("search_mode", "hybrid_rrf")
 
         # Cross-encoder reranking with FlashRank
         results = reranker.rerank_chunks(
