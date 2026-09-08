@@ -71,12 +71,24 @@ async def lifespan(app: FastAPI):
 
 # ── Create the FastAPI app ────────────────────────────────────────────────
 
+import logfire
+
+# Configure Logfire Observability
+if settings.logfire_token:
+    logfire.configure(token=settings.logfire_token, inspect_arguments=False)
+    logger.info("Logfire cloud observability enabled.")
+else:
+    logfire.configure(send_to_logfire=False, inspect_arguments=False)
+    logger.info("Logfire local structured tracing enabled (no token provided).")
+
 app = FastAPI(
     title="RAG Chatbot API",
     description="Document Q&A with streaming answers and source citations",
     version="1.0.0",
     lifespan=lifespan,
 )
+
+logfire.instrument_fastapi(app)
 
 # ── CORS middleware ───────────────────────────────────────────────────────
 # Allow the frontend origin. In production, this should be the Vercel URL.

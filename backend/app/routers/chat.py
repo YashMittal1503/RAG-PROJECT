@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import StreamingResponse
+import logfire
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
@@ -202,178 +203,154 @@ async def query(
 
     async def event_stream():
         """SSE event generator."""
-        try:
-            # Step 0: Classify intent — does this need document retrieval?
-            intent = await classify_intent(body.question, chat_history)
-            logger.info(f"Query intent: {intent} for '{body.question[:80]}'")
+        with logfire.span(
+            "rag.chat_flow",
+            session_id=str(session_id),
+            user_id=user_id,
+            question=body.question,
+        ) as chat_span:
+            try:
+                # Step 0: Classify intent — does this need document retrieval?
+                intent = await classify_intent(body.question, chat_history)
+                chat_span.set_attribute("intent", intent)
+                logger.info(f"Query intent: {intent} for '{body.question[:80]}'")
 
-            if intent == "chitchat":
-                # Direct response — no retrieval needed
+                if intent == "chitchat":
+                    chat_span.set_attribute("route", "chitchat")
+                    # Direct response — no retrieval needed
+                    full_response = ""
+                    async for token in generate_direct_response(body.question, chat_history):
+                        full_response += token
+                        yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+
+                    # No citations for chitchat
+                    yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
+
+                    # Save assistant message
+                    async with AsyncSessionLocal() as save_db:
+                        assistant_msg = ChatMessage(
+                            session_id=session_id,
+                            role="assistant",
+                            content=full_response,
+                            created_at=datetime.now(timezone.utc),
+                        )
+                        save_db.add(assistant_msg)
+                        await save_db.commit()
+
+                    yield f"event: done\ndata: {{}}\n\n"
+                    return
+
+                # Step 1: Rewrite query (for retrieve intent)
+                rewritten = await rewrite_query(body.question, chat_history)
+
+                # Step 2: Check if user has tabular data for SQL pipeline
+                has_tabular = await check_tabular_data(user_id)
+
+                if has_tabular:
+                    # ── Text-to-SQL path ──────────────────────────────
+                    schema_info = await get_schema_for_prompt(user_id)
+
+                    if schema_info:
+                        sql = await generate_sql_query(rewritten, schema_info, chat_history)
+
+                        if sql:
+                            chat_span.set_attribute("route", "sql")
+                            # Send the SQL query to the frontend for transparency
+                            yield f"event: sql_query\ndata: {json.dumps({'sql': sql})}\n\n"
+
+                            try:
+                                sql_result = await execute_sql_query(user_id, sql)
+                                sql_result_text = format_sql_result(sql_result)
+
+                                # Stream the LLM interpretation of the results
+                                full_response = ""
+                                async for token in generate_sql_answer_stream(
+                                    rewritten, sql, sql_result_text
+                                ):
+                                    full_response += token
+                                    yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+
+                                # No vector citations for SQL answers
+                                yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
+
+                                # Save assistant message
+                                async with AsyncSessionLocal() as save_db:
+                                    assistant_msg = ChatMessage(
+                                        session_id=session_id,
+                                        role="assistant",
+                                        content=full_response,
+                                        created_at=datetime.now(timezone.utc),
+                                    )
+                                    save_db.add(assistant_msg)
+                                    await save_db.commit()
+
+                                yield f"event: done\ndata: {{}}\n\n"
+                                return
+
+                            except Exception as sql_err:
+                                logger.warning(f"SQL execution failed, falling through to RAG pipeline: {sql_err}")
+                                # Fall through to RAG pipeline below
+
+                # Step 3: RAG path — detect aggregation
+                chat_span.set_attribute("route", "rag")
+                is_agg = detect_aggregation(rewritten)
+                chat_span.set_attribute("is_aggregation", is_agg)
+
+                # Step 4: Retrieve chunks
+                chunks = await retrieve_chunks(user_id, rewritten, is_agg)
+
+                if not chunks:
+                    # No documents or no relevant chunks found
+                    no_docs_msg = (
+                        "I don't have any documents to search through yet. "
+                        "Please upload some documents first, then ask your question again."
+                    )
+                    yield f"event: token\ndata: {json.dumps({'token': no_docs_msg})}\n\n"
+
+                    # Save assistant message
+                    async with AsyncSessionLocal() as save_db:
+                        assistant_msg = ChatMessage(
+                            session_id=session_id,
+                            role="assistant",
+                            content=no_docs_msg,
+                            created_at=datetime.now(timezone.utc),
+                        )
+                        save_db.add(assistant_msg)
+                        await save_db.commit()
+
+                    yield f"event: done\ndata: {{}}\n\n"
+                    return
+
+                # Step 5: Stream the answer
                 full_response = ""
-                async for token in generate_direct_response(body.question, chat_history):
+                async for token in generate_answer_stream(rewritten, chunks):
                     full_response += token
                     yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
 
-                # No citations for chitchat
-                yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
+                # Step 6: Validate citations
+                citations = validate_citations(full_response, chunks)
+                chat_span.set_attribute("citations_count", len(citations))
+                yield f"event: citations\ndata: {json.dumps({'citations': citations})}\n\n"
 
-                # Save assistant message
+                # Save assistant message with citations
                 async with AsyncSessionLocal() as save_db:
                     assistant_msg = ChatMessage(
                         session_id=session_id,
                         role="assistant",
                         content=full_response,
+                        citations=citations if citations else None,
                         created_at=datetime.now(timezone.utc),
                     )
                     save_db.add(assistant_msg)
                     await save_db.commit()
 
                 yield f"event: done\ndata: {{}}\n\n"
-                return
 
-            # Step 1: Rewrite query (for retrieve intent)
-            rewritten = await rewrite_query(body.question, chat_history)
-
-            # Step 2: Check if user has tabular data for SQL pipeline
-            has_tabular = await check_tabular_data(user_id)
-
-            if has_tabular:
-                # ── Text-to-SQL path ──────────────────────────────
-                schema_info = await get_schema_for_prompt(user_id)
-
-                if schema_info:
-                    sql = await generate_sql_query(rewritten, schema_info, chat_history)
-
-                    # If model didn't formulate custom SQL, provide an overview preview query
-                    # so tabular datasets are always analyzed rather than falling back to unrelated PDFs
-                    if not sql:
-                        tables = await get_tabular_tables(user_id)
-                        if tables:
-                            sql = f"SELECT * FROM {tables[0]} LIMIT 15"
-                            logger.info(f"Using tabular overview preview query: {sql}")
-
-                    if sql:
-                        # Send the SQL query to the frontend for transparency
-                        yield f"event: sql_query\ndata: {json.dumps({'sql': sql})}\n\n"
-
-                        try:
-                            sql_result = await execute_sql_query(user_id, sql)
-                            sql_result_text = format_sql_result(sql_result)
-
-                            # Stream the LLM interpretation of the results
-                            full_response = ""
-                            async for token in generate_sql_answer_stream(
-                                rewritten, sql, sql_result_text
-                            ):
-                                full_response += token
-                                yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
-
-                            # No vector citations for SQL answers
-                            yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
-
-                            # Save assistant message
-                            async with AsyncSessionLocal() as save_db:
-                                assistant_msg = ChatMessage(
-                                    session_id=session_id,
-                                    role="assistant",
-                                    content=full_response,
-                                    created_at=datetime.now(timezone.utc),
-                                )
-                                save_db.add(assistant_msg)
-                                await save_db.commit()
-
-                            yield f"event: done\ndata: {{}}\n\n"
-                            return
-
-                        except ValueError as sql_err:
-                            logger.warning(f"SQL execution failed, attempting fallback preview: {sql_err}")
-                            tables = await get_tabular_tables(user_id)
-                            preview_sql = f"SELECT * FROM {tables[0]} LIMIT 15" if tables else None
-                            if preview_sql and sql != preview_sql:
-                                try:
-                                    fb_res = await execute_sql_query(user_id, preview_sql)
-                                    fb_text = format_sql_result(fb_res)
-                                    yield f"event: sql_query\ndata: {json.dumps({'sql': preview_sql})}\n\n"
-                                    full_response = ""
-                                    async for token in generate_sql_answer_stream(
-                                        rewritten, preview_sql, fb_text
-                                    ):
-                                        full_response += token
-                                        yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
-
-                                    yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
-                                    async with AsyncSessionLocal() as save_db:
-                                        assistant_msg = ChatMessage(
-                                            session_id=session_id,
-                                            role="assistant",
-                                            content=full_response,
-                                            created_at=datetime.now(timezone.utc),
-                                        )
-                                        save_db.add(assistant_msg)
-                                        await save_db.commit()
-
-                                    yield f"event: done\ndata: {{}}\n\n"
-                                    return
-                                except Exception as fb_err:
-                                    logger.warning(f"Fallback preview failed: {fb_err}")
-                            # Fall through to RAG pipeline below
-
-            # Step 3: RAG path — detect aggregation
-            is_agg = detect_aggregation(rewritten)
-
-            # Step 4: Retrieve chunks
-            chunks = await retrieve_chunks(user_id, rewritten, is_agg)
-
-            if not chunks:
-                # No documents or no relevant chunks found
-                no_docs_msg = (
-                    "I don't have any documents to search through yet. "
-                    "Please upload some documents first, then ask your question again."
-                )
-                yield f"event: token\ndata: {json.dumps({'token': no_docs_msg})}\n\n"
-
-                # Save assistant message
-                async with AsyncSessionLocal() as save_db:
-                    assistant_msg = ChatMessage(
-                        session_id=session_id,
-                        role="assistant",
-                        content=no_docs_msg,
-                        created_at=datetime.now(timezone.utc),
-                    )
-                    save_db.add(assistant_msg)
-                    await save_db.commit()
-
-                yield f"event: done\ndata: {{}}\n\n"
-                return
-
-            # Step 5: Stream the answer
-            full_response = ""
-            async for token in generate_answer_stream(rewritten, chunks):
-                full_response += token
-                yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
-
-            # Step 6: Validate citations
-            citations = validate_citations(full_response, chunks)
-            yield f"event: citations\ndata: {json.dumps({'citations': citations})}\n\n"
-
-            # Save assistant message with citations
-            async with AsyncSessionLocal() as save_db:
-                assistant_msg = ChatMessage(
-                    session_id=session_id,
-                    role="assistant",
-                    content=full_response,
-                    citations=citations if citations else None,
-                    created_at=datetime.now(timezone.utc),
-                )
-                save_db.add(assistant_msg)
-                await save_db.commit()
-
-            yield f"event: done\ndata: {{}}\n\n"
-
-        except Exception as e:
-            logger.exception("Error during query processing")
-            error_msg = "Something went wrong generating a response. Please try again in a moment."
-            yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
+            except Exception as e:
+                logger.exception("Error during query processing")
+                chat_span.record_exception(e)
+                error_msg = "Something went wrong generating a response. Please try again in a moment."
+                yield f"event: error\ndata: {json.dumps({'message': error_msg})}\n\n"
 
     return StreamingResponse(
         event_stream(),

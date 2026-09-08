@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     # ── Frontend URL (for CORS) ───────────────────────────────────────────
     frontend_url: str = "http://localhost:3000"
 
+    # ── Observability (Logfire / OpenTelemetry) ───────────────────────────
+    logfire_token: str | None = None
+
 
 # Singleton — imported throughout the app
 settings = Settings()
