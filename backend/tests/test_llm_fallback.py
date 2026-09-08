@@ -15,6 +15,7 @@ from groq import APIError as GroqAPIError, RateLimitError as GroqRateLimitError
 from openai import APIError as OpenAIAPIError, RateLimitError as OpenAIRateLimitError
 import httpx
 
+from app.config import settings
 from app.services.llm_provider import (
     LLMTarget,
     get_generation_targets,
@@ -60,8 +61,9 @@ class TestLLMTargetBuilding:
     """Test resolution of multi-tier provider chains."""
 
     def test_default_targets_groq_only(self):
-        with patch("app.services.llm_provider.settings.gemini_api_key", None), \
-             patch("app.services.llm_provider.settings.openrouter_api_key", None), \
+        from app.config import Settings
+        with patch.object(Settings, "get_gemini_keys", return_value=[]), \
+             patch.object(Settings, "get_openrouter_keys", return_value=[]), \
              patch("app.services.llm_provider._gemini_client", None), \
              patch("app.services.llm_provider._openrouter_client", None):
             targets = get_generation_targets()

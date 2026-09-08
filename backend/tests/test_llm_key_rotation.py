@@ -67,6 +67,7 @@ class TestKeyConfigParsing:
 
     def test_numbered_keys_parsed(self):
         cfg = Settings(
+            _env_file=None,
             supabase_url="https://mock.supabase.co",
             supabase_key="mock-key",
             database_url="postgresql+asyncpg://mock",
@@ -87,6 +88,7 @@ class TestKeyConfigParsing:
 
     def test_comma_separated_keys_parsed(self):
         cfg = Settings(
+            _env_file=None,
             supabase_url="https://mock.supabase.co",
             supabase_key="mock-key",
             database_url="postgresql+asyncpg://mock",

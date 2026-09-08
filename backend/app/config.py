@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     openrouter_api_keys: str | None = None
     openrouter_model: str = "meta-llama/llama-3.3-70b-instruct"
 
+    # ── Mistral AI (High TPM & RAGAS Judge: https://console.mistral.ai) ────
+    mistral_api_key: str | None = None
+    mistral_api_key_2: str | None = None
+    mistral_api_key_3: str | None = None
+    mistral_api_keys: str | None = None
+    mistral_model: str = "mistral-small-latest"
+
     def get_groq_keys(self) -> list[str]:
         """Collect all configured Groq API keys."""
         return _parse_keys(
@@ -88,6 +95,15 @@ class Settings(BaseSettings):
             self.openrouter_api_key_2,
             self.openrouter_api_key_3,
             comma_separated=self.openrouter_api_keys,
+        )
+
+    def get_mistral_keys(self) -> list[str]:
+        """Collect all configured Mistral API keys."""
+        return _parse_keys(
+            self.mistral_api_key,
+            self.mistral_api_key_2,
+            self.mistral_api_key_3,
+            comma_separated=self.mistral_api_keys,
         )
 
 

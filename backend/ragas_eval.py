@@ -183,6 +183,7 @@ class RotatingJudgeLLM(BaseChatModel):
             raise RuntimeError("No judge models available in pool.")
         idx = self._current_idx % len(self.models)
         self._current_idx += 1
+        kwargs.pop("n", None)  # Ensure n=1 compatibility for non-OpenAI endpoints
         return self.models[idx]._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
     async def _agenerate(
@@ -196,6 +197,7 @@ class RotatingJudgeLLM(BaseChatModel):
             raise RuntimeError("No judge models available in pool.")
         idx = self._current_idx % len(self.models)
         self._current_idx += 1
+        kwargs.pop("n", None)  # Ensure n=1 compatibility for non-OpenAI endpoints
         return await self.models[idx]._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
     @property
@@ -203,12 +205,12 @@ class RotatingJudgeLLM(BaseChatModel):
         return "rotating-judge-llm"
 
 
-async def collect_evaluation_data(concurrency: int = 4) -> list[dict]:
+async def collect_evaluation_data(concurrency: int = 2) -> list[dict]:
     """
-    Run the RAG pipeline on all test questions concurrently using an asyncio.Semaphore.
-    Leverages multi-key rotation in llm_provider to distribute queries across keys simultaneously.
+    Run the RAG pipeline on all test questions freshly using an asyncio.Semaphore.
+    Uses concurrency=2 with a short pause to stay safely within Groq's 30,000 TPM limit.
     """
-    logger.info(f"Running RAG pipeline on {len(EVAL_DATASET)} test questions with concurrency={concurrency}...")
+    logger.info(f"Running fresh RAG pipeline on {len(EVAL_DATASET)} test questions with concurrency={concurrency}...")
     sem = asyncio.Semaphore(concurrency)
 
     async def _process_item(index: int, item: dict) -> dict:
@@ -224,6 +226,8 @@ async def collect_evaluation_data(concurrency: int = 4) -> list[dict]:
                     f"[{index+1}/{len(EVAL_DATASET)}] Finished in {elapsed_ms:.0f}ms | "
                     f"Contexts: {len(result['contexts'])} | Answer: {len(result['answer'])} chars"
                 )
+                # Small pause to distribute token consumption evenly
+                await asyncio.sleep(0.5)
                 return {
                     "question": q,
                     "ground_truth": gt,
@@ -251,6 +255,7 @@ async def collect_evaluation_data(concurrency: int = 4) -> list[dict]:
     tasks = [_process_item(i, item) for i, item in enumerate(EVAL_DATASET)]
     all_results = await asyncio.gather(*tasks)
     return list(all_results)
+
 
 
 def run_ragas_evaluation(results: list[dict]) -> dict:
@@ -287,20 +292,29 @@ def run_ragas_evaluation(results: list[dict]) -> dict:
         logger.info("=" * 60)
 
         # Select and configure Judge LLM:
-        # Offload to Google Gemini Flash if available (massive context, high rate limits),
-        # falling back gracefully to Groq.
+        # 1. Primary: Mistral AI (500k TPM, 128k context, 60 RPM — ideal for RAGAS eval)
+        # 2. Secondary: Google Gemini Flash (3 distinct projects, 60 RPM aggregate)
+        # 3. Tertiary: Groq (ultra-fast sub-second LPUs)
+        mistral_keys = settings.get_mistral_keys()
         gemini_keys = settings.get_gemini_keys()
         groq_keys = settings.get_groq_keys()
 
-        if gemini_keys:
+        if mistral_keys:
+            judge_provider = "Mistral AI"
+            base_url = "https://api.mistral.ai/v1"
+            judge_model = settings.mistral_model or "mistral-small-latest"
+            active_keys = mistral_keys
+            # Mistral allows 1 RPS (~60 RPM) and 500,000 TPM
+            max_workers = min(4, max(2, len(active_keys) * 2))
+        elif gemini_keys:
             judge_provider = "Google Gemini Flash"
             base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
             judge_model = settings.gemini_model
             if not judge_model or judge_model in ("gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"):
                 judge_model = "gemini-flash-latest"
             active_keys = gemini_keys
-            # Gemini Flash easily handles 4-8 parallel workers without rate limits
-            max_workers = min(8, max(4, len(gemini_keys) * 2))
+            # 3 distinct projects = 3 workers (1 worker per project quota)
+            max_workers = min(3, len(active_keys))
         else:
             judge_provider = "Groq (fallback)"
             base_url = "https://api.groq.com/openai/v1"
@@ -534,11 +548,11 @@ async def main():
     logger.info(f"   Test questions: {len(EVAL_DATASET)}")
     logger.info(f"   Timestamp: {datetime.now().isoformat()}")
 
-    # Step 1: Run RAG pipeline on all test questions concurrently
+    # Step 1: Run RAG pipeline on all test questions freshly
     t1_start = time.time()
-    raw_results = await collect_evaluation_data(concurrency=4)
+    raw_results = await collect_evaluation_data(concurrency=2)
     t1_elapsed = time.time() - t1_start
-    logger.info(f"\nPhase 1 (Concurrent RAG Generation) completed in {t1_elapsed:.1f}s")
+    logger.info(f"\nPhase 1 (Fresh RAG Generation) completed in {t1_elapsed:.1f}s")
 
     # Save raw results
     raw_path = os.path.join(os.path.dirname(__file__), "ragas_raw_results.json")
