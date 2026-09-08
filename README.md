@@ -10,7 +10,7 @@
 [![4-Tier LLM Fallback](https://img.shields.io/badge/LLM%20Orchestrator-4--Tier%20Failover-success)](https://github.com/YashMittal1503/RAG-PROJECT)
 [![Mistral AI](https://img.shields.io/badge/Mistral%20AI-RAGAS%20Judge-FD6F00?logo=mistralai&logoColor=white)](https://mistral.ai/)
 [![Pydantic Logfire](https://img.shields.io/badge/Logfire-Observability-E92063?logo=pydantic&logoColor=white)](https://logfire.pydantic.dev/)
-[![Tests: 70 Passing](https://img.shields.io/badge/Tests-70%20Passing-brightgreen)](backend/tests/)
+[![Tests: 78 Passing](https://img.shields.io/badge/Tests-78%20Passing-brightgreen)](backend/tests/)
 
 An enterprise-grade, full-stack Retrieval-Augmented Generation (RAG) and Text-to-SQL platform built for high reliability, zero downtime, and strict data grounding. Enables users to upload multiple unstructured documents (PDF, TXT) and structured spreadsheets (CSV, XLSX), query them with natural language, and receive sub-second token-streamed answers backed by validated citations and transparent SQL execution.
 
@@ -90,6 +90,7 @@ In production RAG systems, relying on a single LLM API key or a single provider 
 - **Zero-Vector Chitchat Routing:** Intent classifier separates social pleasantries (`"Hi"`, `"Thanks"`, `"What can you do?"`) from factual questions, eliminating unnecessary vector queries.
 - **Context-Aware Query Rewriting:** Rewrites multi-turn conversational follow-ups (e.g. `"tell me more"`, `"continue"`, `"what about his salary?"`) into standalone search queries under 20 words.
 - **Mathematical Citation Validation:** Algorithmic regex verification verifies that every cited page (`[Page X]`), row range (`[Rows Y-Z]`), or summary (`[Summary]`) genuinely exists in the retrieved context chunks, preventing hallucinated citations.
+- **Adaptive Multi-Turn Chat Auto-Naming:** Generates clean 2-to-5 word chat titles from user inquiries and assistant responses. Defeats initial conversational noise (`"hi"`) by remaining `"New conversation"` until substantive questions are asked, refining the title across turns 1–3, persisting to PostgreSQL, and streaming real-time updates via SSE with zero TTFT delay. Supports manual inline renaming.
 
 ### 5. Dynamic Synthetic Testset Generator & Parallel RAGAS Evaluation
 - **Corpus Auto-Discovery:** Scans Qdrant collections to discover all uploaded documents and generates grounded synthetic `{question, ground_truth}` pairs for newly added files using Mistral AI (`ministral-3b-2512`).
@@ -274,13 +275,13 @@ When a user uploads a `.csv` or `.xlsx` file:
 | **Authentication & Storage** | Supabase Auth & Storage | JWT session auth & document storage |
 | **Frontend Framework** | Next.js 16.3 (React 19, Turbopack) | Modern App Router dashboard and streaming chat UI |
 | **Styling & UI** | Tailwind CSS v4, Lucide React | Glassmorphism dark interface, responsive Markdown tables |
-| **CI / CD Pipeline** | GitHub Actions | Ubuntu runner executing 70 backend unit tests + Next.js build |
+| **CI / CD Pipeline** | GitHub Actions | Ubuntu runner executing 78 backend unit tests + Next.js build |
 
 ---
 
 ## Automated Testing & CI/CD
 
-The project maintains a rigorous test suite of **70 unit and integration tests** that execute in under 5 seconds with **zero external API dependencies** (using mocks, local embeddings, and isolated in-memory fixtures):
+The project maintains a rigorous test suite of **78 unit and integration tests** that execute in under 5 seconds with **zero external API dependencies** (using mocks, local embeddings, and isolated in-memory fixtures):
 
 ```bash
 cd backend
@@ -290,21 +291,23 @@ cd backend
 ```text
 ============================= test session starts =============================
 platform win32 -- Python 3.12.4, pytest-9.1.1, pluggy-1.6.0
-collected 70 items
+collected 78 items
 
-backend/tests/test_chunking.py .........................                 [ 35%]
-backend/tests/test_citation_validation.py ..........                     [ 50%]
-backend/tests/test_contextual_compression.py .....                       [ 57%]
-backend/tests/test_file_validation.py ........                           [ 68%]
-backend/tests/test_hybrid_search.py .....                                [ 75%]
-backend/tests/test_llm_fallback.py ........                              [ 87%]
+backend/tests/test_chat_title.py ........                                [ 10%]
+backend/tests/test_chunking.py .........................                 [ 42%]
+backend/tests/test_citation_validation.py ..........                     [ 55%]
+backend/tests/test_contextual_compression.py .....                       [ 61%]
+backend/tests/test_file_validation.py ........                           [ 71%]
+backend/tests/test_hybrid_search.py .....                                [ 78%]
+backend/tests/test_llm_fallback.py ........                              [ 88%]
 backend/tests/test_llm_key_rotation.py .......                           [ 97%]
 backend/tests/test_parsing.py ..                                         [100%]
 
-============================== 70 passed in 4.19s ==============================
+============================== 78 passed in 4.85s ==============================
 ```
 
 ### Test Suite Directory:
+- `tests/test_chat_title.py`: Normalization/cleaning of LLM title outputs (2–5 words), social pleasantry detection, substantive topic synthesis from question + answer, error fallbacks, and session PATCH endpoint.
 - `tests/test_llm_key_rotation.py`: Multi-key round-robin rotation, 429 quarantine isolation, cooldown recovery, and all-keys-quarantined graceful fallback.
 - `tests/test_llm_fallback.py`: 4-tier cascading cross-provider fallback (Groq $\rightarrow$ Mistral $\rightarrow$ Gemini $\rightarrow$ OpenRouter) for streaming and non-streaming calls, mid-stream failure recovery.
 - `tests/test_contextual_compression.py`: Sentence keyword scoring, density bonus, window expansion ($\pm 1$), short-chunk bypass, zero-match fallback, and citation preservation.

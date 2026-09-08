@@ -6,6 +6,7 @@ import {
   getChatMessagesWithMetadata,
   deleteChatSession,
   sendQuery,
+  updateChatSession,
 } from "@/lib/api";
 import {
   Send,
@@ -17,6 +18,9 @@ import {
   MessageSquare,
   Sparkles,
   Trash2,
+  Pencil,
+  Check,
+  X,
 } from "lucide-react";
 
 import ReactMarkdown from "react-markdown";
@@ -272,7 +276,41 @@ export default function ChatPage() {
     return "Conversation";
   });
 
-  const [input, setInput] = useState("");
+  const [input, setInput] = useState<string>(() => {
+    if (typeof window !== "undefined" && sessionId) {
+      try {
+        return localStorage.getItem(`rag_draft_${sessionId}`) || "";
+      } catch {}
+    }
+    return "";
+  });
+
+  // Synchronously update input draft when switching between chat sessions
+  const [prevSessionId, setPrevSessionId] = useState(sessionId);
+  if (prevSessionId !== sessionId) {
+    setPrevSessionId(sessionId);
+    let draft = "";
+    if (typeof window !== "undefined" && sessionId) {
+      try {
+        draft = localStorage.getItem(`rag_draft_${sessionId}`) || "";
+      } catch {}
+    }
+    setInput(draft);
+  }
+
+  const updateDraft = (val: string) => {
+    setInput(val);
+    if (typeof window !== "undefined" && sessionId) {
+      try {
+        if (val) {
+          localStorage.setItem(`rag_draft_${sessionId}`, val);
+        } else {
+          localStorage.removeItem(`rag_draft_${sessionId}`);
+        }
+      } catch {}
+    }
+  };
+
   const [streaming, setStreaming] = useState(false);
   const [loading, setLoading] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -294,6 +332,9 @@ export default function ChatPage() {
 
     // 1. Immediately hydrate from cache on route/session switch
     try {
+      const savedDraft = localStorage.getItem(`rag_draft_${sessionId}`) || "";
+      setInput(savedDraft);
+
       const cached = localStorage.getItem(`rag_msgs_${sessionId}`);
       if (cached) {
         const parsed = JSON.parse(cached);
@@ -337,10 +378,45 @@ export default function ChatPage() {
     };
   }, [sessionId]);
 
+  const [isEditingTitle, setIsEditingTitle] = useState(false);
+  const [editedTitle, setEditedTitle] = useState("");
+
+  const handleRenameTitle = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const trimmed = editedTitle.trim();
+    if (!trimmed || trimmed === sessionTitle) {
+      setIsEditingTitle(false);
+      return;
+    }
+
+    setSessionTitle(trimmed);
+    setIsEditingTitle(false);
+
+    try {
+      const cachedSessions = localStorage.getItem("rag_sessions_cache");
+      if (cachedSessions) {
+        const list = JSON.parse(cachedSessions);
+        const updated = list.map((s: any) =>
+          s.id === sessionId ? { ...s, title: trimmed } : s
+        );
+        localStorage.setItem("rag_sessions_cache", JSON.stringify(updated));
+      }
+    } catch {}
+
+    window.dispatchEvent(new Event("chat-sessions-changed"));
+
+    try {
+      await updateChatSession(sessionId, trimmed);
+    } catch {
+      // Silently ignore or let SWR revalidate
+    }
+  };
+
   const handleDeleteChat = async () => {
     // Clear local cache
     try {
       localStorage.removeItem(`rag_msgs_${sessionId}`);
+      localStorage.removeItem(`rag_draft_${sessionId}`);
     } catch {}
 
     // Optimistic — navigate away immediately
@@ -361,7 +437,7 @@ export default function ChatPage() {
     if (!input.trim() || streaming) return;
 
     const question = input.trim();
-    setInput("");
+    updateDraft("");
     setError("");
 
     // Add user message
@@ -448,6 +524,19 @@ export default function ChatPage() {
                     : m
                 )
               );
+            } else if (eventType === "title" && data.title) {
+              setSessionTitle(data.title);
+              try {
+                const cachedSessions = localStorage.getItem("rag_sessions_cache");
+                if (cachedSessions) {
+                  const list = JSON.parse(cachedSessions);
+                  const updated = list.map((s: any) =>
+                    s.id === sessionId ? { ...s, title: data.title } : s
+                  );
+                  localStorage.setItem("rag_sessions_cache", JSON.stringify(updated));
+                }
+              } catch {}
+              window.dispatchEvent(new Event("chat-sessions-changed"));
             } else if (eventType === "error") {
               setError(
                 data.message ||
@@ -496,18 +585,67 @@ export default function ChatPage() {
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Chat header */}
       <div className="border-b border-[var(--border)] px-6 py-3 flex items-center justify-between bg-[var(--background)]/80 backdrop-blur-xs flex-shrink-0">
-        <div className="flex items-center gap-2.5 min-w-0">
+        <div className="flex items-center gap-2.5 min-w-0 flex-1 mr-4">
           <div className="w-7 h-7 rounded-lg bg-[var(--primary)]/10 text-[var(--primary)] flex items-center justify-center flex-shrink-0">
             <MessageSquare className="w-3.5 h-3.5" />
           </div>
-          <h2 className="text-sm font-semibold truncate text-[var(--foreground)]">
-            {sessionTitle}
-          </h2>
+          {isEditingTitle ? (
+            <form onSubmit={handleRenameTitle} className="flex items-center gap-1.5 min-w-0 max-w-sm">
+              <input
+                type="text"
+                value={editedTitle}
+                onChange={(e) => setEditedTitle(e.target.value)}
+                className="text-sm font-semibold px-2 py-0.5 rounded border border-[var(--primary)] bg-[var(--background)] text-[var(--foreground)] focus:outline-none w-full"
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setIsEditingTitle(false);
+                }}
+              />
+              <button
+                type="submit"
+                title="Save title"
+                className="p-1 text-emerald-400 hover:text-emerald-300 transition-colors cursor-pointer"
+              >
+                <Check className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsEditingTitle(false)}
+                title="Cancel"
+                className="p-1 text-[var(--muted-foreground)] hover:text-[var(--foreground)] transition-colors cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </form>
+          ) : (
+            <div className="flex items-center gap-2 min-w-0 group">
+              <h2
+                className="text-sm font-semibold truncate text-[var(--foreground)] cursor-pointer hover:text-[var(--primary)] transition-colors"
+                title="Click to rename"
+                onClick={() => {
+                  setEditedTitle(sessionTitle);
+                  setIsEditingTitle(true);
+                }}
+              >
+                {sessionTitle}
+              </h2>
+              <button
+                onClick={() => {
+                  setEditedTitle(sessionTitle);
+                  setIsEditingTitle(true);
+                }}
+                title="Rename conversation"
+                className="opacity-0 group-hover:opacity-100 p-1 text-[var(--muted-foreground)] hover:text-[var(--foreground)] rounded transition-opacity cursor-pointer"
+              >
+                <Pencil className="w-3 h-3" />
+              </button>
+            </div>
+          )}
         </div>
         <button
           onClick={() => setShowDeleteModal(true)}
           title="Delete this conversation"
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-[var(--muted-foreground)] hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 transition-colors cursor-pointer"
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-[var(--muted-foreground)] hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 transition-colors cursor-pointer flex-shrink-0"
         >
           <Trash2 className="w-3.5 h-3.5" />
           <span>Delete chat</span>
@@ -539,7 +677,7 @@ export default function ChatPage() {
                   <button
                     key={q}
                     onClick={() => {
-                      setInput(q);
+                      updateDraft(q);
                     }}
                     className="px-3 py-1.5 rounded-lg text-sm border border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:border-[var(--muted-foreground)] transition-colors"
                   >
@@ -650,7 +788,7 @@ export default function ChatPage() {
         <div className="max-w-3xl mx-auto flex gap-3">
           <textarea
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => updateDraft(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Ask a question about your documents..."
             rows={1}

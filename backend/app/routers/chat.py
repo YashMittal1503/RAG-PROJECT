@@ -24,6 +24,7 @@ from app.schemas import (
     ChatMessageResponse,
     ChatSessionCreate,
     ChatSessionResponse,
+    ChatSessionUpdate,
     QueryRequest,
 )
 from app.services.query import (
@@ -33,6 +34,7 @@ from app.services.query import (
     execute_sql_query,
     format_sql_result,
     generate_answer_stream,
+    generate_chat_title,
     generate_direct_response,
     generate_sql_answer_stream,
     generate_sql_query,
@@ -124,6 +126,31 @@ async def delete_session(
     return None
 
 
+@router.patch("/sessions/{session_id}", response_model=ChatSessionResponse)
+async def update_session(
+    session_id: uuid.UUID,
+    body: ChatSessionUpdate,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a chat session's title."""
+    result = await db.execute(
+        select(ChatSession).where(
+            ChatSession.id == session_id,
+            ChatSession.user_id == uuid.UUID(user_id),
+        )
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+
+    session.title = body.title.strip()
+    await db.commit()
+    await db.refresh(session)
+    return ChatSessionResponse.model_validate(session)
+
+
+
 @router.get("/sessions/{session_id}/messages", response_model=list[ChatMessageResponse])
 async def get_messages(
     session_id: uuid.UUID,
@@ -176,8 +203,10 @@ async def query(
                 ChatSession.user_id == uuid.UUID(user_id),
             )
         )
-        if not result.scalar_one_or_none():
+        session_obj = result.scalar_one_or_none()
+        if not session_obj:
             raise HTTPException(status_code=404, detail="Chat session not found.")
+        current_session_title = session_obj.title or "New conversation"
 
         # Save the user message
         user_msg = ChatMessage(
@@ -189,7 +218,7 @@ async def query(
         db.add(user_msg)
         await db.commit()
 
-        # Get chat history for query rewrite
+        # Get chat history for query rewrite and title synthesis
         result = await db.execute(
             select(ChatMessage)
             .where(ChatMessage.session_id == session_id)
@@ -200,6 +229,37 @@ async def query(
             {"role": m.role, "content": m.content}
             for m in all_messages[:-1]  # Exclude the just-added user message
         ]
+        user_message_count = len([m for m in all_messages if m.role == "user"])
+
+    async def _maybe_update_session_title(full_response: str) -> str | None:
+        nonlocal current_session_title
+        # Auto-name or refine title during the first 3 user messages
+        if user_message_count <= 3:
+            try:
+                new_title = await generate_chat_title(
+                    chat_history=chat_history,
+                    current_question=body.question,
+                    current_answer=full_response,
+                )
+                if (
+                    new_title
+                    and new_title != "New conversation"
+                    and new_title.strip().lower() != current_session_title.strip().lower()
+                ):
+                    async with AsyncSessionLocal() as title_db:
+                        res = await title_db.execute(
+                            select(ChatSession).where(ChatSession.id == session_id)
+                        )
+                        s_to_update = res.scalar_one_or_none()
+                        if s_to_update:
+                            s_to_update.title = new_title
+                            await title_db.commit()
+                            current_session_title = new_title
+                            logger.info(f"Updated session {session_id} title: '{new_title}'")
+                            return new_title
+            except Exception as e:
+                logger.warning(f"Failed to auto-generate or save session title: {e}")
+        return None
 
     async def event_stream():
         """SSE event generator."""
@@ -236,6 +296,11 @@ async def query(
                         )
                         save_db.add(assistant_msg)
                         await save_db.commit()
+
+                    # Check for title update
+                    new_title = await _maybe_update_session_title(full_response)
+                    if new_title:
+                        yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
 
                     yield f"event: done\ndata: {{}}\n\n"
                     return
@@ -283,6 +348,11 @@ async def query(
                                     )
                                     save_db.add(assistant_msg)
                                     await save_db.commit()
+
+                                # Check for title update
+                                new_title = await _maybe_update_session_title(full_response)
+                                if new_title:
+                                    yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
 
                                 yield f"event: done\ndata: {{}}\n\n"
                                 return
@@ -343,6 +413,11 @@ async def query(
                     )
                     save_db.add(assistant_msg)
                     await save_db.commit()
+
+                # Step 7: Auto-name / refine chat title
+                new_title = await _maybe_update_session_title(full_response)
+                if new_title:
+                    yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
 
                 yield f"event: done\ndata: {{}}\n\n"
 

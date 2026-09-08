@@ -205,6 +205,22 @@ export async function getChatSession(sessionId: string): Promise<any> {
 }
 
 /**
+ * Update a chat session (e.g. rename title).
+ */
+export async function updateChatSession(
+  sessionId: string,
+  title: string
+): Promise<any> {
+  const response = await apiRequest(`/api/chat/sessions/${sessionId}`, {
+    method: "PATCH",
+    body: JSON.stringify({ title }),
+  });
+  if (!response.ok) throw new Error("Failed to update chat session");
+  return response.json();
+}
+
+
+/**
  * Delete a chat session.
  */
 export async function deleteChatSession(sessionId: string): Promise<void> {
