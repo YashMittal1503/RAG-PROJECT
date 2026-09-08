@@ -57,6 +57,11 @@ const STATUS_CONFIG: Record<
     label: "Embedding",
     color: "text-indigo-400 bg-indigo-400/10",
   },
+  storing: {
+    icon: <Loader2 className="w-3.5 h-3.5 animate-spin" />,
+    label: "Storing",
+    color: "text-violet-400 bg-violet-400/10",
+  },
   ready: {
     icon: <CheckCircle2 className="w-3.5 h-3.5" />,
     label: "Ready",
@@ -88,8 +93,26 @@ function formatFileSize(bytes: number): string {
 }
 
 export default function DashboardPage() {
-  const [documents, setDocuments] = useState<Document[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Initialize from localStorage if available for instant 0ms render
+  const [documents, setDocuments] = useState<Document[]>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const cached = localStorage.getItem("rag_documents_cache");
+        if (cached) return JSON.parse(cached);
+      } catch {}
+    }
+    return [];
+  });
+  // If we already have cached documents, render immediately without blocking spinner
+  const [loading, setLoading] = useState<boolean>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const cached = localStorage.getItem("rag_documents_cache");
+        if (cached !== null) return false;
+      } catch {}
+    }
+    return true;
+  });
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [uploadErrors, setUploadErrors] = useState<{ filename: string; error: string }[]>([]);
@@ -99,6 +122,11 @@ export default function DashboardPage() {
     try {
       const docs = await getDocuments();
       setDocuments(docs);
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem("rag_documents_cache", JSON.stringify(docs));
+        } catch {}
+      }
     } catch {
       // Will retry on next load
     } finally {
@@ -135,7 +163,14 @@ export default function DashboardPage() {
         }
       }
 
-      if (updated) setDocuments(newDocs);
+      if (updated) {
+        setDocuments(newDocs);
+        if (typeof window !== "undefined") {
+          try {
+            sessionStorage.setItem("rag_documents_cache", JSON.stringify(newDocs));
+          } catch {}
+        }
+      }
     }, 2000);
 
     return () => clearInterval(interval);
@@ -165,7 +200,13 @@ export default function DashboardPage() {
   const handleDelete = async (docId: string) => {
     try {
       await deleteDocument(docId);
-      setDocuments((prev) => prev.filter((d) => d.id !== docId));
+      const updated = documents.filter((d) => d.id !== docId);
+      setDocuments(updated);
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem("rag_documents_cache", JSON.stringify(updated));
+        } catch {}
+      }
     } catch {
       // Show error toast in production
     }
@@ -269,8 +310,24 @@ export default function DashboardPage() {
 
         {/* Document List */}
         {loading ? (
-          <div className="flex items-center justify-center py-12">
-            <Loader2 className="w-6 h-6 animate-spin text-[var(--muted-foreground)]" />
+          <div className="space-y-3 py-4">
+            <div className="flex items-center justify-center gap-2 text-sm text-[var(--muted-foreground)] py-6">
+              <Loader2 className="w-5 h-5 animate-spin text-[var(--primary)]" />
+              <span>Loading documents...</span>
+            </div>
+            {[1, 2, 3].map((i) => (
+              <div
+                key={i}
+                className="flex items-center gap-4 rounded-xl border border-[var(--border)] bg-[var(--card)]/50 px-4 py-3 animate-pulse"
+              >
+                <div className="w-10 h-10 rounded-lg bg-[var(--secondary)]" />
+                <div className="flex-1 space-y-2">
+                  <div className="h-4 bg-[var(--secondary)] rounded w-1/3" />
+                  <div className="h-3 bg-[var(--secondary)] rounded w-1/5" />
+                </div>
+                <div className="h-6 w-16 bg-[var(--secondary)] rounded-full" />
+              </div>
+            ))}
           </div>
         ) : documents.length === 0 ? (
           /* Empty State */

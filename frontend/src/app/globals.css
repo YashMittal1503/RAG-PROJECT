@@ -144,3 +144,14 @@ body {
   background-size: 200% 100%;
   animation: shimmer 2s infinite;
 }
+
+/* ── Markdown Table Styles ────────────────────────────────────────────── */
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th, td {
+  border-color: var(--border);
+}

@@ -3,8 +3,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
-  getChatMessages,
-  getChatSession,
+  getChatMessagesWithMetadata,
   deleteChatSession,
   sendQuery,
 } from "@/lib/api";
@@ -37,6 +36,7 @@ type Message = {
   role: "user" | "assistant";
   content: string;
   citations?: Citation[];
+  sql_query?: string;
 };
 
 function formatMessageContent(content: string, citations?: Citation[]): string {
@@ -135,7 +135,11 @@ const markdownComponents = {
     <em className="italic text-[var(--foreground)]/90">{children}</em>
   ),
   code: ({ inline, className, children, ...props }: any) => {
-    if (inline) {
+    const text = String(children).replace(/\n$/, "");
+    const isShort = !text.includes("\n") && text.length < 60;
+
+    // Inline code (backticks) or short single-line fenced blocks → compact style
+    if (inline || (!className && isShort)) {
       return (
         <code
           className="px-1.5 py-0.5 rounded-md bg-[var(--secondary)] text-[var(--primary)] font-mono text-xs border border-[var(--border)]"
@@ -159,6 +163,38 @@ const markdownComponents = {
     </blockquote>
   ),
   hr: () => <hr className="my-4 border-[var(--border)]" />,
+  table: ({ children }: any) => (
+    <div className="my-3 w-full overflow-x-auto rounded-xl border border-[var(--border)] bg-[var(--secondary)]/30 shadow-xs">
+      <table className="w-full text-left text-xs border-collapse min-w-full">
+        {children}
+      </table>
+    </div>
+  ),
+  thead: ({ children }: any) => (
+    <thead className="bg-[var(--secondary)] text-[var(--foreground)] border-b border-[var(--border)] text-xs font-semibold">
+      {children}
+    </thead>
+  ),
+  tbody: ({ children }: any) => (
+    <tbody className="divide-y divide-[var(--border)]/60 text-xs">
+      {children}
+    </tbody>
+  ),
+  tr: ({ children }: any) => (
+    <tr className="transition-colors hover:bg-[var(--primary)]/5">
+      {children}
+    </tr>
+  ),
+  th: ({ children }: any) => (
+    <th className="px-3.5 py-2.5 font-semibold text-[var(--foreground)] whitespace-nowrap text-left border-b border-[var(--border)]">
+      {children}
+    </th>
+  ),
+  td: ({ children }: any) => (
+    <td className="px-3.5 py-2 text-[var(--foreground)]/90 whitespace-nowrap text-left">
+      {children}
+    </td>
+  ),
 };
 
 function CitationChip({
@@ -208,11 +244,37 @@ export default function ChatPage() {
   const router = useRouter();
   const sessionId = params.sessionId as string;
 
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [sessionTitle, setSessionTitle] = useState<string>("Conversation");
+  // 0ms SWR Synchronous Cache Initialization
+  const [messages, setMessages] = useState<Message[]>(() => {
+    if (typeof window !== "undefined" && sessionId) {
+      try {
+        const cached = localStorage.getItem(`rag_msgs_${sessionId}`);
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        }
+      } catch {}
+    }
+    return [];
+  });
+
+  const [sessionTitle, setSessionTitle] = useState<string>(() => {
+    if (typeof window !== "undefined" && sessionId) {
+      try {
+        const cachedSessions = localStorage.getItem("rag_sessions_cache");
+        if (cachedSessions) {
+          const list = JSON.parse(cachedSessions);
+          const found = list.find((s: any) => s.id === sessionId);
+          if (found?.title) return found.title;
+        }
+      } catch {}
+    }
+    return "Conversation";
+  });
+
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [error, setError] = useState("");
@@ -226,42 +288,72 @@ export default function ChatPage() {
     scrollToBottom();
   }, [messages]);
 
-  // Load existing messages (critical path — load first)
+  // SWR: Instantly load cached messages & revalidate in background via single API call
   useEffect(() => {
-    const load = async () => {
+    if (typeof window === "undefined" || !sessionId) return;
+
+    // 1. Immediately hydrate from cache on route/session switch
+    try {
+      const cached = localStorage.getItem(`rag_msgs_${sessionId}`);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setMessages(parsed);
+        }
+      }
+
+      const cachedSessions = localStorage.getItem("rag_sessions_cache");
+      if (cachedSessions) {
+        const list = JSON.parse(cachedSessions);
+        const found = list.find((s: any) => s.id === sessionId);
+        if (found?.title) setSessionTitle(found.title);
+      }
+    } catch {}
+
+    // 2. Fetch fresh messages + title in a single fast backend roundtrip
+    let cancelled = false;
+    const loadData = async () => {
       try {
-        const msgs = await getChatMessages(sessionId);
-        setMessages(msgs);
+        const { messages: freshMsgs, title } = await getChatMessagesWithMetadata(sessionId);
+        if (cancelled) return;
+
+        if (title) {
+          setSessionTitle(title);
+        }
+        if (Array.isArray(freshMsgs)) {
+          setMessages(freshMsgs);
+          try {
+            localStorage.setItem(`rag_msgs_${sessionId}`, JSON.stringify(freshMsgs));
+          } catch {}
+        }
       } catch {
-        // Session might not exist yet
-      } finally {
-        setLoading(false);
+        // Session may be newly created or unsaved
       }
     };
-    load();
-  }, [sessionId]);
 
-  // Load session title in background (non-critical)
-  useEffect(() => {
-    getChatSession(sessionId)
-      .then((data) => {
-        if (data?.title) setSessionTitle(data.title);
-      })
-      .catch(() => {});
+    loadData();
+    return () => {
+      cancelled = true;
+    };
   }, [sessionId]);
 
   const handleDeleteChat = async () => {
-    setDeleting(true);
+    // Clear local cache
+    try {
+      localStorage.removeItem(`rag_msgs_${sessionId}`);
+    } catch {}
+
+    // Optimistic — navigate away immediately
+    window.dispatchEvent(
+      new CustomEvent("chat-session-deleted", { detail: { sessionId } })
+    );
+    router.push("/dashboard");
+
+    // Fire-and-forget: delete in the background
     try {
       await deleteChatSession(sessionId);
-      window.dispatchEvent(
-        new CustomEvent("chat-session-deleted", { detail: { sessionId } })
-      );
-      router.push("/dashboard");
     } catch {
       setError("Failed to delete chat session.");
-      setDeleting(false);
-      setShowDeleteModal(false);
     }
   };
 
@@ -340,6 +432,14 @@ export default function ChatPage() {
                     : m
                 )
               );
+            } else if (eventType === "sql_query" && data.sql) {
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === assistantId
+                    ? { ...m, sql_query: data.sql }
+                    : m
+                )
+              );
             } else if (eventType === "citations" && data.citations) {
               setMessages((prev) =>
                 prev.map((m) =>
@@ -365,6 +465,15 @@ export default function ChatPage() {
       );
     } finally {
       setStreaming(false);
+      // Persist full conversation with assistant reply into SWR cache
+      setMessages((latest) => {
+        if (typeof window !== "undefined" && sessionId) {
+          try {
+            localStorage.setItem(`rag_msgs_${sessionId}`, JSON.stringify(latest));
+          } catch {}
+        }
+        return latest;
+      });
     }
   };
 
@@ -455,7 +564,7 @@ export default function ChatPage() {
               )}
 
               <div
-                className={`max-w-[80%] ${
+                className={`max-w-[88%] min-w-0 ${
                   msg.role === "user"
                     ? "rounded-2xl rounded-br-md bg-[var(--primary)] text-white px-4 py-3"
                     : "space-y-3"
@@ -465,7 +574,7 @@ export default function ChatPage() {
                 <div
                   className={`${
                     msg.role === "assistant"
-                      ? "rounded-2xl rounded-bl-md bg-[var(--card)] border border-[var(--border)] px-4 py-3 shadow-xs"
+                      ? "rounded-2xl rounded-bl-md bg-[var(--card)] border border-[var(--border)] px-4 py-3 shadow-xs min-w-0 overflow-hidden"
                       : ""
                   }`}
                 >
@@ -474,7 +583,20 @@ export default function ChatPage() {
                       {msg.content}
                     </p>
                   ) : (
-                    <div className="relative">
+                    <div className="relative min-w-0 break-words">
+                      {msg.sql_query && (
+                        <details className="mb-3 group">
+                          <summary className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-violet-500/10 text-violet-400 border border-violet-500/20 cursor-pointer hover:bg-violet-500/15 transition-colors select-none">
+                            <FileSpreadsheet className="w-3 h-3" />
+                            <span>SQL Query</span>
+                            <ChevronDown className="w-3 h-3 group-open:hidden" />
+                            <ChevronUp className="w-3 h-3 hidden group-open:inline" />
+                          </summary>
+                          <pre className="mt-2 p-3 rounded-lg bg-[var(--background)] border border-[var(--border)] text-xs text-[var(--muted-foreground)] overflow-x-auto font-mono whitespace-pre-wrap">
+                            {msg.sql_query}
+                          </pre>
+                        </details>
+                      )}
                       <ReactMarkdown
                         remarkPlugins={[remarkGfm]}
                         components={markdownComponents}

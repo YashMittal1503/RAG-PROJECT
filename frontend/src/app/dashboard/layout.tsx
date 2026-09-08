@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useRouter, usePathname } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import {
@@ -9,11 +9,11 @@ import {
   Plus,
   LogOut,
   Loader2,
-  AlertTriangle,
   Trash2,
 } from "lucide-react";
 import {
   getChatSessions,
+  getChatMessagesWithMetadata,
   createChatSession,
   deleteChatSession,
   checkBackendHealth,
@@ -24,10 +24,25 @@ export default function DashboardLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const [sessions, setSessions] = useState<any[]>([]);
-  const [backendAwake, setBackendAwake] = useState<boolean | null>(null);
-  const [loadingSessions, setLoadingSessions] = useState(true);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<any[]>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const cached = localStorage.getItem("rag_sessions_cache");
+        if (cached) return JSON.parse(cached);
+      } catch {}
+    }
+    return [];
+  });
+  const [backendAwake, setBackendAwake] = useState<boolean | null>(true);
+  const [loadingSessions, setLoadingSessions] = useState(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const cached = localStorage.getItem("rag_sessions_cache");
+        if (cached !== null) return false;
+      } catch {}
+    }
+    return true;
+  });
   const [sessionToDelete, setSessionToDelete] = useState<{
     id: string;
     title: string;
@@ -63,6 +78,11 @@ export default function DashboardLayout({
     try {
       const data = await getChatSessions();
       setSessions(data);
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem("rag_sessions_cache", JSON.stringify(data));
+        } catch {}
+      }
     } catch {
       // Silently fail — sessions will load when backend is ready
     } finally {
@@ -99,33 +119,55 @@ export default function DashboardLayout({
   }, [loadSessions]);
 
   const handleNewChat = async () => {
+    // Optimistic: navigate instantly, create session in background
+    const tempId = crypto.randomUUID();
+    const tempSession = { id: tempId, title: "New conversation", created_at: new Date().toISOString() };
+    setSessions((prev) => [tempSession, ...prev]);
+    router.push(`/chat/${tempId}`);
+
     try {
-      const session = await createChatSession();
-      setSessions((prev) => [session, ...prev]);
-      window.dispatchEvent(new CustomEvent("chat-sessions-changed"));
-      router.push(`/chat/${session.id}`);
+      const realSession = await createChatSession();
+      // Replace temp session with real one
+      setSessions((prev) =>
+        prev.map((s) => (s.id === tempId ? realSession : s))
+      );
+      // Navigate to the real session ID (fast replace, no full reload)
+      router.replace(`/chat/${realSession.id}`);
     } catch {
-      // Handle error
+      // Remove temp session on failure
+      setSessions((prev) => prev.filter((s) => s.id !== tempId));
+      router.push("/dashboard");
     }
   };
 
   const handleDeleteSession = async (sessionId: string) => {
-    setDeletingId(sessionId);
+    // Optimistic delete — update UI immediately
+    setSessions((prev) => {
+      const updated = prev.filter((s) => s.id !== sessionId);
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem("rag_sessions_cache", JSON.stringify(updated));
+        } catch {}
+      }
+      return updated;
+    });
+    setSessionToDelete(null);
+
+    // Navigate away if we're viewing the deleted session
+    if (pathname === `/chat/${sessionId}`) {
+      router.push("/dashboard");
+    }
+
+    // Fire-and-forget: delete in the background
+    window.dispatchEvent(
+      new CustomEvent("chat-session-deleted", { detail: { sessionId } })
+    );
     try {
       await deleteChatSession(sessionId);
-      setSessions((prev) => prev.filter((s) => s.id !== sessionId));
-      setSessionToDelete(null);
-      window.dispatchEvent(
-        new CustomEvent("chat-session-deleted", { detail: { sessionId } })
-      );
-
-      if (pathname === `/chat/${sessionId}`) {
-        router.push("/dashboard");
-      }
     } catch (err) {
       console.error("Failed to delete chat session:", err);
-    } finally {
-      setDeletingId(null);
+      // Re-fetch sessions to restore state on failure
+      loadSessions();
     }
   };
 
@@ -192,6 +234,18 @@ export default function DashboardLayout({
                   >
                     <button
                       onClick={() => router.push(`/chat/${session.id}`)}
+                      onMouseEnter={() => {
+                        router.prefetch(`/chat/${session.id}`);
+                        if (typeof window !== "undefined" && !localStorage.getItem(`rag_msgs_${session.id}`)) {
+                          getChatMessagesWithMetadata(session.id)
+                            .then(({ messages }) => {
+                              if (Array.isArray(messages) && messages.length > 0) {
+                                localStorage.setItem(`rag_msgs_${session.id}`, JSON.stringify(messages));
+                              }
+                            })
+                            .catch(() => {});
+                        }
+                      }}
                       className="flex-1 flex items-center gap-2.5 px-3 py-2 text-left truncate min-w-0 cursor-pointer"
                     >
                       <MessageSquare className="w-4 h-4 flex-shrink-0" />
@@ -262,24 +316,15 @@ export default function DashboardLayout({
             <div className="flex justify-end gap-2.5 mt-6">
               <button
                 onClick={() => setSessionToDelete(null)}
-                disabled={deletingId !== null}
                 className="px-3.5 py-2 rounded-xl text-sm font-medium border border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--secondary)] transition-colors cursor-pointer"
               >
                 Cancel
               </button>
               <button
                 onClick={() => handleDeleteSession(sessionToDelete.id)}
-                disabled={deletingId !== null}
-                className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-sm font-medium bg-red-600 hover:bg-red-500 text-white shadow-sm transition-colors disabled:opacity-50 cursor-pointer"
+                className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-sm font-medium bg-red-600 hover:bg-red-500 text-white shadow-sm transition-colors cursor-pointer"
               >
-                {deletingId === sessionToDelete.id ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Deleting...</span>
-                  </>
-                ) : (
-                  <span>Delete</span>
-                )}
+                <span>Delete</span>
               </button>
             </div>
           </div>

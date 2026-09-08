@@ -13,13 +13,42 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 /**
  * Get the current user's JWT token from Supabase.
+ *
+ * Deduplicates concurrent calls: when multiple API requests fire
+ * in parallel on page load, they share a single getSession() call
+ * instead of each triggering their own (which was the main cause
+ * of slow initial load).
  */
+let _tokenPromise: Promise<string | null> | null = null;
+let _tokenTimestamp = 0;
+
 async function getToken(): Promise<string | null> {
-  const supabase = createClient();
-  const {
-    data: { session },
-  } = await supabase.auth.getSession();
-  return session?.access_token || null;
+  const now = Date.now();
+
+  // Reuse in-flight or recently-fetched token (cache for 60 seconds)
+  if (_tokenPromise && now - _tokenTimestamp < 60_000) {
+    return _tokenPromise;
+  }
+
+  _tokenTimestamp = now;
+  _tokenPromise = (async () => {
+    try {
+      const supabase = createClient();
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const token = session?.access_token || null;
+      if (!token) {
+        _tokenPromise = null;
+      }
+      return token;
+    } catch {
+      _tokenPromise = null;
+      return null;
+    }
+  })();
+
+  return _tokenPromise;
 }
 
 /**
@@ -62,7 +91,7 @@ export async function checkBackendHealth(): Promise<{
 }> {
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
+    const timeout = setTimeout(() => controller.abort(), 3000);
 
     const response = await fetch(`${API_URL}/api/health`, {
       signal: controller.signal,
@@ -188,14 +217,26 @@ export async function deleteChatSession(sessionId: string): Promise<void> {
 }
 
 /**
- * Get messages for a chat session.
+ * Get messages and session title for a chat session in a single call.
  */
-export async function getChatMessages(sessionId: string): Promise<any[]> {
+export async function getChatMessagesWithMetadata(
+  sessionId: string
+): Promise<{ messages: any[]; title?: string }> {
   const response = await apiRequest(
     `/api/chat/sessions/${sessionId}/messages`
   );
   if (!response.ok) throw new Error("Failed to fetch messages");
-  return response.json();
+  const messages = await response.json();
+  const title = response.headers.get("x-session-title") || undefined;
+  return { messages, title };
+}
+
+/**
+ * Get messages for a chat session.
+ */
+export async function getChatMessages(sessionId: string): Promise<any[]> {
+  const { messages } = await getChatMessagesWithMetadata(sessionId);
+  return messages;
 }
 
 /**
