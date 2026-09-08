@@ -60,3 +60,12 @@ sample_titan_report.txt
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# DuckDB Local Storage
+backend/data/
+*.duckdb
+*.duckdb.wal
+
+# Evaluation raw dumps (scores are summarized in README.md)
+backend/ragas_raw_results.json
+backend/ragas_results.json
