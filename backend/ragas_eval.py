@@ -22,6 +22,12 @@ import os
 import sys
 import time
 from datetime import datetime
+from typing import Any, List, Optional
+
+from pydantic import Field
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import BaseMessage
+from langchain_core.outputs import ChatResult
 
 # Ensure app modules are importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -158,60 +164,99 @@ async def run_rag_pipeline(question: str) -> dict:
     return result
 
 
-async def collect_evaluation_data():
+class RotatingJudgeLLM(BaseChatModel):
     """
-    Run the RAG pipeline on all test questions and collect the data
-    needed for RAGAS evaluation.
+    Round-robin LLM wrapper that distributes evaluation prompts across
+    a pool of API keys to maximize concurrency and avoid per-key rate limits.
     """
-    logger.info(f"Running RAG pipeline on {len(EVAL_DATASET)} test questions...")
+    models: list[Any] = Field(default_factory=list)
+    _current_idx: int = 0
 
-    all_results = []
-    for i, item in enumerate(EVAL_DATASET):
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        if not self.models:
+            raise RuntimeError("No judge models available in pool.")
+        idx = self._current_idx % len(self.models)
+        self._current_idx += 1
+        return self.models[idx]._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        if not self.models:
+            raise RuntimeError("No judge models available in pool.")
+        idx = self._current_idx % len(self.models)
+        self._current_idx += 1
+        return await self.models[idx]._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    @property
+    def _llm_type(self) -> str:
+        return "rotating-judge-llm"
+
+
+async def collect_evaluation_data(concurrency: int = 4) -> list[dict]:
+    """
+    Run the RAG pipeline on all test questions concurrently using an asyncio.Semaphore.
+    Leverages multi-key rotation in llm_provider to distribute queries across keys simultaneously.
+    """
+    logger.info(f"Running RAG pipeline on {len(EVAL_DATASET)} test questions with concurrency={concurrency}...")
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _process_item(index: int, item: dict) -> dict:
         q = item["question"]
-        logger.info(f"\n{'='*60}")
-        logger.info(f"[{i+1}/{len(EVAL_DATASET)}] Question: {q}")
-        logger.info(f"{'='*60}")
+        gt = item["ground_truth"]
+        async with sem:
+            logger.info(f"[{index+1}/{len(EVAL_DATASET)}] Querying: '{q[:60]}...'")
+            t_start = time.time()
+            try:
+                result = await run_rag_pipeline(q)
+                elapsed_ms = (time.time() - t_start) * 1000
+                logger.info(
+                    f"[{index+1}/{len(EVAL_DATASET)}] Finished in {elapsed_ms:.0f}ms | "
+                    f"Contexts: {len(result['contexts'])} | Answer: {len(result['answer'])} chars"
+                )
+                return {
+                    "question": q,
+                    "ground_truth": gt,
+                    "answer": result["answer"],
+                    "contexts": result["contexts"],
+                    "citations": result.get("citations", []),
+                    "retrieval_time_ms": result["retrieval_time_ms"],
+                    "generation_time_ms": result["generation_time_ms"],
+                    "chunk_scores": result["chunk_scores"],
+                    "chunk_metadata": result["chunk_metadata"],
+                }
+            except Exception as e:
+                logger.error(f"[{index+1}/{len(EVAL_DATASET)}] ERROR on '{q[:60]}...': {e}")
+                return {
+                    "question": q,
+                    "ground_truth": gt,
+                    "answer": f"ERROR: {str(e)}",
+                    "contexts": [],
+                    "retrieval_time_ms": 0,
+                    "generation_time_ms": 0,
+                    "chunk_scores": [],
+                    "chunk_metadata": [],
+                }
 
-        try:
-            result = await run_rag_pipeline(q)
-            all_results.append({
-                "question": q,
-                "ground_truth": item["ground_truth"],
-                "answer": result["answer"],
-                "contexts": result["contexts"],
-                "citations": result.get("citations", []),
-                "retrieval_time_ms": result["retrieval_time_ms"],
-                "generation_time_ms": result["generation_time_ms"],
-                "chunk_scores": result["chunk_scores"],
-                "chunk_metadata": result["chunk_metadata"],
-            })
-
-            logger.info(f"  Answer ({len(result['answer'])} chars): {result['answer'][:200]}...")
-            logger.info(f"  Contexts retrieved: {len(result['contexts'])}")
-            logger.info(f"  Retrieval: {result['retrieval_time_ms']:.0f}ms | Generation: {result['generation_time_ms']:.0f}ms")
-
-        except Exception as e:
-            logger.error(f"  ERROR: {e}")
-            all_results.append({
-                "question": q,
-                "ground_truth": item["ground_truth"],
-                "answer": f"ERROR: {str(e)}",
-                "contexts": [],
-                "retrieval_time_ms": 0,
-                "generation_time_ms": 0,
-                "chunk_scores": [],
-                "chunk_metadata": [],
-            })
-
-        # Small delay to respect rate limits
-        await asyncio.sleep(2)
-
-    return all_results
+    tasks = [_process_item(i, item) for i, item in enumerate(EVAL_DATASET)]
+    all_results = await asyncio.gather(*tasks)
+    return list(all_results)
 
 
 def run_ragas_evaluation(results: list[dict]) -> dict:
     """
     Run RAGAS evaluation on the collected results.
+    Offloads to Google Gemini Flash with multi-key rotation and multi-worker parallelism.
     """
     try:
         from ragas import evaluate
@@ -229,6 +274,7 @@ def run_ragas_evaluation(results: list[dict]) -> dict:
         from langchain_openai import ChatOpenAI
         from langchain_core.embeddings import Embeddings
         from app.services.embedding import embed_texts, embed_query
+        from app.config import settings
 
         class FastEmbedLangchain(Embeddings):
             def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -237,20 +283,60 @@ def run_ragas_evaluation(results: list[dict]) -> dict:
                 return embed_query(text)
 
         logger.info("\n" + "=" * 60)
-        logger.info("Running RAGAS evaluation...")
+        logger.info("Configuring High-Performance RAGAS Evaluation...")
         logger.info("=" * 60)
 
-        # Set up Groq as the judge LLM
-        from app.config import settings
+        # Select and configure Judge LLM:
+        # Offload to Google Gemini Flash if available (massive context, high rate limits),
+        # falling back gracefully to Groq.
+        gemini_keys = settings.get_gemini_keys()
+        groq_keys = settings.get_groq_keys()
 
-        groq_llm = ChatOpenAI(
-            base_url="https://api.groq.com/openai/v1",
-            api_key=settings.groq_api_key,
-            model="qwen/qwen3.8-27b",
-            temperature=0.0,
-            max_tokens=2000,
+        if gemini_keys:
+            judge_provider = "Google Gemini Flash"
+            base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            judge_model = settings.gemini_model or "gemini-1.5-flash"
+            active_keys = gemini_keys
+            # Gemini Flash easily handles 4-8 parallel workers without rate limits
+            max_workers = min(8, max(4, len(gemini_keys) * 2))
+        else:
+            judge_provider = "Groq (fallback)"
+            base_url = "https://api.groq.com/openai/v1"
+            judge_model = "qwen/qwen3.8-27b"
+            active_keys = groq_keys
+            max_workers = min(4, max(2, len(active_keys) * 2))
+
+        logger.info(
+            f"Judge LLM Provider: {judge_provider} ({judge_model}) | "
+            f"Active keys in rotation: {len(active_keys)} | Parallel Workers: {max_workers}"
         )
-        evaluator_llm = LangchainLLMWrapper(groq_llm)
+
+        if len(active_keys) > 1:
+            models = [
+                ChatOpenAI(
+                    base_url=base_url,
+                    api_key=k,
+                    model=judge_model,
+                    temperature=0.0,
+                    max_tokens=2000,
+                    timeout=90,
+                    max_retries=3,
+                )
+                for k in active_keys
+            ]
+            evaluator_llm = LangchainLLMWrapper(RotatingJudgeLLM(models=models))
+        else:
+            single_model = ChatOpenAI(
+                base_url=base_url,
+                api_key=active_keys[0],
+                model=judge_model,
+                temperature=0.0,
+                max_tokens=2000,
+                timeout=90,
+                max_retries=3,
+            )
+            evaluator_llm = LangchainLLMWrapper(single_model)
+
         evaluator_embeddings = LangchainEmbeddingsWrapper(FastEmbedLangchain())
 
         # Build RAGAS dataset
@@ -282,11 +368,11 @@ def run_ragas_evaluation(results: list[dict]) -> dict:
             FactualCorrectness(llm=evaluator_llm),
         ]
 
-        # Run evaluation
+        # Run evaluation with multi-worker parallelism
         eval_result = evaluate(
             dataset=eval_dataset,
             metrics=metrics,
-            run_config=RunConfig(max_workers=1, timeout=180, max_retries=5, max_wait=30),
+            run_config=RunConfig(max_workers=max_workers, timeout=180, max_retries=5, max_wait=30),
         )
 
         # Convert to dict
@@ -304,11 +390,11 @@ def run_ragas_evaluation(results: list[dict]) -> dict:
             "per_question": scores,
             "aggregate": aggregate,
             "num_samples": len(samples),
-            "evaluation_method": "ragas",
+            "evaluation_method": f"ragas ({judge_provider} {judge_model})",
         }
 
     except ImportError as e:
-        logger.warning(f"RAGAS or langchain-groq not installed: {e}")
+        logger.warning(f"RAGAS or langchain dependencies not installed: {e}")
         logger.info("Falling back to manual evaluation metrics...")
         return run_manual_evaluation(results)
     except Exception as e:
@@ -439,23 +525,30 @@ def print_results(eval_results: dict, raw_results: list[dict]):
 
 
 async def main():
-    """Main entry point."""
-    logger.info("Starting RAGAS Evaluation of DocuChat RAG Pipeline")
+    """Main entry point with timing benchmarks."""
+    t_global_start = time.time()
+    logger.info("Starting High-Performance RAGAS Evaluation of DocuChat RAG Pipeline")
     logger.info(f"   User ID: {USER_ID}")
     logger.info(f"   Test questions: {len(EVAL_DATASET)}")
     logger.info(f"   Timestamp: {datetime.now().isoformat()}")
 
-    # Step 1: Run RAG pipeline on all test questions
-    raw_results = await collect_evaluation_data()
+    # Step 1: Run RAG pipeline on all test questions concurrently
+    t1_start = time.time()
+    raw_results = await collect_evaluation_data(concurrency=4)
+    t1_elapsed = time.time() - t1_start
+    logger.info(f"\nPhase 1 (Concurrent RAG Generation) completed in {t1_elapsed:.1f}s")
 
     # Save raw results
     raw_path = os.path.join(os.path.dirname(__file__), "ragas_raw_results.json")
     with open(raw_path, "w", encoding="utf-8") as f:
         json.dump(raw_results, f, indent=2, ensure_ascii=False)
-    logger.info(f"\nRaw results saved to: {raw_path}")
+    logger.info(f"Raw results saved to: {raw_path}")
 
     # Step 2: Run RAGAS evaluation
+    t2_start = time.time()
     eval_results = run_ragas_evaluation(raw_results)
+    t2_elapsed = time.time() - t2_start
+    logger.info(f"\nPhase 2 (Parallel Judge LLM Evaluation) completed in {t2_elapsed:.1f}s")
 
     # Save evaluation results
     eval_path = os.path.join(os.path.dirname(__file__), "ragas_results.json")
@@ -463,8 +556,19 @@ async def main():
         json.dump(eval_results, f, indent=2, ensure_ascii=False, default=str)
     logger.info(f"Evaluation results saved to: {eval_path}")
 
-    # Step 3: Pretty-print results
+    # Step 3: Pretty-print results with performance benchmark
+    total_elapsed = time.time() - t_global_start
+    eval_results["benchmark"] = {
+        "phase1_generation_seconds": round(t1_elapsed, 2),
+        "phase2_evaluation_seconds": round(t2_elapsed, 2),
+        "total_seconds": round(total_elapsed, 2),
+    }
     print_results(eval_results, raw_results)
+    print(f"\n  BENCHMARK SUMMARY:")
+    print(f"  Phase 1 (Concurrent Generation): {t1_elapsed:.1f}s")
+    print(f"  Phase 2 (Parallel Evaluation):   {t2_elapsed:.1f}s")
+    print(f"  Total Script Runtime:            {total_elapsed:.1f}s")
+    print("=" * 70)
 
     return eval_results
 
