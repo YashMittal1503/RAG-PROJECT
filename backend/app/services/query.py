@@ -12,7 +12,6 @@ import re
 from typing import Any, AsyncGenerator
 from uuid import UUID
 
-from groq import AsyncGroq, APIError, APIStatusError, RateLimitError
 import logfire
 
 from app.config import settings
@@ -22,21 +21,19 @@ from app.services import tabular_store
 
 logger = logging.getLogger(__name__)
 
-# Groq async client
-_groq_client: AsyncGroq | None = None
+from app.services.llm_provider import (
+    call_llm_with_cross_provider_fallback as call_llm_with_fallback,
+    stream_llm_with_cross_provider_fallback as stream_llm_with_fallback,
+    get_groq_client as _get_groq,
+    get_generation_targets,
+    get_fast_targets,
+    is_recoverable_error as _is_rate_limit_or_recoverable,
+)
 
-
-def _get_groq() -> AsyncGroq:
-    """Get or create the async Groq client."""
-    global _groq_client
-    if _groq_client is None:
-        _groq_client = AsyncGroq(api_key=settings.groq_api_key)
-    return _groq_client
-
-
-# ── Resilient Multi-Model Fallback Chain ──────────────────────────────────
-# The USP of this project: when one model hits rate limits (429/TPM) or context limits (413),
-# the system automatically and transparently switches to the next available model.
+# ── Resilient Multi-Provider Fallback Chain ──────────────────────────────
+# When one model/provider hits rate limits (429/TPM) or context limits (413),
+# the system automatically and transparently switches to the next available
+# model across Groq, Google Gemini, and OpenRouter.
 DEFAULT_MODEL_FALLBACKS = [
     "openai/gpt-oss-120b",
     "qwen/qwen3.8-27b",
@@ -44,9 +41,6 @@ DEFAULT_MODEL_FALLBACKS = [
     "groq/compound-mini",
     "qwen/qwen3.6-27b",
 ]
-
-# Fast models for utility tasks (intent classification, query rewriting, SQL generation)
-# These prioritize strict instruction-following, zero-preamble, and low latency
 FAST_MODEL_CHAIN = [
     "qwen/qwen3.8-27b",
     "openai/gpt-oss-120b",
@@ -57,15 +51,9 @@ FAST_MODEL_CHAIN = [
 
 
 def get_model_chain(fast: bool = False) -> list[str]:
-    """
-    Get the ordered list of models to try.
-    If fast=True, uses fast instruction-following models for utility tasks.
-    Otherwise starts with the configured settings.groq_model, then chains through
-    distinct candidate models in DEFAULT_MODEL_FALLBACKS.
-    """
+    """Compatibility helper returning the Groq model list."""
     if fast:
         return list(FAST_MODEL_CHAIN)
-
     configured = settings.groq_model
     chain = [configured]
     for m in DEFAULT_MODEL_FALLBACKS:
@@ -73,134 +61,6 @@ def get_model_chain(fast: bool = False) -> list[str]:
             chain.append(m)
     return chain
 
-
-def _is_rate_limit_or_recoverable(err: Exception) -> bool:
-    """Check if an error is a rate limit, capacity, or recoverable status code."""
-    status_code = getattr(err, "status_code", None)
-    err_msg = str(err).lower()
-    return (
-        isinstance(err, (RateLimitError, APIStatusError, APIError))
-        and (
-            status_code in (413, 429, 500, 502, 503, 504)
-            or "rate limit" in err_msg
-            or "tokens per minute" in err_msg
-            or "tpm" in err_msg
-            or "too large" in err_msg
-            or "decommissioned" in err_msg
-            or "capacity" in err_msg
-        )
-    ) or (
-        "rate limit" in err_msg
-        or "tokens per minute" in err_msg
-        or "tpm" in err_msg
-        or "too large" in err_msg
-    )
-
-
-async def call_llm_with_fallback(
-    messages: list[dict],
-    max_tokens: int,
-    temperature: float = 0.0,
-    fast: bool = False,
-) -> Any:
-    """
-    Execute a non-streaming LLM call with automatic multi-model fallback.
-    Tries each model in the fallback chain if rate-limited (429), token limit exceeded (413),
-    or on temporary API errors.
-    """
-    groq = _get_groq()
-    models = get_model_chain(fast=fast)
-    last_err = None
-
-    for model in models:
-        try:
-            logger.info(f"Invoking LLM with model: {model}")
-            with logfire.span("llm.call", model=model, fast=fast, max_tokens=max_tokens) as span:
-                response = await groq.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
-                usage = getattr(response, "usage", None)
-                if usage:
-                    span.set_attribute("prompt_tokens", usage.prompt_tokens)
-                    span.set_attribute("completion_tokens", usage.completion_tokens)
-                    span.set_attribute("total_tokens", usage.total_tokens)
-                return response
-        except Exception as err:
-            if _is_rate_limit_or_recoverable(err):
-                logger.warning(
-                    f"Model '{model}' failed ({type(err).__name__}: {err}). "
-                    f"Auto-switching to next model in fallback chain..."
-                )
-                last_err = err
-                continue
-            else:
-                logger.error(f"Unrecoverable error on model '{model}': {err}")
-                raise
-
-    logger.error("All fallback models exhausted for non-streaming call.")
-    if last_err:
-        raise last_err
-    raise RuntimeError("All models in the fallback chain failed.")
-
-
-async def stream_llm_with_fallback(
-    messages: list[dict],
-    max_tokens: int,
-    temperature: float = 0.1,
-    fast: bool = False,
-) -> AsyncGenerator[str, None]:
-    """
-    Execute a streaming LLM call with automatic multi-model fallback.
-    If the initial model is rate-limited or fails before stream starts,
-    it automatically catches the error and switches to the next available model.
-    """
-    groq = _get_groq()
-    models = get_model_chain(fast=fast)
-    last_err = None
-
-    for model in models:
-        started = False
-        try:
-            logger.info(f"Starting LLM stream with model: {model}")
-            with logfire.span("llm.stream", model=model, fast=fast, max_tokens=max_tokens) as span:
-                stream = await groq.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stream=True,
-                )
-                token_count = 0
-                async for chunk in stream:
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta
-                    if delta.content:
-                        started = True
-                        token_count += 1
-                        yield delta.content
-                span.set_attribute("streamed_tokens", token_count)
-                return  # Stream completed successfully
-
-        except Exception as err:
-            if _is_rate_limit_or_recoverable(err) and not started:
-                logger.warning(
-                    f"Model '{model}' stream failed ({type(err).__name__}: {err}). "
-                    f"Auto-switching to next model in fallback chain..."
-                )
-                last_err = err
-                continue
-            else:
-                logger.error(f"Error during stream with model '{model}': {err}")
-                raise
-
-    logger.error("All fallback models exhausted for streaming.")
-    if last_err:
-        raise last_err
-    raise RuntimeError("All models in the fallback chain failed.")
 
 
 
@@ -469,16 +329,19 @@ async def retrieve_chunks(
     3. If aggregation detected, also fetch summary chunks and prepend them
     """
     with logfire.span("rag.retrieve_chunks", question=question, is_aggregation=is_aggregation) as span:
-        # Embed the query
+        # Embed the query with dense vector (semantic) and sparse BM25 vector (keyword)
         query_vector = embedding.embed_query(question)
+        query_sparse = embedding.embed_sparse_query(question)
 
-        # Dense candidate retrieval — top 10 candidates for cross-encoder reranking
+        # Hybrid candidate retrieval (Dense + BM25 via server-side RRF) — top 10 candidates
         candidates = await vector_store.search(
             user_id=user_id,
             query_vector=query_vector,
+            query_sparse_vector=query_sparse,
             limit=10,
         )
         span.set_attribute("candidates_retrieved", len(candidates))
+        span.set_attribute("search_mode", "hybrid_rrf")
 
         # Cross-encoder reranking with FlashRank
         results = reranker.rerank_chunks(

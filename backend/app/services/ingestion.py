@@ -155,23 +155,25 @@ async def ingest_document(
             pipe_span.set_attribute("chunk_count", len(all_chunks))
             logger.info(f"[{doc_id}] Created {len(all_chunks)} chunks")
 
-            # ── Step 2: Embedding ─────────────────────────────────────
+            # ── Step 2: Embedding (Dense + BM25 Sparse) ───────────────
             await _update_status(doc_id, DocumentStatus.EMBEDDING)
-            logger.info(f"[{doc_id}] Embedding {len(all_chunks)} chunks")
+            logger.info(f"[{doc_id}] Embedding {len(all_chunks)} chunks (Dense + BM25)")
 
             with logfire.span("ingestion.embed_chunks", count=len(all_chunks)):
                 chunk_texts = [c.content for c in all_chunks]
                 vectors = await asyncio.to_thread(embedding.embed_texts, chunk_texts)
+                sparse_vectors = await asyncio.to_thread(embedding.embed_sparse_texts, chunk_texts)
 
             # ── Step 3: Store in Qdrant ───────────────────────────────
             with logfire.span("ingestion.store_qdrant", points_count=len(all_chunks)):
                 await vector_store.ensure_collection(user_id)
 
                 qdrant_points = []
-                for chunk, vector in zip(all_chunks, vectors):
+                for chunk, vector, sparse_vector in zip(all_chunks, vectors, sparse_vectors):
                     qdrant_points.append({
                         "id": chunk.id,
                         "vector": vector,
+                        "sparse_vector": sparse_vector,
                         "payload": {
                             "doc_id": str(doc_id),
                             "chunk_type": chunk.chunk_type,
