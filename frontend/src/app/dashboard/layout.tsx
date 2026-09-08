@@ -103,6 +103,12 @@ export default function DashboardLayout({
       const deletedId = e.detail?.sessionId;
       if (deletedId) {
         setSessions((prev) => prev.filter((s) => s.id !== deletedId));
+        if (typeof window !== "undefined") {
+          try {
+            localStorage.removeItem(`rag_draft_${deletedId}`);
+            localStorage.removeItem(`rag_msgs_${deletedId}`);
+          } catch {}
+        }
       }
     };
 
@@ -127,6 +133,16 @@ export default function DashboardLayout({
 
     try {
       const realSession = await createChatSession();
+      // If user started typing while tempId was active, migrate draft to realSession.id
+      if (typeof window !== "undefined") {
+        try {
+          const tempDraft = localStorage.getItem(`rag_draft_${tempId}`);
+          if (tempDraft) {
+            localStorage.setItem(`rag_draft_${realSession.id}`, tempDraft);
+            localStorage.removeItem(`rag_draft_${tempId}`);
+          }
+        } catch {}
+      }
       // Replace temp session with real one
       setSessions((prev) =>
         prev.map((s) => (s.id === tempId ? realSession : s))
@@ -134,6 +150,11 @@ export default function DashboardLayout({
       // Navigate to the real session ID (fast replace, no full reload)
       router.replace(`/chat/${realSession.id}`);
     } catch {
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.removeItem(`rag_draft_${tempId}`);
+        } catch {}
+      }
       // Remove temp session on failure
       setSessions((prev) => prev.filter((s) => s.id !== tempId));
       router.push("/dashboard");
@@ -147,6 +168,8 @@ export default function DashboardLayout({
       if (typeof window !== "undefined") {
         try {
           localStorage.setItem("rag_sessions_cache", JSON.stringify(updated));
+          localStorage.removeItem(`rag_draft_${sessionId}`);
+          localStorage.removeItem(`rag_msgs_${sessionId}`);
         } catch {}
       }
       return updated;

@@ -276,7 +276,41 @@ export default function ChatPage() {
     return "Conversation";
   });
 
-  const [input, setInput] = useState("");
+  const [input, setInput] = useState<string>(() => {
+    if (typeof window !== "undefined" && sessionId) {
+      try {
+        return localStorage.getItem(`rag_draft_${sessionId}`) || "";
+      } catch {}
+    }
+    return "";
+  });
+
+  // Synchronously update input draft when switching between chat sessions
+  const [prevSessionId, setPrevSessionId] = useState(sessionId);
+  if (prevSessionId !== sessionId) {
+    setPrevSessionId(sessionId);
+    let draft = "";
+    if (typeof window !== "undefined" && sessionId) {
+      try {
+        draft = localStorage.getItem(`rag_draft_${sessionId}`) || "";
+      } catch {}
+    }
+    setInput(draft);
+  }
+
+  const updateDraft = (val: string) => {
+    setInput(val);
+    if (typeof window !== "undefined" && sessionId) {
+      try {
+        if (val) {
+          localStorage.setItem(`rag_draft_${sessionId}`, val);
+        } else {
+          localStorage.removeItem(`rag_draft_${sessionId}`);
+        }
+      } catch {}
+    }
+  };
+
   const [streaming, setStreaming] = useState(false);
   const [loading, setLoading] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -298,6 +332,9 @@ export default function ChatPage() {
 
     // 1. Immediately hydrate from cache on route/session switch
     try {
+      const savedDraft = localStorage.getItem(`rag_draft_${sessionId}`) || "";
+      setInput(savedDraft);
+
       const cached = localStorage.getItem(`rag_msgs_${sessionId}`);
       if (cached) {
         const parsed = JSON.parse(cached);
@@ -379,6 +416,7 @@ export default function ChatPage() {
     // Clear local cache
     try {
       localStorage.removeItem(`rag_msgs_${sessionId}`);
+      localStorage.removeItem(`rag_draft_${sessionId}`);
     } catch {}
 
     // Optimistic — navigate away immediately
@@ -399,7 +437,7 @@ export default function ChatPage() {
     if (!input.trim() || streaming) return;
 
     const question = input.trim();
-    setInput("");
+    updateDraft("");
     setError("");
 
     // Add user message
@@ -639,7 +677,7 @@ export default function ChatPage() {
                   <button
                     key={q}
                     onClick={() => {
-                      setInput(q);
+                      updateDraft(q);
                     }}
                     className="px-3 py-1.5 rounded-lg text-sm border border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:border-[var(--muted-foreground)] transition-colors"
                   >
@@ -750,7 +788,7 @@ export default function ChatPage() {
         <div className="max-w-3xl mx-auto flex gap-3">
           <textarea
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => updateDraft(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Ask a question about your documents..."
             rows={1}
