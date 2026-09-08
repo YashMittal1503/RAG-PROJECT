@@ -213,6 +213,124 @@ async def generate_direct_response(
         yield token
 
 
+# ── Chat Auto-Naming ──────────────────────────────────────────────────────
+
+TITLE_SYSTEM_PROMPT = """You are a back-end utility that generates highly concise, 3-to-5 word titles for chat logs.
+Analyze the user's initial inquiry and the assistant's response.
+Extract the core topic, task, or technical domain.
+
+CRITICAL RULES:
+- Output ONLY the title. Do not include markdown, bullet points, introductory phrases, or quotes.
+- Do not use generic words like "Chat", "Conversation", "Discussion", or "Question".
+- Keep it between 2 to 5 words maximum.
+- Be specific. (e.g., instead of "Coding Help", use "React Auth State Debugging").
+- If the interaction is pure social pleasantry/greeting with no substantive topic (e.g., "Hi" / "Hello"), output EXACTLY: "New conversation"."""
+
+
+def _clean_title(raw: str) -> str:
+    """Clean and normalize raw LLM output into a strict 2-to-5 word title."""
+    if not raw:
+        return ""
+
+    # Remove markdown bold/italics, quotes, and backticks
+    cleaned = re.sub(r"[*_`'\"]", "", raw).strip()
+
+    # Strip conversational prefixes like "Title:", "Here is a title:", "Topic:"
+    cleaned = re.sub(r"^(?:title|topic|here is a title|suggested title)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+
+    # Strip trailing punctuation
+    cleaned = re.sub(r"[.,;:\-!?]+$", "", cleaned).strip()
+
+    # Check for exact "New conversation" (preserve as is)
+    if cleaned.lower() in ("new conversation", "new conversation.", "new chat"):
+        return "New conversation"
+
+    # Split into words and enforce 2 to 5 words limit
+    words = cleaned.split()
+    if not words:
+        return ""
+
+    # If first word is generic like "Chat", "Question", strip if length > 2
+    if len(words) > 2 and words[0].lower() in ("chat", "conversation", "discussion", "question", "about"):
+        words = words[1:]
+
+    # Enforce maximum 5 words
+    if len(words) > 5:
+        words = words[:5]
+
+    return " ".join(words)
+
+
+async def generate_chat_title(
+    chat_history: list[dict] | None,
+    current_question: str,
+    current_answer: str = "",
+) -> str:
+    """
+    Generate a clean 2-to-5 word title for the chat session using both
+    the user inquiry and the assistant response.
+    Returns "New conversation" if the conversation is purely pleasantries.
+    """
+    with logfire.span("rag.generate_chat_title", question=current_question[:60]) as span:
+        # Fast check: if only message and it's a simple greeting, return default immediately
+        cleaned_q = current_question.strip().lower()
+        cleaned_q = re.sub(r"[^\w\s]", "", cleaned_q)
+        quick_greetings = {"hi", "hello", "hey", "hola", "howdy", "good morning", "good afternoon", "good evening"}
+        if (not chat_history or len(chat_history) == 0) and cleaned_q in quick_greetings and not current_answer:
+            span.set_attribute("title", "New conversation")
+            span.set_attribute("method", "heuristic_greeting")
+            return "New conversation"
+
+        # Build context snippet from history + current exchange
+        snippets = []
+        if chat_history:
+            for m in chat_history[-3:]:
+                role = "User" if m.get("role") == "user" else "Assistant"
+                snippets.append(f"{role}: {m.get('content', '')[:150]}")
+
+        snippets.append(f"User: {current_question[:250]}")
+        if current_answer:
+            snippets.append(f"Assistant: {current_answer[:300]}")
+
+        conversation_context = "\n".join(snippets)
+
+        messages = [
+            {"role": "system", "content": TITLE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"Conversation snippet:\n{conversation_context}\n\nTitle:",
+            },
+        ]
+
+        try:
+            response = await call_llm_with_fallback(
+                messages=messages,
+                max_tokens=25,
+                temperature=0.2,
+                fast=True,
+            )
+            raw = (response.choices[0].message.content or "").strip()
+            title = _clean_title(raw)
+            if title:
+                logger.info(f"Generated chat title: '{title}' for '{current_question[:50]}'")
+                span.set_attribute("title", title)
+                return title
+        except Exception as e:
+            logger.warning(f"Chat title generation failed: {e}")
+
+        # Fallback: extract first 3-5 words from question
+        q_words = [w for w in re.findall(r"\b\w+\b", current_question) if w.lower() not in {"what", "is", "the", "how", "can", "you", "a", "an", "tell", "me"}]
+        if q_words:
+            fallback = " ".join(q_words[:4]).title()
+            span.set_attribute("title", fallback)
+            span.set_attribute("method", "fallback_keyword")
+            return fallback
+
+        span.set_attribute("title", "New conversation")
+        return "New conversation"
+
+
+
 # ── Aggregation keywords ──────────────────────────────────────────────────
 
 AGGREGATION_KEYWORDS = {

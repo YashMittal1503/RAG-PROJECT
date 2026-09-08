@@ -67,6 +67,11 @@ class ChatSessionCreate(BaseModel):
     title: str = "New conversation"
 
 
+class ChatSessionUpdate(BaseModel):
+    """Request to update a chat session."""
+    title: str = Field(..., min_length=1, max_length=100)
+
+
 class ChatSessionResponse(BaseModel):
     """Chat session in API responses."""
     id: UUID
