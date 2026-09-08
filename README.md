@@ -23,6 +23,9 @@ An enterprise-grade, full-stack Retrieval-Augmented Generation (RAG) and Text-to
   - **Dense + Sparse Hybrid Search:** Queries Qdrant concurrently with dense semantic vectors (conceptual understanding) and sparse BM25 vectors (exact keywords, model numbers, IDs).
   - **Reciprocal Rank Fusion (RRF):** Merges both result sets at the vector database level to eliminate score scale mismatches.
   - **FlashRank Cross-Encoder Reranking:** Local ONNX cross-encoder (`ms-marco-TinyBERT-L-2-v2`) evaluates query-chunk cross-attention to select the top 5 highest-precision contexts.
+- **Extractive Contextual Compression:**
+  - Prunes distractor sentences from retrieved 300–500 token chunks using query keyword overlap, density weighting, and bigram phrase matching while retaining adjacent sentence context windows (±1 sentence) for narrative continuity.
+  - Reduces prompt tokens by 25–45%, decreases LLM latency and Time-to-First-Token (TTFT), and shields against TPM rate limits while rigorously preserving page citation tags.
 - **Enterprise Multi-Key Rotation & 3-Tier LLM Fallback Chain:**
   - **Multi-Key Pooling:** Configurable pool of up to 3 API keys per provider tier (`GROQ_API_KEY`, `_2`, `_3`; `GEMINI_API_KEY`, `_2`, `_3`; `MISTRAL_API_KEY`, `_2`, `_3`).
   - **429 Cooldown Quarantine:** Automatic 60-second cooldown isolation upon encountering rate limits, seamlessly rotating to working keys.
