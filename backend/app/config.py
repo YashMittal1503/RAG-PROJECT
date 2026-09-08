@@ -29,9 +29,12 @@ class Settings(BaseSettings):
     qdrant_url: str
     qdrant_api_key: str
 
-    # ── Groq LLM ──────────────────────────────────────────────────────────
+    # ── Groq LLM (Tier 1 Primary — sub-second LPUs) ──────────────────────
     groq_api_key: str
-    groq_model: str = "groq/compound"
+    groq_api_key_2: str | None = None
+    groq_api_key_3: str | None = None
+    groq_api_keys: str | None = None
+    groq_model: str = "openai/gpt-oss-120b"
 
     # ── Embedding ─────────────────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"
@@ -49,10 +52,59 @@ class Settings(BaseSettings):
 
     # ── Multi-Provider LLM Fallbacks (Google Gemini & OpenRouter) ─────────
     gemini_api_key: str | None = None
+    gemini_api_key_2: str | None = None
+    gemini_api_key_3: str | None = None
+    gemini_api_keys: str | None = None
     gemini_model: str = "gemini-1.5-flash"
 
     openrouter_api_key: str | None = None
+    openrouter_api_key_2: str | None = None
+    openrouter_api_key_3: str | None = None
+    openrouter_api_keys: str | None = None
     openrouter_model: str = "meta-llama/llama-3.3-70b-instruct"
+
+    def get_groq_keys(self) -> list[str]:
+        """Collect all configured Groq API keys."""
+        return _parse_keys(
+            self.groq_api_key,
+            self.groq_api_key_2,
+            self.groq_api_key_3,
+            comma_separated=self.groq_api_keys,
+        )
+
+    def get_gemini_keys(self) -> list[str]:
+        """Collect all configured Google Gemini API keys."""
+        return _parse_keys(
+            self.gemini_api_key,
+            self.gemini_api_key_2,
+            self.gemini_api_key_3,
+            comma_separated=self.gemini_api_keys,
+        )
+
+    def get_openrouter_keys(self) -> list[str]:
+        """Collect all configured OpenRouter API keys."""
+        return _parse_keys(
+            self.openrouter_api_key,
+            self.openrouter_api_key_2,
+            self.openrouter_api_key_3,
+            comma_separated=self.openrouter_api_keys,
+        )
+
+
+def _parse_keys(*individual: str | None, comma_separated: str | None = None) -> list[str]:
+    """Helper to parse and deduplicate individual and comma-separated API keys."""
+    keys: list[str] = []
+    if comma_separated:
+        for k in comma_separated.split(","):
+            k = k.strip()
+            if k and k not in keys:
+                keys.append(k)
+    for k in individual:
+        if k:
+            k = k.strip()
+            if k and k not in keys:
+                keys.append(k)
+    return keys
 
 
 # Singleton — imported throughout the app
