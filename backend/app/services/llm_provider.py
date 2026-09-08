@@ -120,13 +120,14 @@ class ProviderKeyPool:
 
 
 def _make_groq_client(key: str) -> AsyncGroq:
-    return AsyncGroq(api_key=key)
+    return AsyncGroq(api_key=key, max_retries=0)
 
 
 def _make_gemini_client(key: str) -> AsyncOpenAI:
     return AsyncOpenAI(
         api_key=key,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        max_retries=0,
     )
 
 
@@ -134,6 +135,7 @@ def _make_openrouter_client(key: str) -> AsyncOpenAI:
     return AsyncOpenAI(
         api_key=key,
         base_url="https://openrouter.ai/api/v1",
+        max_retries=0,
         default_headers={
             "HTTP-Referer": "https://github.com/YashMittal1503/RAG-PROJECT",
             "X-Title": "RAG-Document-QA",
@@ -145,6 +147,7 @@ def _make_mistral_client(key: str) -> AsyncOpenAI:
     return AsyncOpenAI(
         api_key=key,
         base_url="https://api.mistral.ai/v1",
+        max_retries=0,
     )
 
 

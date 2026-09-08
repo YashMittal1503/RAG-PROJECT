@@ -248,13 +248,7 @@ async def run_rag_pipeline(question: str) -> dict:
         "chunk_metadata": [],
     }
 
-    # Step 1: Classify intent
-    intent = await classify_intent(question)
-    if intent == "chitchat":
-        result["answer"] = "[Classified as chitchat - skipping retrieval]"
-        return result
-
-    # Step 2: Rewrite query (no chat history for eval)
+    # Step 1: Rewrite query directly (eval questions are known document queries, skipping intent classification)
     rewritten = await rewrite_query(question, [])
 
     # Step 3: Detect aggregation
@@ -364,8 +358,8 @@ async def collect_evaluation_data(dataset: list[dict], concurrency: int = 1) -> 
                     f"[{index+1}/{len(dataset)}] Finished in {elapsed_ms:.0f}ms | "
                     f"Contexts: {len(result['contexts'])} | Answer: {len(result['answer'])} chars"
                 )
-                # 2.0-second pause to prevent token accumulation in Groq's 60s window
-                await asyncio.sleep(2.0)
+                # Light 0.3-second pacing buffer between queries (multi-key pool handles 429s automatically)
+                await asyncio.sleep(0.3)
                 return {
                     "question": q,
                     "ground_truth": gt,
@@ -734,10 +728,16 @@ async def main():
     logger.info(f"   Total test questions: {len(dataset)}")
 
     # Step 1: Run RAG pipeline on all test questions freshly
+    # Scale concurrency to match the available Groq key pool (multi-key pool handles load)
+    from app.config import settings
+    groq_keys = settings.get_groq_keys()
+    eval_concurrency = max(2, len(groq_keys))
+    logger.info(f"   Phase 1 Concurrency: {eval_concurrency} (scaled across {len(groq_keys)} Groq keys in pool)")
+
     t1_start = time.time()
-    raw_results = await collect_evaluation_data(dataset=dataset, concurrency=1)
+    raw_results = await collect_evaluation_data(dataset=dataset, concurrency=eval_concurrency)
     t1_elapsed = time.time() - t1_start
-    logger.info(f"\nPhase 1 (Fresh RAG Generation) completed in {t1_elapsed:.1f}s")
+    logger.info(f"\nPhase 1 (Concurrent RAG Generation) completed in {t1_elapsed:.1f}s")
 
     # Save raw results
     raw_path = os.path.join(os.path.dirname(__file__), "ragas_raw_results.json")
