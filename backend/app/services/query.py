@@ -215,28 +215,93 @@ async def generate_direct_response(
 
 # ── Chat Auto-Naming ──────────────────────────────────────────────────────
 
-TITLE_SYSTEM_PROMPT = """You are a back-end utility that generates highly concise, 3-to-5 word titles for chat logs.
-Analyze the user's initial inquiry and the assistant's response.
-Extract the core topic, task, or technical domain.
+DANGLING_END_WORDS = {
+    "a", "an", "the", "and", "or", "but", "nor", "so", "yet",
+    "in", "on", "at", "to", "for", "of", "with", "by", "from", "as", "into", "onto", "upon", "about",
+    "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did",
+    "can", "could", "would", "should", "will", "shall", "may", "might", "must",
+    "we", "you", "they", "it", "he", "she", "i", "me", "us", "him", "her", "them",
+    "my", "your", "its", "their", "our", "his",
+    "that", "this", "these", "those", "which", "whose", "whom", "who", "what", "where", "when", "why", "how",
+}
+
+TITLE_SYSTEM_PROMPT = """You generate concise, self-contained chat names (3 to 6 words) for the sidebar of an AI document assistant application.
+Analyze the user's inquiry and the assistant's response to identify the core topic, book, dataset, or technical question being discussed.
 
 CRITICAL RULES:
-- Output ONLY the title. Do not include markdown, bullet points, introductory phrases, or quotes.
-- Do not use generic words like "Chat", "Conversation", "Discussion", or "Question".
-- Keep it between 2 to 5 words maximum.
-- Be specific. (e.g., instead of "Coding Help", use "React Auth State Debugging").
-- If the interaction is pure social pleasantry/greeting with no substantive topic (e.g., "Hi" / "Hello"), output EXACTLY: "New conversation"."""
+1. The chat name MUST be a complete, self-contained phrase or title (3 to 6 words).
+2. It MUST make complete grammatical sense on its own. NEVER cut off mid-sentence or trail off.
+3. NEVER end on dangling words, prepositions, conjunctions, pronouns, or auxiliary verbs (e.g., NEVER end with 'be', 'to', 'of', 'the', 'a', 'in', 'on', 'and', 'for', 'with', 'we', 'can').
+4. Be specific to the actual subject. Do NOT use redundant label prefixes like 'Book Summary:', 'Document Analysis:', or 'Question About:' — focus directly on the actual subject or work title so the entire 3 to 6 words are meaningful (e.g., instead of 'Book Summary: Can We Be', use 'Can We Be Friends Summary' or the full book title).
+5. Output ONLY the title text. Do not include quotes, markdown, bullet points, colons, or introductory preamble.
+6. If the conversation is purely social pleasantries or a greeting with no substantive topic (e.g., 'Hi' / 'Hello'), output EXACTLY: New conversation."""
 
 
-def _clean_title(raw: str) -> str:
-    """Clean and normalize raw LLM output into a strict 2-to-5 word title."""
+def _repair_dangling_title(title: str, context_text: str = "") -> str:
+    """If a title ends on an incomplete dangling word, attempt to complete it from context or fix it."""
+    words = title.split()
+    if not words:
+        return title
+
+    # If ending on a dangling word (e.g. "Can We Be" -> "Be")
+    if words[-1].lower() in DANGLING_END_WORDS and context_text:
+        # Search context (question/answer) for the sequence of words and capture non-punctuation continuation
+        search_phrase = " ".join(words)
+        pattern = re.compile(rf"\b{re.escape(search_phrase)}\s+([^\n\r.,;:!?]+)", re.IGNORECASE)
+        match = pattern.search(context_text)
+        if match:
+            continuation_words = match.group(1).strip().split()
+            added = []
+            for w in continuation_words:
+                if len(words) + len(added) >= 6:
+                    break
+                added.append(w)
+            # Trim trailing dangling words from added segment
+            while added and added[-1].lower() in DANGLING_END_WORDS:
+                added.pop()
+            if added:
+                return " ".join(words + added)
+
+    # If still ending in a dangling word, trim backward if we have at least 3 words left
+    while len(words) > 3 and words[-1].lower() in DANGLING_END_WORDS:
+        words.pop()
+
+    # If still dangling and <= 3 words, append a clarifying noun rather than leaving it broken
+    if words and words[-1].lower() in DANGLING_END_WORDS:
+        if words[-1].lower() in {"be", "is", "are", "can", "could", "should", "will"}:
+            words.append("Overview")
+        else:
+            words.pop()
+            if not words:
+                return "Document Overview"
+
+    return " ".join(words)
+
+
+def _clean_title(raw: str, max_words: int = 6) -> str:
+    """Clean and normalize raw LLM output into a complete 3-to-6 word chat name."""
     if not raw:
         return ""
 
     # Remove markdown bold/italics, quotes, and backticks
     cleaned = re.sub(r"[*_`'\"]", "", raw).strip()
 
-    # Strip conversational prefixes like "Title:", "Here is a title:", "Topic:"
-    cleaned = re.sub(r"^(?:title|topic|here is a title|suggested title)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    # Strip conversational prefixes like "Title:", "Here is a title:", "Topic:", "Chat Name:"
+    cleaned = re.sub(
+        r"^(?:title|topic|here is a title|suggested title|chat name|chat title|suggested name)\s*:\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Strip redundant category prefixes like "Book Summary:", "Document Summary:", "Summary:"
+    cleaned = re.sub(
+        r"^(?:book summary|document summary|paper summary|text summary|executive summary|summary|overview|analysis)\s*:\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
 
     # Strip trailing punctuation
     cleaned = re.sub(r"[.,;:\-!?]+$", "", cleaned).strip()
@@ -245,18 +310,26 @@ def _clean_title(raw: str) -> str:
     if cleaned.lower() in ("new conversation", "new conversation.", "new chat"):
         return "New conversation"
 
-    # Split into words and enforce 2 to 5 words limit
+    # Split into words and enforce 3 to 6 words limit
     words = cleaned.split()
     if not words:
         return ""
 
-    # If first word is generic like "Chat", "Question", strip if length > 2
+    # If first word is generic like "Chat", "Conversation", "Discussion", "Question", strip if length > 2
     if len(words) > 2 and words[0].lower() in ("chat", "conversation", "discussion", "question", "about"):
         words = words[1:]
 
-    # Enforce maximum 5 words
-    if len(words) > 5:
-        words = words[:5]
+    # Enforce maximum words (up to 6 words)
+    if len(words) > max_words:
+        # If dropping leading article ("The", "A", "An") helps fit in 6 words
+        if len(words) == max_words + 1 and words[0].lower() in ("the", "a", "an"):
+            words = words[1:]
+        else:
+            words = words[:max_words]
+
+    # Trim trailing dangling words if longer than 3 words
+    while len(words) > 3 and words[-1].lower() in DANGLING_END_WORDS:
+        words.pop()
 
     return " ".join(words)
 
@@ -267,7 +340,7 @@ async def generate_chat_title(
     current_answer: str = "",
 ) -> str:
     """
-    Generate a clean 2-to-5 word title for the chat session using both
+    Generate a complete 3-to-6 word title for the chat session using both
     the user inquiry and the assistant response.
     Returns "New conversation" if the conversation is purely pleasantries.
     """
@@ -305,12 +378,14 @@ async def generate_chat_title(
         try:
             response = await call_llm_with_fallback(
                 messages=messages,
-                max_tokens=25,
+                max_tokens=60,
                 temperature=0.2,
                 fast=True,
             )
             raw = (response.choices[0].message.content or "").strip()
-            title = _clean_title(raw)
+            title = _clean_title(raw, max_words=6)
+            combined_context = f"{current_question} {current_answer}"
+            title = _repair_dangling_title(title, combined_context)
             if title:
                 logger.info(f"Generated chat title: '{title}' for '{current_question[:50]}'")
                 span.set_attribute("title", title)
@@ -318,10 +393,13 @@ async def generate_chat_title(
         except Exception as e:
             logger.warning(f"Chat title generation failed: {e}")
 
-        # Fallback: extract first 3-5 words from question
-        q_words = [w for w in re.findall(r"\b\w+\b", current_question) if w.lower() not in {"what", "is", "the", "how", "can", "you", "a", "an", "tell", "me"}]
+        # Fallback: extract substantive keywords from question, avoiding stop/dangling words
+        q_words = [
+            w for w in re.findall(r"\b\w+\b", current_question)
+            if w.lower() not in DANGLING_END_WORDS and w.lower() not in {"what", "how", "tell", "give", "please", "explain"}
+        ]
         if q_words:
-            fallback = " ".join(q_words[:4]).title()
+            fallback = " ".join(q_words[:5]).title()
             span.set_attribute("title", fallback)
             span.set_attribute("method", "fallback_keyword")
             return fallback
