@@ -5,6 +5,7 @@ The query endpoint uses SSE (Server-Sent Events) to stream
 the LLM response token-by-token to the frontend.
 """
 
+import asyncio
 import json
 import logging
 import uuid
@@ -270,6 +271,10 @@ async def query(
             question=body.question,
         ) as chat_span:
             try:
+                # Flush initial SSE comment ping to immediately open stream and disable proxy buffering
+                yield ": ping\n\n"
+                await asyncio.sleep(0)
+
                 # Step 0: Classify intent — does this need document retrieval?
                 intent = await classify_intent(body.question, chat_history)
                 chat_span.set_attribute("intent", intent)

@@ -348,8 +348,14 @@ export default function ChatPage() {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  const scrollToBottom = (smooth = false) => {
+    if (scrollContainerRef.current) {
+      if (smooth) {
+        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      } else {
+        scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
+      }
+    }
   };
 
   const handleScroll = () => {
@@ -361,8 +367,10 @@ export default function ChatPage() {
   };
 
   useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
+    if (!showScrollDown) {
+      scrollToBottom(false);
+    }
+  }, [messages, showScrollDown]);
 
   // SWR: Instantly load cached messages & revalidate in background via single API call
   useEffect(() => {
@@ -560,72 +568,55 @@ export default function ChatPage() {
       let fullContent = "";
       let buffer = "";
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      const processSseChunk = (chunkText: string) => {
+        const trimmed = chunkText.trim();
+        if (!trimmed || trimmed.startsWith(":")) return; // skip empty blocks or comments/pings
 
-        buffer += decoder.decode(value, { stream: true });
-        
-        const messages = buffer.split("\n\n");
-        buffer = messages.pop() || "";
+        let eventType = "message";
+        let dataStr = "";
 
-        for (const message of messages) {
-          if (!message.trim()) continue;
-
-          let eventType = "message";
-          let dataStr = "";
-
-          for (const line of message.split("\n")) {
-            if (line.startsWith("event: ")) {
-              eventType = line.slice(7).trim();
-            } else if (line.startsWith("data: ")) {
-              dataStr = line.slice(6);
-            }
+        for (const rawLine of trimmed.split("\n")) {
+          const line = rawLine.trim();
+          if (line.startsWith("event:")) {
+            eventType = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            dataStr = line.slice(5).trim();
           }
+        }
 
-          if (!dataStr) continue;
+        if (!dataStr) return;
 
-          try {
-            const data = JSON.parse(dataStr);
+        try {
+          const data = JSON.parse(dataStr);
 
-            if (eventType === "token") {
-              fullContent += data.token || "";
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId ? { ...m, content: fullContent } : m
-                )
-              );
-            } else if (eventType === "citation") {
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId
-                    ? {
-                        ...m,
-                        citations: [
-                          ...(m.citations || []),
-                          {
-                            chunk_id: data.chunk_id,
-                            filename: data.filename,
-                            page_number: data.page_number,
-                            row_range_start: data.row_range_start,
-                            row_range_end: data.row_range_end,
-                            content_preview: data.content_preview,
-                          },
-                        ],
-                      }
-                    : m
-                )
-              );
-            } else if (eventType === "sql") {
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId
-                    ? { ...m, sql_query: data.query }
-                    : m
-                )
-              );
-            } else if (eventType === "title") {
-              const newTitle = data.title;
+          if (eventType === "token") {
+            fullContent += data.token || "";
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId ? { ...m, content: fullContent } : m
+              )
+            );
+          } else if (eventType === "citations" || eventType === "citation") {
+            const citationsList = Array.isArray(data.citations)
+              ? data.citations
+              : Array.isArray(data)
+              ? data
+              : [data];
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId ? { ...m, citations: citationsList } : m
+              )
+            );
+          } else if (eventType === "sql_query" || eventType === "sql") {
+            const sqlQuery = data.sql || data.query || "";
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId ? { ...m, sql_query: sqlQuery } : m
+              )
+            );
+          } else if (eventType === "title") {
+            const newTitle = data.title;
+            if (newTitle) {
               setSessionTitle(newTitle);
               try {
                 const cachedSessions = localStorage.getItem("rag_sessions_cache");
@@ -638,15 +629,38 @@ export default function ChatPage() {
                 }
               } catch {}
               window.dispatchEvent(new Event("chat-sessions-changed"));
-            } else if (eventType === "error") {
-              setError(
-                data.message ||
-                  "Something went wrong. Please try again."
-              );
             }
-          } catch {
-            // Ignore JSON parse errors for incomplete data
+          } else if (eventType === "error") {
+            setError(
+              data.message ||
+                "Something went wrong. Please try again."
+            );
           }
+        } catch {
+          // Ignore JSON parse errors for non-JSON or partial data
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        // Normalize \r\n to \n to ensure CRLF never prevents SSE blocks from splitting
+        buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
+        
+        const chunks = buffer.split("\n\n");
+        buffer = chunks.pop() || "";
+
+        for (const chunk of chunks) {
+          processSseChunk(chunk);
+        }
+      }
+
+      // Flush any trailing buffer
+      const finalRemaining = (buffer + decoder.decode()).replace(/\r\n/g, "\n").trim();
+      if (finalRemaining) {
+        for (const chunk of finalRemaining.split("\n\n")) {
+          processSseChunk(chunk);
         }
       }
     } catch (err: any) {
@@ -865,20 +879,34 @@ export default function ChatPage() {
                     </details>
                   )}
 
-                  <div className="text-sm leading-relaxed text-[var(--foreground)] space-y-2">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      components={markdownComponents}
-                    >
-                      {formatMessageContent(msg.content, msg.citations)}
-                    </ReactMarkdown>
+                  {/* Thinking / Searching indicator during pre-retrieval */}
+                  {streaming && msg.id.startsWith("assistant-") && !msg.content && (
+                    <div className="flex items-center gap-2.5 py-1 text-[var(--muted-foreground)]">
+                      <div className="flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-[var(--primary)] animate-pulse" style={{ animationDelay: "0ms" }} />
+                        <span className="w-1.5 h-1.5 rounded-full bg-[var(--primary)] animate-pulse" style={{ animationDelay: "200ms" }} />
+                        <span className="w-1.5 h-1.5 rounded-full bg-[var(--primary)] animate-pulse" style={{ animationDelay: "400ms" }} />
+                      </div>
+                      <span className="text-xs font-medium text-[var(--muted-foreground)]">
+                        Searching documents & thinking...
+                      </span>
+                    </div>
+                  )}
 
-                    {streaming &&
-                      msg.id.startsWith("assistant-") &&
-                      msg.content.length > 0 && (
+                  {msg.content && (
+                    <div className="text-sm leading-relaxed text-[var(--foreground)] space-y-2">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={markdownComponents}
+                      >
+                        {formatMessageContent(msg.content, msg.citations)}
+                      </ReactMarkdown>
+
+                      {streaming && msg.id.startsWith("assistant-") && (
                         <span className="inline-block w-1.5 h-4 ml-1 align-middle bg-[var(--primary)] animate-pulse rounded-xs" />
                       )}
-                  </div>
+                    </div>
+                  )}
 
                   {/* Citations */}
                   {msg.citations && msg.citations.length > 0 && (
@@ -933,7 +961,7 @@ export default function ChatPage() {
       {/* Floating Scroll to Bottom Button */}
       {showScrollDown && (
         <button
-          onClick={scrollToBottom}
+          onClick={() => scrollToBottom(true)}
           title="Scroll to bottom"
           aria-label="Scroll to bottom"
           className="absolute bottom-28 right-8 z-30 p-2.5 rounded-full bg-[var(--card)] border border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)] shadow-xl transition-all hover:scale-105 cursor-pointer"
