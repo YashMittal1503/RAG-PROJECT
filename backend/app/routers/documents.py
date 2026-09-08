@@ -20,6 +20,7 @@ from app.database import get_db
 from app.models import Chunk, Document, DocumentStatus
 from app.schemas import DocumentResponse, DocumentStatusResponse, UploadResponse
 from app.services import storage, vector_store
+from app.services import tabular_store
 from app.services.ingestion import ingest_document
 from app.utils.file_validation import validate_file_type
 
@@ -94,12 +95,13 @@ async def upload_documents(
                 updated_at=datetime.now(timezone.utc),
             )
             db.add(doc)
-            await db.flush()  # Flush to get the ID before starting background task
+            await db.commit()
+            await db.refresh(doc)
 
-            # Start background ingestion (non-blocking)
+            # Start background ingestion (non-blocking) after record is committed
             asyncio.create_task(
                 ingest_document(
-                    doc_id=doc_id,
+                    doc_id=doc_id,  
                     user_id=user_id,
                     filename=file.filename,
                     file_type=file_type,
@@ -121,8 +123,6 @@ async def upload_documents(
                 "filename": file.filename or "unknown",
                 "error": "An unexpected error occurred during upload.",
             })
-
-    await db.commit()
 
     return UploadResponse(documents=documents, errors=errors)
 
@@ -198,6 +198,14 @@ async def delete_document(
         await vector_store.delete_by_document(user_id, str(doc_id))
     except Exception as e:
         logger.warning(f"Failed to delete vectors for doc {doc_id}: {e}")
+
+    # Delete DuckDB tables for tabular documents
+    if doc.is_tabular:
+        try:
+            import asyncio
+            await asyncio.to_thread(tabular_store.delete_tables, user_id, doc_id)
+        except Exception as e:
+            logger.warning(f"Failed to delete DuckDB tables for doc {doc_id}: {e}")
 
     # Delete file from Supabase Storage
     await storage.delete_file(doc.storage_path)

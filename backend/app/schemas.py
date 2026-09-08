@@ -22,6 +22,7 @@ class DocumentResponse(BaseModel):
     status: str
     failure_reason: Optional[str] = None
     chunk_count: Optional[int] = None
+    is_tabular: bool = False
     created_at: datetime
     updated_at: datetime
 

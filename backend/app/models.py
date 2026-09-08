@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     Enum as SAEnum,
@@ -39,6 +40,7 @@ class DocumentStatus(str, enum.Enum):
     PARSING = "parsing"
     CHUNKING = "chunking"
     EMBEDDING = "embedding"
+    STORING = "storing"       # DuckDB storage phase for tabular data
     READY = "ready"
     FAILED = "failed"
 
@@ -66,6 +68,7 @@ class Document(Base):
     )
     failure_reason = Column(Text, nullable=True)             # human-readable error
     chunk_count = Column(Integer, nullable=True)             # set after chunking
+    is_tabular = Column(Boolean, nullable=False, default=False)  # True for XLSX/CSV (SQL pipeline)
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,

@@ -10,10 +10,11 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from app.auth import get_current_user
 from app.database import AsyncSessionLocal, get_db
@@ -25,10 +26,17 @@ from app.schemas import (
     QueryRequest,
 )
 from app.services.query import (
+    check_tabular_data,
     classify_intent,
     detect_aggregation,
+    execute_sql_query,
+    format_sql_result,
     generate_answer_stream,
     generate_direct_response,
+    generate_sql_answer_stream,
+    generate_sql_query,
+    get_schema_for_prompt,
+    get_tabular_tables,
     retrieve_chunks,
     rewrite_query,
     validate_citations,
@@ -118,27 +126,27 @@ async def delete_session(
 @router.get("/sessions/{session_id}/messages", response_model=list[ChatMessageResponse])
 async def get_messages(
     session_id: uuid.UUID,
+    response: Response,
     user_id: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get all messages in a chat session."""
-    # Verify session belongs to user
+    """Get all messages in a chat session in a single database roundtrip."""
     result = await db.execute(
-        select(ChatSession).where(
+        select(ChatSession)
+        .options(joinedload(ChatSession.messages))
+        .where(
             ChatSession.id == session_id,
             ChatSession.user_id == uuid.UUID(user_id),
         )
     )
-    if not result.scalar_one_or_none():
+    session = result.unique().scalar_one_or_none()
+    if not session:
         raise HTTPException(status_code=404, detail="Chat session not found.")
 
-    result = await db.execute(
-        select(ChatMessage)
-        .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at)
-    )
-    messages = result.scalars().all()
-    return [ChatMessageResponse.model_validate(m) for m in messages]
+    if session.title:
+        response.headers["X-Session-Title"] = session.title
+
+    return [ChatMessageResponse.model_validate(m) for m in session.messages]
 
 
 # ── Streaming query endpoint ──────────────────────────────────────────────
@@ -148,7 +156,6 @@ async def query(
     session_id: uuid.UUID,
     body: QueryRequest,
     user_id: str = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
 ):
     """
     Ask a question and get a streamed answer via SSE.
@@ -159,37 +166,39 @@ async def query(
     - event: done      → data: {}                   (stream complete)
     - event: error     → data: {"message": "..."}   (error occurred)
     """
-    # Verify session belongs to user
-    result = await db.execute(
-        select(ChatSession).where(
-            ChatSession.id == session_id,
-            ChatSession.user_id == uuid.UUID(user_id),
+    # Verify session and save user message in a scoped session so the DB connection
+    # is immediately returned to the pool and not held open during the SSE stream.
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(ChatSession).where(
+                ChatSession.id == session_id,
+                ChatSession.user_id == uuid.UUID(user_id),
+            )
         )
-    )
-    if not result.scalar_one_or_none():
-        raise HTTPException(status_code=404, detail="Chat session not found.")
+        if not result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Chat session not found.")
 
-    # Save the user message
-    user_msg = ChatMessage(
-        session_id=session_id,
-        role="user",
-        content=body.question,
-        created_at=datetime.now(timezone.utc),
-    )
-    db.add(user_msg)
-    await db.commit()
+        # Save the user message
+        user_msg = ChatMessage(
+            session_id=session_id,
+            role="user",
+            content=body.question,
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(user_msg)
+        await db.commit()
 
-    # Get chat history for query rewrite
-    result = await db.execute(
-        select(ChatMessage)
-        .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at)
-    )
-    all_messages = result.scalars().all()
-    chat_history = [
-        {"role": m.role, "content": m.content}
-        for m in all_messages[:-1]  # Exclude the just-added user message
-    ]
+        # Get chat history for query rewrite
+        result = await db.execute(
+            select(ChatMessage)
+            .where(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.created_at)
+        )
+        all_messages = result.scalars().all()
+        chat_history = [
+            {"role": m.role, "content": m.content}
+            for m in all_messages[:-1]  # Exclude the just-added user message
+        ]
 
     async def event_stream():
         """SSE event generator."""
@@ -225,10 +234,94 @@ async def query(
             # Step 1: Rewrite query (for retrieve intent)
             rewritten = await rewrite_query(body.question, chat_history)
 
-            # Step 2: Detect aggregation
+            # Step 2: Check if user has tabular data for SQL pipeline
+            has_tabular = await check_tabular_data(user_id)
+
+            if has_tabular:
+                # ── Text-to-SQL path ──────────────────────────────
+                schema_info = await get_schema_for_prompt(user_id)
+
+                if schema_info:
+                    sql = await generate_sql_query(rewritten, schema_info, chat_history)
+
+                    # If model didn't formulate custom SQL, provide an overview preview query
+                    # so tabular datasets are always analyzed rather than falling back to unrelated PDFs
+                    if not sql:
+                        tables = await get_tabular_tables(user_id)
+                        if tables:
+                            sql = f"SELECT * FROM {tables[0]} LIMIT 15"
+                            logger.info(f"Using tabular overview preview query: {sql}")
+
+                    if sql:
+                        # Send the SQL query to the frontend for transparency
+                        yield f"event: sql_query\ndata: {json.dumps({'sql': sql})}\n\n"
+
+                        try:
+                            sql_result = await execute_sql_query(user_id, sql)
+                            sql_result_text = format_sql_result(sql_result)
+
+                            # Stream the LLM interpretation of the results
+                            full_response = ""
+                            async for token in generate_sql_answer_stream(
+                                rewritten, sql, sql_result_text
+                            ):
+                                full_response += token
+                                yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+
+                            # No vector citations for SQL answers
+                            yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
+
+                            # Save assistant message
+                            async with AsyncSessionLocal() as save_db:
+                                assistant_msg = ChatMessage(
+                                    session_id=session_id,
+                                    role="assistant",
+                                    content=full_response,
+                                    created_at=datetime.now(timezone.utc),
+                                )
+                                save_db.add(assistant_msg)
+                                await save_db.commit()
+
+                            yield f"event: done\ndata: {{}}\n\n"
+                            return
+
+                        except ValueError as sql_err:
+                            logger.warning(f"SQL execution failed, attempting fallback preview: {sql_err}")
+                            tables = await get_tabular_tables(user_id)
+                            preview_sql = f"SELECT * FROM {tables[0]} LIMIT 15" if tables else None
+                            if preview_sql and sql != preview_sql:
+                                try:
+                                    fb_res = await execute_sql_query(user_id, preview_sql)
+                                    fb_text = format_sql_result(fb_res)
+                                    yield f"event: sql_query\ndata: {json.dumps({'sql': preview_sql})}\n\n"
+                                    full_response = ""
+                                    async for token in generate_sql_answer_stream(
+                                        rewritten, preview_sql, fb_text
+                                    ):
+                                        full_response += token
+                                        yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+
+                                    yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
+                                    async with AsyncSessionLocal() as save_db:
+                                        assistant_msg = ChatMessage(
+                                            session_id=session_id,
+                                            role="assistant",
+                                            content=full_response,
+                                            created_at=datetime.now(timezone.utc),
+                                        )
+                                        save_db.add(assistant_msg)
+                                        await save_db.commit()
+
+                                    yield f"event: done\ndata: {{}}\n\n"
+                                    return
+                                except Exception as fb_err:
+                                    logger.warning(f"Fallback preview failed: {fb_err}")
+                            # Fall through to RAG pipeline below
+
+            # Step 3: RAG path — detect aggregation
             is_agg = detect_aggregation(rewritten)
 
-            # Step 3: Retrieve chunks
+            # Step 4: Retrieve chunks
             chunks = await retrieve_chunks(user_id, rewritten, is_agg)
 
             if not chunks:
@@ -253,13 +346,13 @@ async def query(
                 yield f"event: done\ndata: {{}}\n\n"
                 return
 
-            # Step 4: Stream the answer
+            # Step 5: Stream the answer
             full_response = ""
             async for token in generate_answer_stream(rewritten, chunks):
                 full_response += token
                 yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
 
-            # Step 5: Validate citations
+            # Step 6: Validate citations
             citations = validate_citations(full_response, chunks)
             yield f"event: citations\ndata: {json.dumps({'citations': citations})}\n\n"
 

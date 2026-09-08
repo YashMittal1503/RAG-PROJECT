@@ -9,13 +9,15 @@ Implemented as plain Python functions — no LangChain/LangGraph.
 import json
 import logging
 import re
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 from uuid import UUID
 
-from groq import AsyncGroq
+from groq import AsyncGroq, APIError, APIStatusError, RateLimitError
 
 from app.config import settings
-from app.services import embedding, vector_store
+from app.services import embedding, vector_store, reranker
+from app.services.chunking import count_tokens
+from app.services import tabular_store
 
 logger = logging.getLogger(__name__)
 
@@ -31,14 +33,176 @@ def _get_groq() -> AsyncGroq:
     return _groq_client
 
 
+# ── Resilient Multi-Model Fallback Chain ──────────────────────────────────
+# The USP of this project: when one model hits rate limits (429/TPM) or context limits (413),
+# the system automatically and transparently switches to the next available model.
+DEFAULT_MODEL_FALLBACKS = [
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-20b",
+    "groq/compound-mini",
+    "qwen/qwen3.6-27b",
+]
+
+# Fast models for utility tasks (intent classification, query rewriting, SQL generation)
+# These prioritize strict instruction-following, zero-preamble, and low latency
+FAST_MODEL_CHAIN = [
+    "qwen/qwen3.8-27b",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.6-27b",
+    "groq/compound-mini",
+]
+
+
+def get_model_chain(fast: bool = False) -> list[str]:
+    """
+    Get the ordered list of models to try.
+    If fast=True, uses fast instruction-following models for utility tasks.
+    Otherwise starts with the configured settings.groq_model, then chains through
+    distinct candidate models in DEFAULT_MODEL_FALLBACKS.
+    """
+    if fast:
+        return list(FAST_MODEL_CHAIN)
+
+    configured = settings.groq_model
+    chain = [configured]
+    for m in DEFAULT_MODEL_FALLBACKS:
+        if m not in chain and m != configured:
+            chain.append(m)
+    return chain
+
+
+def _is_rate_limit_or_recoverable(err: Exception) -> bool:
+    """Check if an error is a rate limit, capacity, or recoverable status code."""
+    status_code = getattr(err, "status_code", None)
+    err_msg = str(err).lower()
+    return (
+        isinstance(err, (RateLimitError, APIStatusError, APIError))
+        and (
+            status_code in (413, 429, 500, 502, 503, 504)
+            or "rate limit" in err_msg
+            or "tokens per minute" in err_msg
+            or "tpm" in err_msg
+            or "too large" in err_msg
+            or "decommissioned" in err_msg
+            or "capacity" in err_msg
+        )
+    ) or (
+        "rate limit" in err_msg
+        or "tokens per minute" in err_msg
+        or "tpm" in err_msg
+        or "too large" in err_msg
+    )
+
+
+async def call_llm_with_fallback(
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float = 0.0,
+    fast: bool = False,
+) -> Any:
+    """
+    Execute a non-streaming LLM call with automatic multi-model fallback.
+    Tries each model in the fallback chain if rate-limited (429), token limit exceeded (413),
+    or on temporary API errors.
+    """
+    groq = _get_groq()
+    models = get_model_chain(fast=fast)
+    last_err = None
+
+    for model in models:
+        try:
+            logger.info(f"Invoking LLM with model: {model}")
+            response = await groq.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return response
+        except Exception as err:
+            if _is_rate_limit_or_recoverable(err):
+                logger.warning(
+                    f"Model '{model}' failed ({type(err).__name__}: {err}). "
+                    f"Auto-switching to next model in fallback chain..."
+                )
+                last_err = err
+                continue
+            else:
+                logger.error(f"Unrecoverable error on model '{model}': {err}")
+                raise
+
+    logger.error("All fallback models exhausted for non-streaming call.")
+    if last_err:
+        raise last_err
+    raise RuntimeError("All models in the fallback chain failed.")
+
+
+async def stream_llm_with_fallback(
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float = 0.1,
+    fast: bool = False,
+) -> AsyncGenerator[str, None]:
+    """
+    Execute a streaming LLM call with automatic multi-model fallback.
+    If the initial model is rate-limited or fails before stream starts,
+    it automatically catches the error and switches to the next available model.
+    """
+    groq = _get_groq()
+    models = get_model_chain(fast=fast)
+    last_err = None
+
+    for model in models:
+        started = False
+        try:
+            logger.info(f"Starting LLM stream with model: {model}")
+            stream = await groq.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    started = True
+                    yield delta.content
+            return  # Stream completed successfully
+
+        except Exception as err:
+            if _is_rate_limit_or_recoverable(err) and not started:
+                logger.warning(
+                    f"Model '{model}' stream failed ({type(err).__name__}: {err}). "
+                    f"Auto-switching to next model in fallback chain..."
+                )
+                last_err = err
+                continue
+            else:
+                logger.error(f"Error during stream with model '{model}': {err}")
+                raise
+
+    logger.error("All fallback models exhausted for streaming.")
+    if last_err:
+        raise last_err
+    raise RuntimeError("All models in the fallback chain failed.")
+
+
+
 # ── Intent classification ─────────────────────────────────────────────────
 
-INTENT_SYSTEM_PROMPT = """You are an intent classifier for a document Q&A assistant. 
-Given the user's message, classify it into exactly one category.
+INTENT_SYSTEM_PROMPT = """You are an intent classifier for a document Q&A assistant where users upload documents and ask questions about them.
 
-Categories:
-- "retrieve": The user is asking a question that requires searching through uploaded documents (e.g. factual questions, analysis requests, summarization, questions about content).
-- "chitchat": The user is making casual conversation, greeting, saying thanks, or asking something that clearly does NOT require document lookup (e.g. "Hi", "Hello", "Thanks!", "How are you?", "What can you do?", "Who are you?").
+Given the user's message, classify it into exactly one category:
+
+- "retrieve": The user is asking ANY question that COULD be answered using uploaded documents. This includes factual questions, analysis requests, summarization, technical questions, questions about specific topics, or anything that might relate to document content. When in doubt, choose "retrieve".
+- "chitchat": The user is making pure social conversation — greetings, thanks, or meta-questions about the assistant itself. Examples: "Hi", "Hello", "Thanks!", "How are you?", "What can you do?", "Who are you?"
+
+IMPORTANT: If the user asks about ANY topic (python, finance, science, history, etc.), classify as "retrieve" because their uploaded documents may contain relevant information. Only classify as "chitchat" for obvious greetings and pleasantries.
 
 Respond with ONLY the category name — one word, no quotes, no explanation."""
 
@@ -84,11 +248,11 @@ async def classify_intent(
     messages.append({"role": "user", "content": question})
 
     try:
-        response = await groq.chat.completions.create(
-            model=settings.groq_model,
+        response = await call_llm_with_fallback(
             messages=messages,
             max_tokens=150,
             temperature=0.0,
+            fast=True,
         )
         content = (response.choices[0].message.content or "").strip().lower()
         reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip().lower()
@@ -155,18 +319,12 @@ async def generate_direct_response(
 
     messages.append({"role": "user", "content": question})
 
-    stream = await groq.chat.completions.create(
-        model=settings.groq_model,
+    async for token in stream_llm_with_fallback(
         messages=messages,
         max_tokens=200,
         temperature=0.7,
-        stream=True,
-    )
-
-    async for chunk in stream:
-        delta = chunk.choices[0].delta
-        if delta.content:
-            yield delta.content
+    ):
+        yield token
 
 
 # ── Aggregation keywords ──────────────────────────────────────────────────
@@ -189,16 +347,25 @@ def detect_aggregation(question: str) -> bool:
 
 # ── Query rewrite ─────────────────────────────────────────────────────────
 
+REWRITE_SYSTEM_PROMPT = """You are a search query rewriter for a document and tabular data assistant.
+Given a conversation history and a user's follow-up message, rewrite it into a single standalone search question (maximum 20 words).
+
+CRITICAL RULES:
+1. Output ONLY the rewritten question. Never output an answer, explanation, essay, bullet list, or markdown headers.
+2. If the user says "continue", "more", "tell me more", "go on", "elaborate": rewrite it into a question asking for deeper insights, key factors, or metrics about the previous topic (e.g. "What are more details and key factors behind [topic]?").
+3. Strictly maximum 1 sentence under 20 words.
+4. If the question is already self-contained, return it unchanged."""
+
+
 async def rewrite_query(
     question: str,
     chat_history: list[dict],
 ) -> str:
     """
-    Rewrite a question to be self-contained by resolving references
-    to prior conversation turns.
+    Rewrite a question to be self-contained by resolving references to prior conversation turns.
 
     If the question is already self-contained, returns it unchanged.
-    Uses a lightweight Groq call with a short system prompt.
+    Uses a fast LLM call and enforces a strict single-sentence length guard.
     """
     if not chat_history:
         return question
@@ -210,35 +377,45 @@ async def rewrite_query(
         for m in recent
     )
 
-    groq = _get_groq()
+    messages = [
+        {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Conversation history:\n{history_str}\n\n"
+                f"Follow-up question: {question}\n\n"
+                f"Rewritten question:"
+            ),
+        },
+    ]
 
     try:
-        response = await groq.chat.completions.create(
-            model=settings.groq_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a query rewriter. Given a conversation history and a "
-                        "follow-up question, rewrite the question to be self-contained "
-                        "(resolve pronouns, references to 'that', 'it', 'those', etc.). "
-                        "Output ONLY the rewritten question, nothing else. "
-                        "If the question is already self-contained, return it unchanged."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Conversation history:\n{history_str}\n\n"
-                        f"Follow-up question: {question}\n\n"
-                        f"Rewritten question:"
-                    ),
-                },
-            ],
-            max_tokens=200,
+        response = await call_llm_with_fallback(
+            messages=messages,
+            max_tokens=60,
             temperature=0.0,
+            fast=True,
         )
-        rewritten = response.choices[0].message.content.strip()
+        content = (response.choices[0].message.content or "").strip()
+        reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip()
+        rewritten = content or reasoning
+
+        # Strip any markdown code fences or quotes
+        rewritten = re.sub(r"^[`'\"]+|[`'\"]+$", "", rewritten).strip()
+
+        # If model generated a multi-line essay or headers, extract ONLY the first short sentence
+        lines = [
+            line.strip()
+            for line in rewritten.splitlines()
+            if line.strip() and not line.strip().startswith(("#", "**", "---", "###"))
+        ]
+        if lines:
+            rewritten = lines[0]
+
+        # Enforce maximum length limit (under 180 chars) to prevent runaway prompts
+        if len(rewritten) > 180:
+            rewritten = rewritten[:180].rsplit(".", 1)[0].strip()
+
         if rewritten:
             logger.info(f"Query rewritten: '{question}' → '{rewritten}'")
             return rewritten
@@ -265,11 +442,18 @@ async def retrieve_chunks(
     # Embed the query
     query_vector = embedding.embed_query(question)
 
-    # Dense retrieval — top 5 chunks
-    results = await vector_store.search(
+    # Dense candidate retrieval — top 10 candidates for cross-encoder reranking
+    candidates = await vector_store.search(
         user_id=user_id,
         query_vector=query_vector,
-        limit=5,
+        limit=10,
+    )
+
+    # Cross-encoder reranking with FlashRank
+    results = reranker.rerank_chunks(
+        query=question,
+        chunks=candidates,
+        top_k=5,
     )
 
     # If aggregation detected, fetch and prepend up to 3 summary chunks
@@ -304,9 +488,14 @@ RULES:
 6. Be concise, accurate, and professional."""
 
 
-def _build_context(chunks: list[dict]) -> str:
-    """Format retrieved chunks into a context string for the LLM prompt."""
+def _build_context(chunks: list[dict], max_context_tokens: int = 4000) -> str:
+    """
+    Format retrieved chunks into a context string for the LLM prompt.
+    Enforces a strict token budget to prevent exceeding TPM rate limits (e.g. Groq 8k limit).
+    """
     context_parts = []
+    current_tokens = 0
+
     for chunk in chunks:
         filename = chunk.get("filename", "unknown")
         chunk_type = chunk.get("chunk_type", "text")
@@ -322,8 +511,19 @@ def _build_context(chunks: list[dict]) -> str:
         else:
             tag = f"Document: {filename}"
 
-        # Do NOT include raw chunk_id in LLM context so LLM never cites chunk UUIDs
-        context_parts.append(f"[{tag}] (Source: {filename})\n{content}")
+        part = f"[{tag}] (Source: {filename})\n{content}"
+        part_tokens = count_tokens(part)
+
+        # Enforce budget so request never exceeds TPM limit
+        if current_tokens + part_tokens > max_context_tokens:
+            if not context_parts:
+                # If first chunk alone is large, truncate it to fit
+                char_limit = max_context_tokens * 4
+                context_parts.append(part[:char_limit] + "\n... [truncated for length]")
+            break
+
+        context_parts.append(part)
+        current_tokens += part_tokens
 
     return "\n\n---\n\n".join(context_parts)
 
@@ -345,27 +545,23 @@ async def generate_answer_stream(
 
     groq = _get_groq()
 
-    stream = await groq.chat.completions.create(
-        model=settings.groq_model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Context chunks:\n\n{context}\n\n"
-                    f"Question: {question}"
-                ),
-            },
-        ],
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Context chunks:\n\n{context}\n\n"
+                f"Question: {question}"
+            ),
+        },
+    ]
+
+    async for token in stream_llm_with_fallback(
+        messages=messages,
         max_tokens=1000,
         temperature=0.1,
-        stream=True,
-    )
-
-    async for chunk in stream:
-        delta = chunk.choices[0].delta
-        if delta.content:
-            yield delta.content
+    ):
+        yield token
 
 
 # ── Citation validation ───────────────────────────────────────────────────
@@ -427,3 +623,195 @@ def validate_citations(
             })
 
     return valid_citations
+
+
+# ── Text-to-SQL pipeline ──────────────────────────────────────────────────
+
+SQL_GENERATION_PROMPT = """You are an expert SQL query generator. Given a database schema and a user question, generate a DuckDB-compatible SQL SELECT query that answers the question.
+
+RULES:
+1. Generate ONLY a single SQL SELECT statement. No INSERT, UPDATE, DELETE, DROP, or any DDL.
+2. Output ONLY the raw SQL — no explanation, no notes, no commentary.
+3. Use the exact table and column names from the schema.
+4. For aggregations (SUM, AVG, COUNT, MIN, MAX), apply them on the correct numeric columns.
+5. If the user asks an open-ended, overview, or exploratory question (e.g. "tell me about the data", "summarize", "key factors", "overview", "what are the drivers of X"):
+   Generate an analytical aggregation query! For example:
+   - Group by the primary category or target column (like Churn, Status, Department) with COUNT(*) and percentages
+   - Or calculate key averages, distributions, or metrics (e.g. AVG(MonthlyCharges), AVG(tenure))
+   - Or select top informative columns with LIMIT 20
+   Do NOT return CANNOT_ANSWER for general data analysis questions.
+6. Only return CANNOT_ANSWER if the question has absolutely nothing to do with the schema or tables.
+7. Always alias aggregated columns with meaningful names (e.g., total_customers, avg_monthly_charges).
+8. Handle NULL or blank values appropriately: for text/varchar columns containing numbers or spaces, ALWAYS use TRY_CAST(TRIM(col) AS DOUBLE) instead of CAST to avoid conversion errors.
+9. If the user asks for "all data" or something very broad, use LIMIT 50.
+10. Use ILIKE for case-insensitive text matching when filtering by text values."""
+
+
+SQL_ANSWER_PROMPT = """You are a helpful data analyst assistant. You have been given the results of a SQL query executed on the user's uploaded spreadsheet data.
+
+RULES:
+1. Present the data in a clear, well-formatted Markdown response.
+2. Use tables for tabular results, bullet points for summaries.
+3. If the result has numeric aggregations, highlight the key numbers in bold.
+4. Add brief interpretive commentary (e.g., "The highest revenue was **$52,000** from the East region.").
+5. If the result is empty, explain that no matching data was found.
+6. Be concise but thorough.
+7. Reference the data source as "your uploaded spreadsheet data".
+8. Do NOT mention SQL queries, databases, or technical details unless the user explicitly asked for the SQL."""
+
+
+def _extract_sql(content: str) -> str | None:
+    """Extract a valid SQL SELECT statement from raw LLM output."""
+    if not content:
+        return None
+    if "CANNOT_ANSWER" in content:
+        return None
+    # 1. Match inside ```sql ... ``` or ``` ... ```
+    m = re.search(r"```(?:sql)?\s*(SELECT\b[\s\S]*?)```", content, re.IGNORECASE)
+    if m:
+        sql = m.group(1).strip().rstrip(";")
+        return sql
+    # 2. Match raw SELECT statement
+    m = re.search(r"\b(SELECT\b[\s\S]*?)(?:;\s*$|\Z)", content, re.IGNORECASE)
+    if m:
+        sql = m.group(1).strip().rstrip(";")
+        sql = re.sub(r"```.*$", "", sql, flags=re.DOTALL).strip().rstrip(";")
+        return sql
+    return None
+
+
+async def generate_sql_query(
+    question: str,
+    schema_info: str,
+    chat_history: list[dict] | None = None,
+) -> str | None:
+    """
+    Ask the LLM to generate a SQL query for the given question and schema.
+
+    Returns the SQL string, or None if the question can't be answered with SQL.
+    """
+    messages: list[dict] = [
+        {"role": "system", "content": SQL_GENERATION_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Database schema:\n\n{schema_info}\n\n"
+                f"User question: {question}\n\n"
+                f"SQL query:"
+            ),
+        },
+    ]
+
+    try:
+        response = await call_llm_with_fallback(
+            messages=messages,
+            max_tokens=400,
+            temperature=0.0,
+            fast=True,
+        )
+        content = (response.choices[0].message.content or "").strip()
+        reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip()
+
+        sql = _extract_sql(content) or _extract_sql(reasoning)
+        if not sql:
+            logger.info(f"LLM says question cannot be answered with SQL or gave non-SELECT output: '{question[:80]}'")
+            return None
+
+        logger.info(f"Generated SQL: {sql}")
+        return sql
+
+    except Exception as e:
+        logger.warning(f"SQL generation failed: {e}")
+        return None
+
+
+def format_sql_result(result: dict) -> str:
+    """
+    Format SQL query results as a readable string for the LLM context.
+    """
+    columns = result["columns"]
+    rows = result["rows"]
+
+    if not rows:
+        return "The query returned no results."
+
+    # Build a simple text table
+    lines = []
+    header = " | ".join(str(c) for c in columns)
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for row in rows:
+        lines.append(" | ".join(str(v) for v in row))
+
+    if result.get("truncated"):
+        lines.append(f"\n... (showing first {result['row_count']} of many rows)")
+
+    return "\n".join(lines)
+
+
+async def generate_sql_answer_stream(
+    question: str,
+    sql_query: str,
+    sql_result_text: str,
+) -> AsyncGenerator[str, None]:
+    """
+    Stream an LLM answer that interprets the SQL results for the user.
+    """
+    groq = _get_groq()
+
+    messages = [
+        {"role": "system", "content": SQL_ANSWER_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"SQL query executed:\n{sql_query}\n\n"
+                f"Query results:\n{sql_result_text}\n\n"
+                f"User's question: {question}\n\n"
+                f"Please provide a clear, formatted answer:"
+            ),
+        },
+    ]
+
+    async for token in stream_llm_with_fallback(
+        messages=messages,
+        max_tokens=1000,
+        temperature=0.1,
+    ):
+        yield token
+
+
+async def check_tabular_data(user_id: str) -> bool:
+    """
+    Check if the user has any tabular data in DuckDB.
+    Runs the check in a thread to avoid blocking the event loop.
+    """
+    import asyncio
+    return await asyncio.to_thread(tabular_store.has_tabular_data, user_id)
+
+
+async def get_schema_for_prompt(user_id: str) -> str:
+    """
+    Get the full DuckDB schema for the user, formatted for the LLM prompt.
+    Runs in a thread to avoid blocking.
+    """
+    import asyncio
+    return await asyncio.to_thread(tabular_store.get_table_schema, user_id)
+
+
+async def execute_sql_query(user_id: str, sql: str) -> dict:
+    """
+    Execute a SQL query on the user's DuckDB.
+    Runs in a thread to avoid blocking.
+    """
+    import asyncio
+    return await asyncio.to_thread(tabular_store.execute_sql, user_id, sql)
+
+
+async def get_tabular_tables(user_id: str) -> list[str]:
+    """
+    Get list of table names in the user's DuckDB.
+    Runs in a thread to avoid blocking.
+    """
+    import asyncio
+    return await asyncio.to_thread(tabular_store.list_tables, user_id)

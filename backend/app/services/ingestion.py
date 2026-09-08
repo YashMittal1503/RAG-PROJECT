@@ -8,6 +8,7 @@ Status transitions: queued → parsing → chunking → embedding → ready
 Any failure sets status to "failed" with a human-readable reason.
 """
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from app.services.chunking import (
     chunk_text_from_string,
     chunk_spreadsheet,
 )
+from app.services import tabular_store
 
 logger = logging.getLogger(__name__)
 
@@ -35,23 +37,32 @@ async def _update_status(
     failure_reason: str | None = None,
     chunk_count: int | None = None,
 ) -> None:
-    """Update a document's status in the database."""
-    async with AsyncSessionLocal() as session:
-        values = {
-            "status": status,
-            "updated_at": datetime.now(timezone.utc),
-        }
-        if failure_reason is not None:
-            values["failure_reason"] = failure_reason
-        if chunk_count is not None:
-            values["chunk_count"] = chunk_count
+    """Update a document's status in the database with retry for resilience."""
+    for attempt in range(3):
+        try:
+            async with AsyncSessionLocal() as session:
+                values = {
+                    "status": status,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+                if failure_reason is not None:
+                    values["failure_reason"] = failure_reason
+                if chunk_count is not None:
+                    values["chunk_count"] = chunk_count
 
-        await session.execute(
-            update(Document)
-            .where(Document.id == doc_id)
-            .values(**values)
-        )
-        await session.commit()
+                await session.execute(
+                    update(Document)
+                    .where(Document.id == doc_id)
+                    .values(**values)
+                )
+                await session.commit()
+                return
+        except Exception as e:
+            if attempt == 2:
+                logger.error(f"Failed to update status for doc {doc_id} to {status}: {e}")
+                raise
+            logger.warning(f"Retrying status update for doc {doc_id} (attempt {attempt + 1}): {e}")
+            await asyncio.sleep(0.5 * (attempt + 1))
 
 
 async def ingest_document(
@@ -77,21 +88,47 @@ async def ingest_document(
         all_chunks: list[ChunkData] = []
 
         if file_type == "pdf":
-            pages = parse_pdf(file_bytes)
+            pages = await asyncio.to_thread(parse_pdf, file_bytes)
             await _update_status(doc_id, DocumentStatus.CHUNKING)
-            all_chunks = chunk_text(pages, filename=filename)
+            all_chunks = await asyncio.to_thread(chunk_text, pages, filename=filename)
 
         elif file_type == "txt":
-            text = parse_txt(file_bytes)
+            text = await asyncio.to_thread(parse_txt, file_bytes)
             await _update_status(doc_id, DocumentStatus.CHUNKING)
-            all_chunks = chunk_text_from_string(text, filename=filename)
+            all_chunks = await asyncio.to_thread(chunk_text_from_string, text, filename=filename)
 
         elif file_type in ("xlsx", "csv"):
-            sheets = parse_spreadsheet(file_bytes, file_type)
-            await _update_status(doc_id, DocumentStatus.CHUNKING)
+            sheets = await asyncio.to_thread(parse_spreadsheet, file_bytes, file_type)
+
+            # ── Text-to-SQL path: store in DuckDB, skip chunking/embedding ──
+            await _update_status(doc_id, DocumentStatus.STORING)
+            logger.info(f"[{doc_id}] Storing {len(sheets)} sheet(s) in DuckDB")
+
+            total_rows = 0
             for sheet in sheets:
-                sheet_chunks = chunk_spreadsheet(sheet, filename=filename)
-                all_chunks.extend(sheet_chunks)
+                result = await asyncio.to_thread(
+                    tabular_store.store_dataframe,
+                    user_id, doc_id, sheet.name, sheet.df,
+                )
+                total_rows += result["rows"]
+
+            # Mark the document as tabular in the DB
+            async with AsyncSessionLocal() as session:
+                await session.execute(
+                    update(Document)
+                    .where(Document.id == doc_id)
+                    .values(is_tabular=True)
+                )
+                await session.commit()
+
+            # Mark as ready — no chunking/embedding needed
+            await _update_status(
+                doc_id,
+                DocumentStatus.READY,
+                chunk_count=total_rows,
+            )
+            logger.info(f"[{doc_id}] Tabular ingestion complete — {total_rows} rows stored")
+            return  # Early return — skip the embedding pipeline below
 
         else:
             raise ValueError(f"Unsupported file type: {file_type}")
@@ -105,9 +142,9 @@ async def ingest_document(
         await _update_status(doc_id, DocumentStatus.EMBEDDING)
         logger.info(f"[{doc_id}] Embedding {len(all_chunks)} chunks")
 
-        # Batch embed all chunk texts
+        # Batch embed all chunk texts in worker thread so event loop is not blocked
         chunk_texts = [c.content for c in all_chunks]
-        vectors = embedding.embed_texts(chunk_texts)
+        vectors = await asyncio.to_thread(embedding.embed_texts, chunk_texts)
 
         # ── Step 3: Store in Qdrant ───────────────────────────────────
         await vector_store.ensure_collection(user_id)
@@ -131,22 +168,33 @@ async def ingest_document(
         await vector_store.upsert_chunks(user_id, qdrant_points)
 
         # ── Step 4: Save chunk metadata to Postgres ───────────────────
-        async with AsyncSessionLocal() as session:
-            for chunk in all_chunks:
-                db_chunk = Chunk(
-                    id=uuid.UUID(chunk.id),
-                    document_id=doc_id,
-                    user_id=uuid.UUID(user_id),
-                    chunk_index=chunk.chunk_index,
-                    chunk_type=chunk.chunk_type,
-                    content=chunk.content,
-                    page_number=chunk.page_number,
-                    row_range_start=chunk.row_range_start,
-                    row_range_end=chunk.row_range_end,
-                    token_count=chunk.token_count,
-                )
-                session.add(db_chunk)
-            await session.commit()
+        db_chunks = [
+            Chunk(
+                id=uuid.UUID(chunk.id),
+                document_id=doc_id,
+                user_id=uuid.UUID(user_id),
+                chunk_index=chunk.chunk_index,
+                chunk_type=chunk.chunk_type,
+                content=chunk.content,
+                page_number=chunk.page_number,
+                row_range_start=chunk.row_range_start,
+                row_range_end=chunk.row_range_end,
+                token_count=chunk.token_count,
+            )
+            for chunk in all_chunks
+        ]
+
+        for attempt in range(3):
+            try:
+                async with AsyncSessionLocal() as session:
+                    session.add_all(db_chunks)
+                    await session.commit()
+                    break
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                logger.warning(f"[{doc_id}] Retrying chunk save (attempt {attempt + 1}): {e}")
+                await asyncio.sleep(0.5 * (attempt + 1))
 
         # ── Step 5: Mark as ready ─────────────────────────────────────
         await _update_status(
@@ -164,8 +212,11 @@ async def ingest_document(
     except Exception as e:
         # Unexpected errors
         logger.exception(f"[{doc_id}] Unexpected ingestion error")
-        await _update_status(
-            doc_id,
-            DocumentStatus.FAILED,
-            failure_reason=f"An unexpected error occurred during processing: {type(e).__name__}",
-        )
+        try:
+            await _update_status(
+                doc_id,
+                DocumentStatus.FAILED,
+                failure_reason=f"An unexpected error occurred during processing: {type(e).__name__}",
+            )
+        except Exception:
+            logger.exception(f"[{doc_id}] Failed to record failure status")
