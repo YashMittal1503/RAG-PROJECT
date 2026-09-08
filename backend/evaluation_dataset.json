@@ -1,0 +1,66 @@
+{
+  "The Ultimate Python Handbook.pdf": [
+    {
+      "question": "What is the purpose of the Ultimate Python Handbook?",
+      "ground_truth": "The purpose of the Ultimate Python Handbook is to make programming accessible and enjoyable for everyone. It is a comprehensive guide designed for beginners and anyone looking to strengthen their foundational knowledge of Python, a versatile and user-friendly programming language."
+    },
+    {
+      "question": "What are the different types of comments in Python?",
+      "ground_truth": "There are two types of comments in Python: Single-line comments use a '#' at the start of the line, and multi-line comments can use '#' at each line or use triple quotes (triple double-quotes)."
+    },
+    {
+      "question": "What is a function in Python according to the handbook?",
+      "ground_truth": "A function is a group of statements performing a specific task. When a program gets bigger in size and its complexity grows, functions help keep track of which piece of code is doing what. A function can be reused by the programmer in a given program any number of times."
+    },
+    {
+      "question": "How does the if-else conditional work in Python?",
+      "ground_truth": "If-else and elif statements are multiway decisions taken by the program due to certain conditions. The syntax uses if(condition) followed by code block, elif(condition) for additional conditions, and else for the default case. For example: if(a>9): print('greater') else: print('lesser')."
+    },
+    {
+      "question": "What are sets in Python?",
+      "ground_truth": "A set is a collection of non-repetitive elements in Python. Sets are created using set(). Sets do not allow duplicate values."
+    },
+    {
+      "question": "How does a while loop work in Python?",
+      "ground_truth": "A while loop checks a condition. If it evaluates to true, the body of the loop is executed. The process of condition check and execution is continued until the condition becomes False. If the condition never becomes false, the loop keeps getting executed forever."
+    },
+    {
+      "question": "What dictionary methods are described in the Python handbook?",
+      "ground_truth": "The dictionary methods described are: items() which returns a list of (key, value) tuples, keys() which returns a list containing dictionary's keys, update() which updates the dictionary with supplied key-value pairs, and get() which returns the value of the specified key."
+    }
+  ],
+  "Yash_Mittal_Offer_Letter_signed.pdf": [
+    {
+      "question": "What position was offered in the Xoodrip offer letter?",
+      "ground_truth": "The position offered was Software Developer Intern at Xoodrip Private Limited."
+    },
+    {
+      "question": "What is the salary mentioned in the Xoodrip offer letter?",
+      "ground_truth": "The salary mentioned is Unpaid Internship."
+    },
+    {
+      "question": "What is the work mode and internship duration mentioned in the offer letter?",
+      "ground_truth": "The work mode is Remote and the internship duration is 3 months, starting from October 17, 2025."
+    }
+  ],
+  "Can We Be Strangers Again.pdf": [
+    {
+      "question": "What emotions did the narrator experience after eating Chicken Lal Jhol and listening to the song ‘Besar Rahee Sharabein’?",
+      "ground_truth": "After eating Chicken Lal Jhol, the narrator felt a deep sense of unease and emotional heaviness, despite craving the food. The familiar comfort of the meal did not alleviate their distress, instead leaving them with a feeling of being overwhelmed by sorrow and turmoil. The lyrics of the song ‘Besar Rahee Sharabein, Besabar Ye Dil Jo Mera’ resonated profoundly with their emotions, amplifying their ache and yearning for loss. The narrator described the song as echoing their turmoil, making it feel like a silent witness to their heartbreak, and each note of the music intensified the ache in their chest. This emotional resonance made the song act as a soundtrack to their sorrow, making it harder to escape their swirling thoughts and overwhelming emotions."
+    },
+    {
+      "question": "What was the narrator's initial reaction to Tanishka's message about removing them from social media and what did they ultimately decide to say in response?",
+      "ground_truth": "The narrator initially felt a mix of contemplation and emotional weight upon reading Tanishka’s message, which stated she was removing them from Instagram and Snapchat, while expressing her continued availability for support. Initially, they avoided replying. However, upon reflection, they composed a thoughtful response that acknowledged Tanishka’s advice about not getting stuck on people and expressed readiness to move forward. They wished Tanishka well for her placement at St. Xavier’s and added, ‘If I hadn’t proposed to Avantika, maybe things would have been different,’ hinting at regret over their past actions and the subsequent loss of Tanishka."
+    }
+  ],
+  "2405.15793v3.pdf": [
+    {
+      "question": "What is the purpose of the regex pattern modification in the provided code snippet, specifically regarding how it handles the detection of warning notes like FIXME or XXX in the code?",
+      "ground_truth": "The modification to the regular expression pattern in the code snippet addresses an issue with how warning notes such as FIXME or XXX are detected. Originally, the regex was structured to allow the tag to be followed by any non-word character or the end of the string (`(?=\\W|$)`) but included an unnecessary inclusion of `{self.config.notes_rgx}`, which could cause incorrect matches. The edit removes this redundant component and simplifies the regex to focus solely on the `{notes}` variable, ensuring that only the specified warning notes (e.g., FIXME, XXX) are correctly identified when they appear at the start of a line prefixed by a `#`. This change ensures that the regex string `rf\"#\\\\s*({notes})(?=\\\\W|$)\"` reliably matches warning notes regardless of intervening non-word characters, thereby improving the accuracy of the `EncodingChecker` in detecting such notes in the codebase."
+    },
+    {
+      "question": "What is the probability of a successful edit after the agent encounters its first failed edit attempt, and what is the probability of not recovering at all after this failure?",
+      "ground_truth": "According to the provided excerpt, the probability of a successful edit after the agent encounters its first failed edit attempt is 57.2%. This means that there is a 42.8% chance that the agent will not recover successfully from that single failed edit attempt, indicating a significant drop in recovery odds from the initial 90.5% chance of success with no prior failures."
+    }
+  ]
+}

@@ -39,49 +39,186 @@ logger = logging.getLogger("ragas_eval")
 USER_ID = "ef052553-0d23-40e8-a677-508a417259a5"
 
 
-# ── Evaluation Dataset ────────────────────────────────────────────────────
-EVAL_DATASET = [
-    {
-        "question": "What is the purpose of the Ultimate Python Handbook?",
-        "ground_truth": "The purpose of the Ultimate Python Handbook is to make programming accessible and enjoyable for everyone. It is a comprehensive guide designed for beginners and anyone looking to strengthen their foundational knowledge of Python, a versatile and user-friendly programming language.",
-    },
-    {
-        "question": "What are the different types of comments in Python?",
-        "ground_truth": "There are two types of comments in Python: Single-line comments use a '#' at the start of the line, and multi-line comments can use '#' at each line or use triple quotes (triple double-quotes).",
-    },
-    {
-        "question": "What is a function in Python according to the handbook?",
-        "ground_truth": "A function is a group of statements performing a specific task. When a program gets bigger in size and its complexity grows, functions help keep track of which piece of code is doing what. A function can be reused by the programmer in a given program any number of times.",
-    },
-    {
-        "question": "How does the if-else conditional work in Python?",
-        "ground_truth": "If-else and elif statements are multiway decisions taken by the program due to certain conditions. The syntax uses if(condition) followed by code block, elif(condition) for additional conditions, and else for the default case. For example: if(a>9): print('greater') else: print('lesser').",
-    },
-    {
-        "question": "What are sets in Python?",
-        "ground_truth": "A set is a collection of non-repetitive elements in Python. Sets are created using set(). Sets do not allow duplicate values.",
-    },
-    {
-        "question": "What position was offered in the Xoodrip offer letter?",
-        "ground_truth": "The position offered was Software Developer Intern at Xoodrip Private Limited.",
-    },
-    {
-        "question": "What is the salary mentioned in the Xoodrip offer letter?",
-        "ground_truth": "The salary mentioned is Unpaid Internship.",
-    },
-    {
-        "question": "What is the work mode and internship duration mentioned in the offer letter?",
-        "ground_truth": "The work mode is Remote and the internship duration is 3 months, starting from October 17, 2025.",
-    },
-    {
-        "question": "How does a while loop work in Python?",
-        "ground_truth": "A while loop checks a condition. If it evaluates to true, the body of the loop is executed. The process of condition check and execution is continued until the condition becomes False. If the condition never becomes false, the loop keeps getting executed forever.",
-    },
-    {
-        "question": "What dictionary methods are described in the Python handbook?",
-        "ground_truth": "The dictionary methods described are: items() which returns a list of (key, value) tuples, keys() which returns a list containing dictionary's keys, update() which updates the dictionary with supplied key-value pairs, and get() which returns the value of the specified key.",
-    },
-]
+# ── Dynamic Evaluation Dataset ─────────────────────────────────────────────
+DATASET_FILE = os.path.join(os.path.dirname(__file__), "evaluation_dataset.json")
+
+
+async def discover_user_documents(user_id: str) -> dict[str, list[dict]]:
+    """
+    Scroll Qdrant collection for the given user and group chunks by filename.
+    Returns: { filename: [ { "content": str, "page_number": int, "chunk_type": str }, ... ] }
+    """
+    from app.services.vector_store import get_client, _collection_name
+    client = await get_client()
+    col = _collection_name(user_id)
+    offset = None
+    chunks_by_file: dict[str, list[dict]] = {}
+
+    while True:
+        res, offset = await client.scroll(
+            collection_name=col,
+            limit=100,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for pt in res:
+            fn = pt.payload.get("filename")
+            content = pt.payload.get("content", "")
+            if not fn or not content:
+                continue
+            chunks_by_file.setdefault(fn, []).append({
+                "content": content,
+                "page_number": pt.payload.get("page_number"),
+                "chunk_type": pt.payload.get("chunk_type", "text"),
+            })
+        if offset is None:
+            break
+
+    return chunks_by_file
+
+
+async def synthesize_qa_for_chunk(
+    client: Any,
+    model: str,
+    filename: str,
+    chunk_text: str,
+) -> dict | None:
+    """
+    Generate a grounded question and comprehensive ground_truth answer
+    from a specific document excerpt using ministral-3b-2512.
+    """
+    system_prompt = (
+        "You are an AI benchmark creator for RAG evaluation. "
+        "Given a document excerpt, generate 1 natural user question and a comprehensive, "
+        "factually accurate ground-truth answer based ONLY on the provided excerpt.\n"
+        "Requirements:\n"
+        "1. The question must be specific and answerable purely from the excerpt.\n"
+        "2. The ground_truth must be a comprehensive paragraph string directly grounded in the excerpt.\n"
+        "3. Output STRICT JSON with keys: \"question\" (string) and \"ground_truth\" (string)."
+    )
+    user_prompt = f"Document: {filename}\n\nExcerpt:\n{chunk_text[:1500]}"
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+        )
+        data = json.loads(resp.choices[0].message.content)
+        q = data.get("question", "").strip()
+        gt = data.get("ground_truth", "")
+        if isinstance(gt, dict):
+            gt = " ".join(f"{k}: {v}" for k, v in gt.items())
+        elif isinstance(gt, list):
+            gt = " ".join(str(item) for item in gt)
+        gt = str(gt).strip()
+
+        if q and gt:
+            return {"question": q, "ground_truth": gt}
+    except Exception as e:
+        logger.warning(f"Failed to synthesize QA for {filename}: {e}")
+    return None
+
+
+async def sync_and_load_evaluation_dataset(
+    user_id: str,
+    questions_per_new_doc: int = 2,
+) -> list[dict]:
+    """
+    Discovers all uploaded documents in the user's Qdrant collection,
+    loads existing questions from evaluation_dataset.json,
+    and dynamically synthesizes grounded questions for any newly discovered documents.
+    Returns: flattened list of [{ "question": ..., "ground_truth": ..., "document": ... }]
+    """
+    from openai import AsyncOpenAI
+    from app.config import settings
+
+    logger.info("Scanning vector database for user documents...")
+    chunks_by_file = await discover_user_documents(user_id)
+    logger.info(f"Discovered {len(chunks_by_file)} documents in vector store: {list(chunks_by_file.keys())}")
+
+    # Load persistent dataset if it exists
+    dataset_store: dict[str, list[dict]] = {}
+    if os.path.exists(DATASET_FILE):
+        try:
+            with open(DATASET_FILE, "r", encoding="utf-8") as f:
+                dataset_store = json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not read {DATASET_FILE}: {e}")
+
+    # Prepare Mistral client for synthesis if new documents need questions
+    mistral_keys = settings.get_mistral_keys()
+    judge_model = settings.mistral_model or "ministral-3b-2512"
+    if judge_model == "mistral-small-latest":
+        judge_model = "ministral-3b-2512"
+
+    mistral_clients = [
+        AsyncOpenAI(api_key=k, base_url="https://api.mistral.ai/v1")
+        for k in mistral_keys
+    ] if mistral_keys else []
+
+    updated = False
+    for fn, chunks in chunks_by_file.items():
+        existing_qs = dataset_store.get(fn, [])
+        if existing_qs:
+            logger.info(f"  [Existing Document] '{fn}': {len(existing_qs)} questions loaded from cache.")
+            continue
+
+        logger.info(f"  [New Document Detected] '{fn}' ({len(chunks)} chunks). Synthesizing {questions_per_new_doc} grounded questions...")
+        if not mistral_clients:
+            logger.error("Cannot synthesize questions for new document: No Mistral API keys configured.")
+            continue
+
+        # Filter out very short chunks (e.g. copyright, headers)
+        substantive = [c for c in chunks if len(c["content"]) > 150]
+        if not substantive:
+            substantive = chunks
+
+        # Pick diverse chunks across document span
+        stride = max(1, len(substantive) // (questions_per_new_doc + 1))
+        chosen_indices = [min((i + 1) * stride, len(substantive) - 1) for i in range(questions_per_new_doc)]
+        chosen_indices = list(dict.fromkeys(chosen_indices))
+
+        new_qa_list = []
+        for idx_i, chunk_idx in enumerate(chosen_indices):
+            chunk = substantive[chunk_idx]
+            client = mistral_clients[idx_i % len(mistral_clients)]
+            qa = await synthesize_qa_for_chunk(
+                client=client,
+                model=judge_model,
+                filename=fn,
+                chunk_text=chunk["content"],
+            )
+            if qa:
+                new_qa_list.append(qa)
+                logger.info(f"    Generated Q{idx_i+1}: '{qa['question'][:65]}...'")
+
+        if new_qa_list:
+            dataset_store[fn] = new_qa_list
+            updated = True
+
+    # Persist updated dataset to file
+    if updated:
+        with open(DATASET_FILE, "w", encoding="utf-8") as f:
+            json.dump(dataset_store, f, indent=2, ensure_ascii=False)
+        logger.info(f"Updated evaluation dataset successfully saved to: {DATASET_FILE}")
+
+    # Flatten into list of test questions with document tags
+    flattened = []
+    for fn, items in dataset_store.items():
+        for item in items:
+            flattened.append({
+                "question": item["question"],
+                "ground_truth": item["ground_truth"],
+                "document": fn,
+            })
+
+    logger.info(f"Total benchmark questions across all documents: {len(flattened)}")
+    return flattened
 
 
 async def run_rag_pipeline(question: str) -> dict:
@@ -205,25 +342,26 @@ class RotatingJudgeLLM(BaseChatModel):
         return "rotating-judge-llm"
 
 
-async def collect_evaluation_data(concurrency: int = 1) -> list[dict]:
+async def collect_evaluation_data(dataset: list[dict], concurrency: int = 1) -> list[dict]:
     """
     Run the RAG pipeline on all test questions freshly using sequential pacing.
     Processes 1 question at a time with a 2.0s pause to stay strictly within Groq's 30,000 TPM limit.
     """
-    logger.info(f"Running fresh RAG pipeline on {len(EVAL_DATASET)} test questions with concurrency={concurrency}...")
+    logger.info(f"Running fresh RAG pipeline on {len(dataset)} test questions with concurrency={concurrency}...")
     sem = asyncio.Semaphore(concurrency)
 
     async def _process_item(index: int, item: dict) -> dict:
         q = item["question"]
         gt = item["ground_truth"]
+        doc = item.get("document", "Unknown")
         async with sem:
-            logger.info(f"[{index+1}/{len(EVAL_DATASET)}] Querying: '{q[:60]}...'")
+            logger.info(f"[{index+1}/{len(dataset)}] [{doc}] Querying: '{q[:60]}...'")
             t_start = time.time()
             try:
                 result = await run_rag_pipeline(q)
                 elapsed_ms = (time.time() - t_start) * 1000
                 logger.info(
-                    f"[{index+1}/{len(EVAL_DATASET)}] Finished in {elapsed_ms:.0f}ms | "
+                    f"[{index+1}/{len(dataset)}] Finished in {elapsed_ms:.0f}ms | "
                     f"Contexts: {len(result['contexts'])} | Answer: {len(result['answer'])} chars"
                 )
                 # 2.0-second pause to prevent token accumulation in Groq's 60s window
@@ -231,6 +369,7 @@ async def collect_evaluation_data(concurrency: int = 1) -> list[dict]:
                 return {
                     "question": q,
                     "ground_truth": gt,
+                    "document": doc,
                     "answer": result["answer"],
                     "contexts": result["contexts"],
                     "citations": result.get("citations", []),
@@ -240,10 +379,11 @@ async def collect_evaluation_data(concurrency: int = 1) -> list[dict]:
                     "chunk_metadata": result["chunk_metadata"],
                 }
             except Exception as e:
-                logger.error(f"[{index+1}/{len(EVAL_DATASET)}] ERROR on '{q[:60]}...': {e}")
+                logger.error(f"[{index+1}/{len(dataset)}] ERROR on '{q[:60]}...': {e}")
                 return {
                     "question": q,
                     "ground_truth": gt,
+                    "document": doc,
                     "answer": f"ERROR: {str(e)}",
                     "contexts": [],
                     "retrieval_time_ms": 0,
@@ -252,7 +392,7 @@ async def collect_evaluation_data(concurrency: int = 1) -> list[dict]:
                     "chunk_metadata": [],
                 }
 
-    tasks = [_process_item(i, item) for i, item in enumerate(EVAL_DATASET)]
+    tasks = [_process_item(i, item) for i, item in enumerate(dataset)]
     all_results = await asyncio.gather(*tasks)
     return list(all_results)
 
@@ -393,10 +533,20 @@ def run_ragas_evaluation(results: list[dict]) -> dict:
             run_config=RunConfig(max_workers=max_workers, timeout=60, max_retries=2, max_wait=10),
         )
 
-        # Convert to dict
-        scores = eval_result.to_pandas().to_dict(orient="records")
+        # Convert to dict and enrich with document metadata
+        raw_scores = eval_result.to_pandas().to_dict(orient="records")
+        scores = []
+        for i, row in enumerate(raw_scores):
+            cleaned = {}
+            for k, v in row.items():
+                if isinstance(v, float) and (v != v):  # NaN check
+                    continue
+                cleaned[k] = round(v, 4) if isinstance(v, float) else v
+            if i < len(results):
+                cleaned["document"] = results[i].get("document", "Unknown")
+            scores.append(cleaned)
 
-        # Compute aggregates
+        # Compute overall aggregates
         aggregate = {}
         metric_names = ["faithfulness", "answer_relevancy", "llm_context_precision_without_reference", "context_recall", "factual_correctness(mode=f1)"]
         for metric in metric_names:
@@ -404,9 +554,25 @@ def run_ragas_evaluation(results: list[dict]) -> dict:
             if values:
                 aggregate[metric] = round(sum(values) / len(values), 4)
 
+        # Compute per-document aggregates
+        by_document = {}
+        for s in scores:
+            doc = s.get("document", "Unknown")
+            by_document.setdefault(doc, []).append(s)
+
+        doc_aggregates = {}
+        for doc, doc_scores in by_document.items():
+            doc_aggs = {}
+            for metric in metric_names:
+                m_vals = [s.get(metric) for s in doc_scores if s.get(metric) is not None and not (isinstance(s.get(metric), float) and s.get(metric) != s.get(metric))]
+                if m_vals:
+                    doc_aggs[metric] = round(sum(m_vals) / len(m_vals), 4)
+            doc_aggregates[doc] = doc_aggs
+
         return {
             "per_question": scores,
             "aggregate": aggregate,
+            "by_document": doc_aggregates,
             "num_samples": len(samples),
             "evaluation_method": f"ragas ({judge_provider} {judge_model})",
         }
@@ -509,8 +675,10 @@ def print_results(eval_results: dict, raw_results: list[dict]):
     per_q = eval_results.get("per_question", [])
     for i, raw in enumerate(raw_results):
         score = per_q[i] if i < len(per_q) else {}
+        doc = raw.get("document", "Unknown")
         print(f"\n{'_' * 60}")
-        print(f"Q{i+1}: {raw['question']}")
+        print(f"Q{i+1} [{doc}]:")
+        print(f"  Question:     {raw['question']}")
         gt_preview = raw['ground_truth'][:100].encode('ascii', 'replace').decode()
         ans_preview = raw['answer'][:100].encode('ascii', 'replace').decode()
         print(f"  Ground Truth: {gt_preview}...")
@@ -518,16 +686,16 @@ def print_results(eval_results: dict, raw_results: list[dict]):
         print(f"  Chunks:       {len(raw['contexts'])} retrieved")
 
         for key, val in score.items():
-            if key not in ("question", "user_input", "response", "retrieved_contexts", "reference"):
+            if key not in ("question", "user_input", "response", "retrieved_contexts", "reference", "document"):
                 if isinstance(val, float):
                     emoji = "[OK]" if val >= 0.7 else ("[WARN]" if val >= 0.5 else "[LOW]")
                     print(f"  {emoji} {key}: {val:.4f}")
                 elif isinstance(val, (int, bool)):
                     print(f"     {key}: {val}")
 
-    # Aggregate
+    # Overall Aggregate
     print(f"\n{'=' * 70}")
-    print("  AGGREGATE SCORES")
+    print("  AGGREGATE SCORES (ALL DOCUMENTS)")
     print(f"{'=' * 70}")
     for metric, val in eval_results.get("aggregate", {}).items():
         if isinstance(val, float) and val <= 1.0:
@@ -535,6 +703,18 @@ def print_results(eval_results: dict, raw_results: list[dict]):
             print(f"  {emoji} {metric}: {val:.4f}")
         else:
             print(f"       {metric}: {val}")
+
+    # Per-Document Aggregates
+    if eval_results.get("by_document"):
+        print(f"\n{'=' * 70}")
+        print("  PER-DOCUMENT AGGREGATES")
+        print(f"{'=' * 70}")
+        for doc, metrics in eval_results["by_document"].items():
+            print(f"\n  Document: {doc}")
+            for metric, val in metrics.items():
+                if isinstance(val, float):
+                    emoji = "[OK]" if val >= 0.7 else ("[WARN]" if val >= 0.5 else "[LOW]")
+                    print(f"    {emoji} {metric}: {val:.4f}")
 
     print(f"\n  Total samples evaluated: {eval_results.get('num_samples', 0)}")
     method = eval_results.get("evaluation_method", "ragas")
@@ -547,12 +727,15 @@ async def main():
     t_global_start = time.time()
     logger.info("Starting High-Performance RAGAS Evaluation of DocuChat RAG Pipeline")
     logger.info(f"   User ID: {USER_ID}")
-    logger.info(f"   Test questions: {len(EVAL_DATASET)}")
     logger.info(f"   Timestamp: {datetime.now().isoformat()}")
+
+    # Step 0: Sync and load dynamic evaluation dataset across all uploaded documents
+    dataset = await sync_and_load_evaluation_dataset(USER_ID, questions_per_new_doc=2)
+    logger.info(f"   Total test questions: {len(dataset)}")
 
     # Step 1: Run RAG pipeline on all test questions freshly
     t1_start = time.time()
-    raw_results = await collect_evaluation_data(concurrency=1)
+    raw_results = await collect_evaluation_data(dataset=dataset, concurrency=1)
     t1_elapsed = time.time() - t1_start
     logger.info(f"\nPhase 1 (Fresh RAG Generation) completed in {t1_elapsed:.1f}s")
 
