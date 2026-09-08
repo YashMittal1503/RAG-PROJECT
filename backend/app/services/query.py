@@ -389,18 +389,150 @@ RULES:
 7. Be concise, accurate, and professional."""
 
 
-def _build_context(chunks: list[dict], max_context_tokens: int = 4000) -> str:
+# ── Contextual Compression ────────────────────────────────────────────────
+COMPRESSION_STOP_WORDS = {
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
+    "any", "are", "aren't", "as", "at", "be", "because", "been", "before", "being",
+    "below", "between", "both", "but", "by", "can", "can't", "cannot", "could",
+    "couldn't", "did", "didn't", "do", "does", "doesn't", "doing", "don't", "down",
+    "during", "each", "few", "for", "from", "further", "had", "hadn't", "has",
+    "hasn't", "have", "haven't", "having", "he", "he'd", "he'll", "he's", "her",
+    "here", "here's", "hers", "herself", "him", "himself", "his", "how", "how's",
+    "i", "i'd", "i'll", "i'm", "i've", "if", "in", "into", "is", "isn't", "it",
+    "it's", "its", "itself", "let's", "me", "more", "most", "mustn't", "my",
+    "myself", "no", "nor", "not", "of", "off", "on", "once", "only", "or", "other",
+    "ought", "our", "ours", "ourselves", "out", "over", "own", "same", "shan't",
+    "she", "she'd", "she'll", "she's", "should", "shouldn't", "so", "some", "such",
+    "than", "that", "that's", "the", "their", "theirs", "them", "themselves",
+    "then", "there", "there's", "these", "they", "they'd", "they'll", "they're",
+    "they've", "this", "those", "through", "to", "too", "under", "until", "up",
+    "very", "was", "wasn't", "we", "we'd", "we'll", "we're", "we've", "were",
+    "weren't", "what", "what's", "when", "when's", "where", "where's", "which",
+    "while", "who", "who's", "whom", "why", "why's", "with", "won't", "would",
+    "wouldn't", "you", "you'd", "you'll", "you're", "you've", "your", "yours",
+    "yourself", "yourselves",
+}
+
+
+def compress_chunk_content(
+    content: str,
+    query: str,
+    max_sentences: int = 3,
+    window_size: int = 1,
+) -> str:
+    """
+    Extractively compresses a text chunk by retaining only sentences relevant to the query,
+    expanded with adjacent sentence context (±1) to ensure grammatical and narrative continuity.
+
+    Returns the original content unmodified if:
+    - The chunk is already concise (<= 4 sentences).
+    - No significant query term matches are found (failsafe to prevent accidental data loss).
+    """
+    if not content or not query:
+        return content
+
+    from app.services.chunking import _split_into_sentences
+    sentences = _split_into_sentences(content)
+
+    # Do not compress already compact chunks
+    if len(sentences) <= 4:
+        return content
+
+    # Extract meaningful query keywords (alphanumeric, length > 1, not stop words)
+    q_tokens = [
+        w.lower() for w in re.findall(r"\b\w+\b", query)
+        if len(w) > 1 and w.lower() not in COMPRESSION_STOP_WORDS
+    ]
+    if not q_tokens:
+        return content
+
+    q_set = set(q_tokens)
+
+    # Score each sentence
+    scored: list[tuple[float, int]] = []
+    for i, s in enumerate(sentences):
+        s_lower = s.lower()
+        s_tokens = re.findall(r"\b\w+\b", s_lower)
+        if not s_tokens:
+            continue
+        s_set = set(s_tokens)
+
+        # 1. Exact query keyword overlap count
+        overlap = len(q_set & s_set)
+        if overlap == 0:
+            continue
+
+        # 2. Density bonus: higher score if matching words form a bigger fraction of the sentence
+        density = overlap / len(s_set)
+
+        # 3. Exact phrase match bonus (if 2+ consecutive query words appear verbatim in sentence)
+        phrase_bonus = 0.0
+        if len(q_tokens) >= 2:
+            for j in range(len(q_tokens) - 1):
+                bigram = f"{q_tokens[j]} {q_tokens[j+1]}"
+                if bigram in s_lower:
+                    phrase_bonus += 1.5
+
+        total_score = overlap + (density * 2.0) + phrase_bonus
+        scored.append((total_score, i))
+
+    # If no sentences matched, return full content safely (zero data loss)
+    if not scored:
+        return content
+
+    # Sort sentences by relevance score descending
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Take top scoring sentences and expand each with adjacent window (±window_size)
+    selected_indices: set[int] = set()
+    for _, idx in scored[:max_sentences]:
+        start = max(0, idx - window_size)
+        end = min(len(sentences), idx + window_size + 1)
+        for w in range(start, end):
+            selected_indices.add(w)
+
+    # If selected sentences encompass almost the entire chunk (> 75%), keep original chunk
+    if len(selected_indices) >= len(sentences) * 0.75:
+        return content
+
+    # Reassemble selected sentences in chronological document order
+    sorted_indices = sorted(selected_indices)
+    parts = []
+    prev_idx = -1
+    for idx in sorted_indices:
+        if prev_idx != -1 and idx > prev_idx + 1:
+            parts.append("[...]")
+        parts.append(sentences[idx].strip())
+        prev_idx = idx
+
+    return " ".join(parts)
+
+
+def _build_context(
+    chunks: list[dict],
+    query: str = "",
+    max_context_tokens: int = 4000,
+    enable_compression: bool = True,
+) -> str:
     """
     Format retrieved chunks into a context string for the LLM prompt.
-    Enforces a strict token budget to prevent exceeding TPM rate limits (e.g. Groq 8k limit).
+    Enforces a strict token budget and applies extractive contextual compression
+    to prune distractor sentences while preserving citation metadata.
     """
     context_parts = []
     current_tokens = 0
+    total_raw_tokens = 0
 
     for chunk in chunks:
         filename = chunk.get("filename", "unknown")
         chunk_type = chunk.get("chunk_type", "text")
         content = chunk.get("content", "")
+        raw_chunk_tokens = count_tokens(content)
+        total_raw_tokens += raw_chunk_tokens
+
+        # Apply extractive contextual compression to text chunks
+        if enable_compression and query and chunk_type == "text":
+            content = compress_chunk_content(content, query)
 
         # Build clean human-friendly label for citation
         if chunk.get("page_number"):
@@ -426,6 +558,12 @@ def _build_context(chunks: list[dict], max_context_tokens: int = 4000) -> str:
         context_parts.append(part)
         current_tokens += part_tokens
 
+    if total_raw_tokens > 0 and current_tokens < total_raw_tokens:
+        savings = ((total_raw_tokens - current_tokens) / total_raw_tokens) * 100
+        logger.info(
+            f"Contextual compression reduced context: {total_raw_tokens} -> {current_tokens} tokens (-{savings:.1f}%)"
+        )
+
     return "\n\n---\n\n".join(context_parts)
 
 
@@ -443,7 +581,7 @@ async def generate_answer_stream(
     for citation validation.
     """
     with logfire.span("rag.generate_answer", question=question, chunks_count=len(chunks)) as span:
-        context = _build_context(chunks)
+        context = _build_context(chunks, query=question)
 
         groq = _get_groq()
 
