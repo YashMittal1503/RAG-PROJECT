@@ -31,7 +31,7 @@ class Settings(BaseSettings):
 
     # ── Groq LLM ──────────────────────────────────────────────────────────
     groq_api_key: str
-    groq_model: str = "openai/gpt-oss-120b"
+    groq_model: str = "groq/compound"
 
     # ── Embedding ─────────────────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"

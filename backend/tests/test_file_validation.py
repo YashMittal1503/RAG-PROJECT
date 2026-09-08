@@ -36,10 +36,9 @@ class TestValidateFileType:
 
     def test_unsupported_file_type_rejected(self):
         """Binary files that aren't in the allowlist should be rejected."""
-        # ELF binary header (Linux executable)
-        elf_header = b"\x7fELF" + b"\x00" * 2048
+        binary_header = b"\x89PNG\r\n\x1a\n" + b"\x00" * 2048
         with pytest.raises(ValueError, match="Unsupported file type"):
-            validate_file_type(elf_header, "program.exe")
+            validate_file_type(binary_header, "image.png")
 
     def test_xlsm_blocked_by_extension(self):
         """Macro-enabled .xlsm files should be blocked even before magic-byte check."""

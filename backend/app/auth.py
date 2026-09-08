@@ -5,6 +5,7 @@ Verifies Supabase Auth JWTs locally using the project's JWKS endpoint (for asymm
 with fallbacks to legacy HS256 secret or Supabase API verification.
 """
 
+import time
 import jwt
 from jwt import PyJWKClient
 from fastapi import Depends, HTTPException, status
@@ -17,9 +18,41 @@ from app.config import settings
 security = HTTPBearer()
 
 jwks_url = f"{settings.supabase_url}/auth/v1/.well-known/jwks.json"
-jwks_client = PyJWKClient(jwks_url)
+jwks_client = PyJWKClient(jwks_url, cache_jwk_set=True, lifespan=3600)
+
+
+def warm_up_auth() -> None:
+    """Pre-fetch JWKS signing keys on startup to eliminate first-request auth delay."""
+    try:
+        jwks_client.get_signing_keys()
+    except Exception:
+        pass
+
 
 _supabase_admin = None
+
+# In-memory cache for verified tokens: token -> (user_id, expire_time)
+# Avoids re-verifying crypto signatures or calling Supabase Auth on rapid requests/polling
+_verified_token_cache: dict[str, tuple[str, float]] = {}
+
+
+def _get_cached_user(token: str) -> str | None:
+    cached = _verified_token_cache.get(token)
+    if cached:
+        user_id, exp = cached
+        if time.time() < exp:
+            return user_id
+        _verified_token_cache.pop(token, None)
+    return None
+
+
+def _cache_user(token: str, user_id: str, exp: float | None = None) -> None:
+    if len(_verified_token_cache) > 1000:
+        _verified_token_cache.clear()
+    now = time.time()
+    ttl = min(60.0, (exp - now) if exp else 60.0)
+    if ttl > 0:
+        _verified_token_cache[token] = (user_id, now + ttl)
 
 
 def get_supabase_admin():
@@ -39,6 +72,12 @@ async def get_current_user(
     Raises HTTP 401 if the token is invalid, expired, or malformed.
     """
     token = credentials.credentials
+
+    # Fast-path: return cached user_id if token was recently verified
+    cached_user_id = _get_cached_user(token)
+    if cached_user_id:
+        return cached_user_id
+
     payload = None
 
     # 1. Try JWKS verification (modern Supabase ECC / RSA tokens)
@@ -79,7 +118,9 @@ async def get_current_user(
             client = get_supabase_admin()
             user_resp = client.auth.get_user(token)
             if user_resp and user_resp.user:
-                return str(user_resp.user.id)
+                uid = str(user_resp.user.id)
+                _cache_user(token, uid)
+                return uid
         except Exception as api_err:
             print(f"[AUTH ERROR] Supabase API verification failed: {api_err}")
             raise HTTPException(
@@ -101,4 +142,6 @@ async def get_current_user(
             detail="Token is missing user identifier.",
         )
 
+    exp = payload.get("exp")
+    _cache_user(token, str(user_id), float(exp) if exp else None)
     return str(user_id)
