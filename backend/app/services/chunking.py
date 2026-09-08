@@ -55,14 +55,41 @@ def count_tokens(text: str) -> int:
 
 def _split_into_sentences(text: str) -> list[str]:
     """
-    Split text into sentences, preserving the delimiter.
-    Simple heuristic: split on '. ', '! ', '? ', and newlines.
+    Split text into sentences, preserving delimiter and meaning.
+    Oversized sentences exceeding MAX_CHUNK_TOKENS (e.g. dense research paper tables,
+    citations, code, or formulas) are automatically sub-split.
     """
     import re
-    # Split on sentence-ending punctuation followed by whitespace,
-    # or on double newlines (paragraph breaks)
-    parts = re.split(r'(?<=[.!?])\s+|\n\n+', text)
-    return [p.strip() for p in parts if p.strip()]
+    # Split on sentence-ending punctuation followed by whitespace, or on double newlines
+    raw_parts = re.split(r'(?<=[.!?])\s+|\n\n+', text)
+    sentences: list[str] = []
+    for part in raw_parts:
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        # If a single sentence/block exceeds MAX_CHUNK_TOKENS, break it into smaller sub-sentences
+        if count_tokens(cleaned) > MAX_CHUNK_TOKENS:
+            sub_parts = re.split(r'(?<=[;:])\s+|\n+', cleaned)
+            for sp in sub_parts:
+                sp_clean = sp.strip()
+                if not sp_clean:
+                    continue
+                if count_tokens(sp_clean) > MAX_CHUNK_TOKENS:
+                    # Hard word slice to guarantee chunk fits under MAX_CHUNK_TOKENS
+                    words = sp_clean.split()
+                    w_buf: list[str] = []
+                    for w in words:
+                        w_buf.append(w)
+                        if len(w_buf) >= 300:  # ~380-450 tokens
+                            sentences.append(" ".join(w_buf))
+                            w_buf = []
+                    if w_buf:
+                        sentences.append(" ".join(w_buf))
+                else:
+                    sentences.append(sp_clean)
+        else:
+            sentences.append(cleaned)
+    return sentences
 
 
 def chunk_text(pages: list[PageText], filename: str = "") -> list[ChunkData]:
@@ -70,21 +97,20 @@ def chunk_text(pages: list[PageText], filename: str = "") -> list[ChunkData]:
     Chunk text content (from PDF or TXT) into overlapping chunks.
 
     Strategy:
-    1. Split all pages into sentences
-    2. Accumulate sentences until we hit the target token count
-    3. When a chunk is full, start the next one with overlap from the end
-       of the previous chunk
-    4. Track which page each sentence came from for citation metadata
+    1. Split all pages into sentences (with oversized sentence protection).
+    2. Pre-compute token counts to prevent redundant encoding.
+    3. Accumulate sentences into bounded chunks with smooth overlap.
+    4. Deterministic forward progress via for-loop (guaranteed no infinite loops).
     """
     chunks: list[ChunkData] = []
     chunk_index = 0
 
-    # Build a list of (sentence, page_number) tuples
-    sentence_pages: list[tuple[str, int]] = []
+    # Build list of (sentence, page_number, token_count) tuples
+    sentence_pages: list[tuple[str, int, int]] = []
     for page in pages:
         sentences = _split_into_sentences(page.text)
         for sent in sentences:
-            sentence_pages.append((sent, page.page_number))
+            sentence_pages.append((sent, page.page_number, count_tokens(sent)))
 
     if not sentence_pages:
         return chunks
@@ -94,29 +120,10 @@ def chunk_text(pages: list[PageText], filename: str = "") -> list[ChunkData]:
     current_tokens = 0
     current_pages: set[int] = set()
 
-    i = 0
-    while i < len(sentence_pages):
-        sent, page_num = sentence_pages[i]
-        sent_tokens = count_tokens(sent)
-
-        # If a single sentence exceeds max tokens, we have to include it alone
-        if sent_tokens > MAX_CHUNK_TOKENS and not current_sentences:
-            chunks.append(ChunkData(
-                content=sent,
-                chunk_index=chunk_index,
-                chunk_type="text",
-                page_number=page_num,
-                token_count=sent_tokens,
-            ))
-            chunk_index += 1
-            i += 1
-            continue
-
-        # Would adding this sentence exceed the max?
+    for sent, page_num, sent_tokens in sentence_pages:
+        # If adding this sentence exceeds MAX_CHUNK_TOKENS and we already have content:
         if current_tokens + sent_tokens > MAX_CHUNK_TOKENS and current_sentences:
-            # Finalize the current chunk
             chunk_text_content = " ".join(current_sentences)
-            # Use the most common page number, or the first one
             primary_page = min(current_pages) if current_pages else None
             chunks.append(ChunkData(
                 content=chunk_text_content,
@@ -127,30 +134,27 @@ def chunk_text(pages: list[PageText], filename: str = "") -> list[ChunkData]:
             ))
             chunk_index += 1
 
-            # Calculate overlap: take sentences from the end of current chunk
-            # that total approximately overlap_tokens
+            # Compute overlap sentences from the end of current chunk
             overlap_sents: list[str] = []
             overlap_tok = 0
-            for s in reversed(current_sentences):
-                st = count_tokens(s)
-                if overlap_tok + st > overlap_tokens:
-                    break
-                overlap_sents.insert(0, s)
-                overlap_tok += st
+            if sent_tokens < MAX_CHUNK_TOKENS:
+                for s in reversed(current_sentences):
+                    st = count_tokens(s)
+                    if overlap_tok + st > overlap_tokens or overlap_tok + st + sent_tokens > MAX_CHUNK_TOKENS:
+                        break
+                    overlap_sents.insert(0, s)
+                    overlap_tok += st
 
             current_sentences = overlap_sents
             current_tokens = overlap_tok
-            current_pages = set()
-            # Don't increment i — re-process this sentence with the new chunk
-            continue
+            current_pages = {page_num} if overlap_sents else set()
 
-        # Add sentence to current chunk
+        # Add current sentence
         current_sentences.append(sent)
         current_tokens += sent_tokens
         current_pages.add(page_num)
-        i += 1
 
-    # Don't forget the last chunk
+    # Finalize remaining chunk
     if current_sentences:
         chunk_text_content = " ".join(current_sentences)
         primary_page = min(current_pages) if current_pages else None

@@ -92,6 +92,15 @@ class TestChunkText:
         chunks = chunk_text([])
         assert len(chunks) == 0
 
+    def test_oversized_sentence_no_infinite_loop(self):
+        """A single sentence larger than MAX_CHUNK_TOKENS must not cause an infinite loop."""
+        huge_text = "Short introductory sentence. " + ("word " * 900) + ". Final conclusion."
+        pages = [PageText(page_number=1, text=huge_text)]
+        chunks = chunk_text(pages)
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert chunk.token_count <= MAX_CHUNK_TOKENS + 50
+
 
 class TestChunkSpreadsheet:
     """Tests for spreadsheet chunking."""

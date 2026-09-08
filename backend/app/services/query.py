@@ -13,6 +13,7 @@ from typing import Any, AsyncGenerator
 from uuid import UUID
 
 from groq import AsyncGroq, APIError, APIStatusError, RateLimitError
+import logfire
 
 from app.config import settings
 from app.services import embedding, vector_store, reranker
@@ -114,13 +115,19 @@ async def call_llm_with_fallback(
     for model in models:
         try:
             logger.info(f"Invoking LLM with model: {model}")
-            response = await groq.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-            return response
+            with logfire.span("llm.call", model=model, fast=fast, max_tokens=max_tokens) as span:
+                response = await groq.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                usage = getattr(response, "usage", None)
+                if usage:
+                    span.set_attribute("prompt_tokens", usage.prompt_tokens)
+                    span.set_attribute("completion_tokens", usage.completion_tokens)
+                    span.set_attribute("total_tokens", usage.total_tokens)
+                return response
         except Exception as err:
             if _is_rate_limit_or_recoverable(err):
                 logger.warning(
@@ -158,21 +165,25 @@ async def stream_llm_with_fallback(
         started = False
         try:
             logger.info(f"Starting LLM stream with model: {model}")
-            stream = await groq.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stream=True,
-            )
-            async for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    started = True
-                    yield delta.content
-            return  # Stream completed successfully
+            with logfire.span("llm.stream", model=model, fast=fast, max_tokens=max_tokens) as span:
+                stream = await groq.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stream=True,
+                )
+                token_count = 0
+                async for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        started = True
+                        token_count += 1
+                        yield delta.content
+                span.set_attribute("streamed_tokens", token_count)
+                return  # Stream completed successfully
 
         except Exception as err:
             if _is_rate_limit_or_recoverable(err) and not started:
@@ -217,69 +228,84 @@ async def classify_intent(
 
     Returns: "retrieve" or "chitchat"
     """
-    # Fast heuristic for obvious greetings / conversational pleasantries
-    cleaned = question.strip().lower()
-    cleaned = re.sub(r"[^\w\s]", "", cleaned)
-    quick_chitchat = {
-        "hi", "hello", "hey", "hola", "howdy",
-        "good morning", "good afternoon", "good evening",
-        "how are you", "how are you doing", "whats up", "what's up",
-        "who are you", "what can you do", "help",
-        "thanks", "thank you", "thx", "bye", "goodbye",
-    }
-    if cleaned in quick_chitchat:
-        logger.info(f"Intent classified (heuristic): '{question}' → chitchat")
-        return "chitchat"
-
-    groq = _get_groq()
-
-    messages: list[dict] = [
-        {"role": "system", "content": INTENT_SYSTEM_PROMPT},
-    ]
-
-    # Include last 2 messages for context (helps with follow-ups like "thanks")
-    if chat_history:
-        for m in chat_history[-2:]:
-            messages.append({
-                "role": m["role"],
-                "content": m["content"][:150],
-            })
-
-    messages.append({"role": "user", "content": question})
-
-    try:
-        response = await call_llm_with_fallback(
-            messages=messages,
-            max_tokens=150,
-            temperature=0.0,
-            fast=True,
-        )
-        content = (response.choices[0].message.content or "").strip().lower()
-        reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip().lower()
-
-        # Check content first
-        if "chitchat" in content:
-            logger.info(f"Intent classified: '{question}' → chitchat")
+    with logfire.span("rag.classify_intent", question=question) as span:
+        # Fast heuristic for obvious greetings / conversational pleasantries
+        cleaned = question.strip().lower()
+        cleaned = re.sub(r"[^\w\s]", "", cleaned)
+        quick_chitchat = {
+            "hi", "hello", "hey", "hola", "howdy",
+            "good morning", "good afternoon", "good evening",
+            "how are you", "how are you doing", "whats up", "what's up",
+            "who are you", "what can you do", "help",
+            "thanks", "thank you", "thx", "bye", "goodbye",
+        }
+        if cleaned in quick_chitchat:
+            logger.info(f"Intent classified (heuristic): '{question}' → chitchat")
+            span.set_attribute("intent", "chitchat")
+            span.set_attribute("method", "heuristic")
             return "chitchat"
-        if "retrieve" in content:
-            logger.info(f"Intent classified: '{question}' → retrieve")
+
+        groq = _get_groq()
+
+        messages: list[dict] = [
+            {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+        ]
+
+        # Include last 2 messages for context (helps with follow-ups like "thanks")
+        if chat_history:
+            for m in chat_history[-2:]:
+                messages.append({
+                    "role": m["role"],
+                    "content": m["content"][:150],
+                })
+
+        messages.append({"role": "user", "content": question})
+
+        try:
+            response = await call_llm_with_fallback(
+                messages=messages,
+                max_tokens=150,
+                temperature=0.0,
+                fast=True,
+            )
+            content = (response.choices[0].message.content or "").strip().lower()
+            reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip().lower()
+
+            # Check content first
+            if "chitchat" in content:
+                logger.info(f"Intent classified: '{question}' → chitchat")
+                span.set_attribute("intent", "chitchat")
+                span.set_attribute("method", "llm")
+                return "chitchat"
+            if "retrieve" in content:
+                logger.info(f"Intent classified: '{question}' → retrieve")
+                span.set_attribute("intent", "retrieve")
+                span.set_attribute("method", "llm")
+                return "retrieve"
+
+            # Fallback to reasoning if content was in reasoning
+            if "chitchat" in reasoning:
+                logger.info(f"Intent classified (from reasoning): '{question}' → chitchat")
+                span.set_attribute("intent", "chitchat")
+                span.set_attribute("method", "llm_reasoning")
+                return "chitchat"
+            if "retrieve" in reasoning:
+                logger.info(f"Intent classified (from reasoning): '{question}' → retrieve")
+                span.set_attribute("intent", "retrieve")
+                span.set_attribute("method", "llm_reasoning")
+                return "retrieve"
+
+            # If the LLM returns something unexpected, default to retrieve
+            logger.warning(f"Unknown intent '{content}' for '{question}', defaulting to retrieve")
+            span.set_attribute("intent", "retrieve")
+            span.set_attribute("method", "fallback_unknown")
             return "retrieve"
 
-        # Fallback to reasoning if content was in reasoning
-        if "chitchat" in reasoning:
-            logger.info(f"Intent classified (from reasoning): '{question}' → chitchat")
-            return "chitchat"
-        if "retrieve" in reasoning:
-            logger.info(f"Intent classified (from reasoning): '{question}' → retrieve")
+        except Exception as e:
+            logger.warning(f"Intent classification failed: {e}, defaulting to retrieve")
+            span.set_attribute("intent", "retrieve")
+            span.set_attribute("method", "fallback_error")
             return "retrieve"
-
-        # If the LLM returns something unexpected, default to retrieve
-        logger.warning(f"Unknown intent '{content}' for '{question}', defaulting to retrieve")
-        return "retrieve"
-
-    except Exception as e:
-        logger.warning(f"Intent classification failed: {e}, defaulting to retrieve")
-        return "retrieve"
 
 
 # ── Direct response (no retrieval) ────────────────────────────────────────
@@ -370,59 +396,62 @@ async def rewrite_query(
     if not chat_history:
         return question
 
-    # Build a condensed history string (last 5 messages)
-    recent = chat_history[-5:]
-    history_str = "\n".join(
-        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:200]}"
-        for m in recent
-    )
-
-    messages = [
-        {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"Conversation history:\n{history_str}\n\n"
-                f"Follow-up question: {question}\n\n"
-                f"Rewritten question:"
-            ),
-        },
-    ]
-
-    try:
-        response = await call_llm_with_fallback(
-            messages=messages,
-            max_tokens=60,
-            temperature=0.0,
-            fast=True,
+    with logfire.span("rag.rewrite_query", original_question=question, history_turns=len(chat_history)) as span:
+        # Build a condensed history string (last 5 messages)
+        recent = chat_history[-5:]
+        history_str = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:200]}"
+            for m in recent
         )
-        content = (response.choices[0].message.content or "").strip()
-        reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip()
-        rewritten = content or reasoning
 
-        # Strip any markdown code fences or quotes
-        rewritten = re.sub(r"^[`'\"]+|[`'\"]+$", "", rewritten).strip()
-
-        # If model generated a multi-line essay or headers, extract ONLY the first short sentence
-        lines = [
-            line.strip()
-            for line in rewritten.splitlines()
-            if line.strip() and not line.strip().startswith(("#", "**", "---", "###"))
+        messages = [
+            {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Conversation history:\n{history_str}\n\n"
+                    f"Follow-up question: {question}\n\n"
+                    f"Rewritten question:"
+                ),
+            },
         ]
-        if lines:
-            rewritten = lines[0]
 
-        # Enforce maximum length limit (under 180 chars) to prevent runaway prompts
-        if len(rewritten) > 180:
-            rewritten = rewritten[:180].rsplit(".", 1)[0].strip()
+        try:
+            response = await call_llm_with_fallback(
+                messages=messages,
+                max_tokens=60,
+                temperature=0.0,
+                fast=True,
+            )
+            content = (response.choices[0].message.content or "").strip()
+            reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip()
+            rewritten = content or reasoning
 
-        if rewritten:
-            logger.info(f"Query rewritten: '{question}' → '{rewritten}'")
-            return rewritten
-    except Exception as e:
-        logger.warning(f"Query rewrite failed, using original: {e}")
+            # Strip any markdown code fences or quotes
+            rewritten = re.sub(r"^[`'\"]+|[`'\"]+$", "", rewritten).strip()
 
-    return question
+            # If model generated a multi-line essay or headers, extract ONLY the first short sentence
+            lines = [
+                line.strip()
+                for line in rewritten.splitlines()
+                if line.strip() and not line.strip().startswith(("#", "**", "---", "###"))
+            ]
+            if lines:
+                rewritten = lines[0]
+
+            # Enforce maximum length limit (under 180 chars) to prevent runaway prompts
+            if len(rewritten) > 180:
+                rewritten = rewritten[:180].rsplit(".", 1)[0].strip()
+
+            if rewritten:
+                logger.info(f"Query rewritten: '{question}' → '{rewritten}'")
+                span.set_attribute("rewritten_question", rewritten)
+                return rewritten
+        except Exception as e:
+            logger.warning(f"Query rewrite failed, using original: {e}")
+
+        span.set_attribute("rewritten_question", question)
+        return question
 
 
 # ── Retrieve chunks ───────────────────────────────────────────────────────
@@ -439,35 +468,43 @@ async def retrieve_chunks(
     2. Search Qdrant for top-K similar chunks
     3. If aggregation detected, also fetch summary chunks and prepend them
     """
-    # Embed the query
-    query_vector = embedding.embed_query(question)
+    with logfire.span("rag.retrieve_chunks", question=question, is_aggregation=is_aggregation) as span:
+        # Embed the query
+        query_vector = embedding.embed_query(question)
 
-    # Dense candidate retrieval — top 10 candidates for cross-encoder reranking
-    candidates = await vector_store.search(
-        user_id=user_id,
-        query_vector=query_vector,
-        limit=10,
-    )
+        # Dense candidate retrieval — top 10 candidates for cross-encoder reranking
+        candidates = await vector_store.search(
+            user_id=user_id,
+            query_vector=query_vector,
+            limit=10,
+        )
+        span.set_attribute("candidates_retrieved", len(candidates))
 
-    # Cross-encoder reranking with FlashRank
-    results = reranker.rerank_chunks(
-        query=question,
-        chunks=candidates,
-        top_k=5,
-    )
+        # Cross-encoder reranking with FlashRank
+        results = reranker.rerank_chunks(
+            query=question,
+            chunks=candidates,
+            top_k=5,
+        )
+        span.set_attribute("reranked_count", len(results))
+        if results:
+            span.set_attribute("top_score", results[0].get("score", 0.0))
+            span.set_attribute("top_source", results[0].get("filename", "unknown"))
+            span.set_attribute("retrieved_sources", list(set(r.get("filename", "unknown") for r in results)))
 
-    # If aggregation detected, fetch and prepend up to 3 summary chunks
-    if is_aggregation:
-        summary_chunks = await vector_store.get_summary_chunks(user_id)
-        if summary_chunks:
-            # Deduplicate: remove any summary chunks already in results
-            result_ids = {r["id"] for r in results}
-            new_summaries = [s for s in summary_chunks if s["id"] not in result_ids][:3]
-            # Prepend summaries so they appear first in context
-            results = new_summaries + results
-            logger.info(f"Added {len(new_summaries)} summary chunks for aggregation query")
+        # If aggregation detected, fetch and prepend up to 3 summary chunks
+        if is_aggregation:
+            summary_chunks = await vector_store.get_summary_chunks(user_id)
+            if summary_chunks:
+                # Deduplicate: remove any summary chunks already in results
+                result_ids = {r["id"] for r in results}
+                new_summaries = [s for s in summary_chunks if s["id"] not in result_ids][:3]
+                # Prepend summaries so they appear first in context
+                results = new_summaries + results
+                span.set_attribute("summary_chunks_added", len(new_summaries))
+                logger.info(f"Added {len(new_summaries)} summary chunks for aggregation query")
 
-    return results
+        return results
 
 
 # ── System prompt ─────────────────────────────────────────────────────────
@@ -485,7 +522,8 @@ RULES:
    - Use Markdown headings (e.g. ### Section Name) to organize long responses.
    - Place citations like [Page 3] directly after the relevant sentence or bullet point.
 5. Do NOT make up, hallucinate, or infer information that is not explicitly stated in the context.
-6. Be concise, accurate, and professional."""
+6. NEVER claim, pretend, or hallucinate that you performed a web search. You do not have external web access and must answer solely from the provided document context.
+7. Be concise, accurate, and professional."""
 
 
 def _build_context(chunks: list[dict], max_context_tokens: int = 4000) -> str:
@@ -541,27 +579,31 @@ async def generate_answer_stream(
     The caller is responsible for accumulating the full response
     for citation validation.
     """
-    context = _build_context(chunks)
+    with logfire.span("rag.generate_answer", question=question, chunks_count=len(chunks)) as span:
+        context = _build_context(chunks)
 
-    groq = _get_groq()
+        groq = _get_groq()
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"Context chunks:\n\n{context}\n\n"
-                f"Question: {question}"
-            ),
-        },
-    ]
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Context chunks:\n\n{context}\n\n"
+                    f"Question: {question}"
+                ),
+            },
+        ]
 
-    async for token in stream_llm_with_fallback(
-        messages=messages,
-        max_tokens=1000,
-        temperature=0.1,
-    ):
-        yield token
+        token_count = 0
+        async for token in stream_llm_with_fallback(
+            messages=messages,
+            max_tokens=1000,
+            temperature=0.1,
+        ):
+            token_count += 1
+            yield token
+        span.set_attribute("tokens_generated", token_count)
 
 
 # ── Citation validation ───────────────────────────────────────────────────
@@ -574,55 +616,57 @@ def validate_citations(
     Extract and validate citation references from the LLM response.
     Supports [Page X], [Rows X-Y], [Summary], and [CHUNK <id>].
     """
-    valid_citations = []
-    seen = set()
+    with logfire.span("rag.validate_citations", chunks_available=len(context_chunks)) as span:
+        valid_citations = []
+        seen = set()
 
-    for chunk in context_chunks:
-        cid = chunk["id"]
-        page = chunk.get("page_number")
-        rows = chunk.get("row_range_start")
-        fname = chunk.get("filename", "")
+        for chunk in context_chunks:
+            cid = chunk["id"]
+            page = chunk.get("page_number")
+            rows = chunk.get("row_range_start")
+            fname = chunk.get("filename", "")
 
-        is_cited = False
-        # Match [Page X] or (Page X) or 【Page X】 or Page X
-        if page is not None and re.search(rf'(?:\[|【|\()?\s*Page\s+{page}\b', full_response, re.IGNORECASE):
-            is_cited = True
-        # Match [Rows X-Y] or Rows X-Y
-        elif rows is not None and re.search(rf'(?:\[|【|\()?\s*Rows?\s+{rows}\b', full_response, re.IGNORECASE):
-            is_cited = True
-        # Match [Summary]
-        elif chunk.get("chunk_type") == "summary" and re.search(r'(?:\[|【|\()?\s*Summary\b', full_response, re.IGNORECASE):
-            is_cited = True
-        # Match legacy [CHUNK <id>]
-        elif cid in full_response:
-            is_cited = True
+            is_cited = False
+            # Match [Page X] or (Page X) or 【Page X】 or Page X
+            if page is not None and re.search(rf'(?:\[|【|\()?\s*Page\s+{page}\b', full_response, re.IGNORECASE):
+                is_cited = True
+            # Match [Rows X-Y] or Rows X-Y
+            elif rows is not None and re.search(rf'(?:\[|【|\()?\s*Rows?\s+{rows}\b', full_response, re.IGNORECASE):
+                is_cited = True
+            # Match [Summary]
+            elif chunk.get("chunk_type") == "summary" and re.search(r'(?:\[|【|\()?\s*Summary\b', full_response, re.IGNORECASE):
+                is_cited = True
+            # Match legacy [CHUNK <id>]
+            elif cid in full_response:
+                is_cited = True
 
-        if is_cited and cid not in seen:
-            seen.add(cid)
-            content = chunk.get("content", "")
-            valid_citations.append({
-                "chunk_id": cid,
-                "filename": chunk.get("filename", "unknown"),
-                "page_number": page,
-                "row_range_start": chunk.get("row_range_start"),
-                "row_range_end": chunk.get("row_range_end"),
-                "content_preview": content[:200] + ("..." if len(content) > 200 else ""),
-            })
+            if is_cited and cid not in seen:
+                seen.add(cid)
+                content = chunk.get("content", "")
+                valid_citations.append({
+                    "chunk_id": cid,
+                    "filename": chunk.get("filename", "unknown"),
+                    "page_number": page,
+                    "row_range_start": chunk.get("row_range_start"),
+                    "row_range_end": chunk.get("row_range_end"),
+                    "content_preview": content[:200] + ("..." if len(content) > 200 else ""),
+                })
 
-    # If no explicit page tags matched in text but chunks were used, include top chunks
-    if not valid_citations and context_chunks:
-        for chunk in context_chunks[:3]:
-            content = chunk.get("content", "")
-            valid_citations.append({
-                "chunk_id": chunk["id"],
-                "filename": chunk.get("filename", "unknown"),
-                "page_number": chunk.get("page_number"),
-                "row_range_start": chunk.get("row_range_start"),
-                "row_range_end": chunk.get("row_range_end"),
-                "content_preview": content[:200] + ("..." if len(content) > 200 else ""),
-            })
+        # If no explicit page tags matched in text but chunks were used, include top chunks
+        if not valid_citations and context_chunks:
+            for chunk in context_chunks[:3]:
+                content = chunk.get("content", "")
+                valid_citations.append({
+                    "chunk_id": chunk["id"],
+                    "filename": chunk.get("filename", "unknown"),
+                    "page_number": chunk.get("page_number"),
+                    "row_range_start": chunk.get("row_range_start"),
+                    "row_range_end": chunk.get("row_range_end"),
+                    "content_preview": content[:200] + ("..." if len(content) > 200 else ""),
+                })
 
-    return valid_citations
+        span.set_attribute("valid_citations_count", len(valid_citations))
+        return valid_citations
 
 
 # ── Text-to-SQL pipeline ──────────────────────────────────────────────────
@@ -690,39 +734,45 @@ async def generate_sql_query(
 
     Returns the SQL string, or None if the question can't be answered with SQL.
     """
-    messages: list[dict] = [
-        {"role": "system", "content": SQL_GENERATION_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"Database schema:\n\n{schema_info}\n\n"
-                f"User question: {question}\n\n"
-                f"SQL query:"
-            ),
-        },
-    ]
+    with logfire.span("rag.generate_sql", question=question) as span:
+        messages: list[dict] = [
+            {"role": "system", "content": SQL_GENERATION_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Database schema:\n\n{schema_info}\n\n"
+                    f"User question: {question}\n\n"
+                    f"SQL query:"
+                ),
+            },
+        ]
 
-    try:
-        response = await call_llm_with_fallback(
-            messages=messages,
-            max_tokens=400,
-            temperature=0.0,
-            fast=True,
-        )
-        content = (response.choices[0].message.content or "").strip()
-        reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip()
+        try:
+            response = await call_llm_with_fallback(
+                messages=messages,
+                max_tokens=400,
+                temperature=0.0,
+                fast=True,
+            )
+            content = (response.choices[0].message.content or "").strip()
+            reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip()
 
-        sql = _extract_sql(content) or _extract_sql(reasoning)
-        if not sql:
-            logger.info(f"LLM says question cannot be answered with SQL or gave non-SELECT output: '{question[:80]}'")
+            sql = _extract_sql(content) or _extract_sql(reasoning)
+            if not sql:
+                logger.info(f"LLM says question cannot be answered with SQL or gave non-SELECT output: '{question[:80]}'")
+                span.set_attribute("sql_generated", False)
+                return None
+
+            logger.info(f"Generated SQL: {sql}")
+            span.set_attribute("sql_generated", True)
+            span.set_attribute("sql", sql)
+            return sql
+
+        except Exception as e:
+            logger.warning(f"SQL generation failed: {e}")
+            span.set_attribute("sql_generated", False)
+            span.set_attribute("error", str(e))
             return None
-
-        logger.info(f"Generated SQL: {sql}")
-        return sql
-
-    except Exception as e:
-        logger.warning(f"SQL generation failed: {e}")
-        return None
 
 
 def format_sql_result(result: dict) -> str:
@@ -758,27 +808,31 @@ async def generate_sql_answer_stream(
     """
     Stream an LLM answer that interprets the SQL results for the user.
     """
-    groq = _get_groq()
+    with logfire.span("rag.generate_sql_answer", question=question, sql_query=sql_query) as span:
+        groq = _get_groq()
 
-    messages = [
-        {"role": "system", "content": SQL_ANSWER_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"SQL query executed:\n{sql_query}\n\n"
-                f"Query results:\n{sql_result_text}\n\n"
-                f"User's question: {question}\n\n"
-                f"Please provide a clear, formatted answer:"
-            ),
-        },
-    ]
+        messages = [
+            {"role": "system", "content": SQL_ANSWER_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"SQL query executed:\n{sql_query}\n\n"
+                    f"Query results:\n{sql_result_text}\n\n"
+                    f"User's question: {question}\n\n"
+                    f"Please provide a clear, formatted answer:"
+                ),
+            },
+        ]
 
-    async for token in stream_llm_with_fallback(
-        messages=messages,
-        max_tokens=1000,
-        temperature=0.1,
-    ):
-        yield token
+        token_count = 0
+        async for token in stream_llm_with_fallback(
+            messages=messages,
+            max_tokens=1000,
+            temperature=0.1,
+        ):
+            token_count += 1
+            yield token
+        span.set_attribute("tokens_generated", token_count)
 
 
 async def check_tabular_data(user_id: str) -> bool:
@@ -805,7 +859,11 @@ async def execute_sql_query(user_id: str, sql: str) -> dict:
     Runs in a thread to avoid blocking.
     """
     import asyncio
-    return await asyncio.to_thread(tabular_store.execute_sql, user_id, sql)
+    with logfire.span("duckdb.execute_sql", sql=sql) as span:
+        result = await asyncio.to_thread(tabular_store.execute_sql, user_id, sql)
+        span.set_attribute("row_count", result.get("row_count", 0))
+        span.set_attribute("columns", result.get("columns", []))
+        return result
 
 
 async def get_tabular_tables(user_id: str) -> list[str]:
