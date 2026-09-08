@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     # ── Observability (Logfire / OpenTelemetry) ───────────────────────────
     logfire_token: str | None = None
 
+    # ── Multi-Provider LLM Fallbacks (Google Gemini & OpenRouter) ─────────
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-1.5-flash"
+
+    openrouter_api_key: str | None = None
+    openrouter_model: str = "meta-llama/llama-3.3-70b-instruct"
+
 
 # Singleton — imported throughout the app
 settings = Settings()
