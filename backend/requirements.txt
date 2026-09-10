@@ -23,3 +23,4 @@ flashrank==0.2.10
 pytest>=8.0.0
 logfire[fastapi]>=5.0.0
 openai>=1.50.0
+rapidocr_onnxruntime>=1.4.0

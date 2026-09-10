@@ -48,6 +48,8 @@ async def _update_status(
                 }
                 if failure_reason is not None:
                     values["failure_reason"] = failure_reason
+                elif status == DocumentStatus.READY:
+                    values["failure_reason"] = None
                 if chunk_count is not None:
                     values["chunk_count"] = chunk_count
 
@@ -161,8 +163,15 @@ async def ingest_document(
 
             with logfire.span("ingestion.embed_chunks", count=len(all_chunks)):
                 chunk_texts = [c.content for c in all_chunks]
-                vectors = await asyncio.to_thread(embedding.embed_texts, chunk_texts)
-                sparse_vectors = await asyncio.to_thread(embedding.embed_sparse_texts, chunk_texts)
+                batch_embed_size = 64
+                vectors = []
+                sparse_vectors = []
+                for i in range(0, len(chunk_texts), batch_embed_size):
+                    sub_texts = chunk_texts[i : i + batch_embed_size]
+                    sub_vectors = await asyncio.to_thread(embedding.embed_texts, sub_texts)
+                    sub_sparse = await asyncio.to_thread(embedding.embed_sparse_texts, sub_texts)
+                    vectors.extend(sub_vectors)
+                    sparse_vectors.extend(sub_sparse)
 
             # ── Step 3: Store in Qdrant ───────────────────────────────
             with logfire.span("ingestion.store_qdrant", points_count=len(all_chunks)):
@@ -205,17 +214,20 @@ async def ingest_document(
                     for chunk in all_chunks
                 ]
 
-                for attempt in range(3):
-                    try:
-                        async with AsyncSessionLocal() as session:
-                            session.add_all(db_chunks)
-                            await session.commit()
-                            break
-                    except Exception as e:
-                        if attempt == 2:
-                            raise
-                        logger.warning(f"[{doc_id}] Retrying chunk save (attempt {attempt + 1}): {e}")
-                        await asyncio.sleep(0.5 * (attempt + 1))
+                batch_db_size = 100
+                for i in range(0, len(db_chunks), batch_db_size):
+                    sub_db = db_chunks[i : i + batch_db_size]
+                    for attempt in range(3):
+                        try:
+                            async with AsyncSessionLocal() as session:
+                                session.add_all(sub_db)
+                                await session.commit()
+                                break
+                        except Exception as e:
+                            if attempt == 2:
+                                raise
+                            logger.warning(f"[{doc_id}] Retrying chunk save (attempt {attempt + 1}): {e}")
+                            await asyncio.sleep(0.5 * (attempt + 1))
 
             # ── Step 5: Mark as ready ─────────────────────────────────
             await _update_status(

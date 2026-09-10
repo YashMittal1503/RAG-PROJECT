@@ -58,10 +58,22 @@ def _collection_name(user_id: str) -> str:
     return f"docs_{user_id.replace('-', '_')}"
 
 
+async def collection_supports_sparse(client: AsyncQdrantClient, name: str) -> bool:
+    """Check whether a collection has the 'bm25' sparse vector configured."""
+    try:
+        coll_info = await client.get_collection(name)
+        return bool(
+            coll_info.config.params.sparse_vectors
+            and "bm25" in coll_info.config.params.sparse_vectors
+        )
+    except Exception:
+        return False
+
+
 async def ensure_collection(user_id: str) -> None:
     """
     Create the user's collection if it doesn't already exist,
-    or upgrade an existing collection to support BM25 sparse vectors.
+    or ensure payload indices are present on existing collections.
     """
     client = await get_client()
     name = _collection_name(user_id)
@@ -82,35 +94,17 @@ async def ensure_collection(user_id: str) -> None:
                 "bm25": SparseVectorParams(),
             },
         )
-        # Create payload indices required for filtering
-        await client.create_payload_index(
-            collection_name=name,
-            field_name="chunk_type",
-            field_schema=PayloadSchemaType.KEYWORD,
-        )
-        await client.create_payload_index(
-            collection_name=name,
-            field_name="doc_id",
-            field_schema=PayloadSchemaType.KEYWORD,
-        )
-    else:
-        # Check if existing collection already has sparse_vectors_config
+    
+    # Ensure payload indices required for fast filtering exist (safe idempotent calls)
+    for field_name in ("chunk_type", "doc_id", "filename"):
         try:
-            coll_info = await client.get_collection(name)
-            has_sparse = (
-                coll_info.config.params.sparse_vectors
-                and "bm25" in coll_info.config.params.sparse_vectors
+            await client.create_payload_index(
+                collection_name=name,
+                field_name=field_name,
+                field_schema=PayloadSchemaType.KEYWORD,
             )
-            if not has_sparse:
-                logger.info(f"Upgrading existing collection {name} with BM25 sparse vector index...")
-                await client.update_collection(
-                    collection_name=name,
-                    sparse_vectors_config={
-                        "bm25": SparseVectorParams(),
-                    },
-                )
-        except Exception as e:
-            logger.warning(f"Could not verify/upgrade sparse config on collection {name}: {e}")
+        except Exception:
+            pass  # Index already exists or cannot be altered
 
 
 async def upsert_chunks(
@@ -119,20 +113,19 @@ async def upsert_chunks(
 ) -> None:
     """
     Upsert chunk vectors and metadata into the user's Qdrant collection.
-
-    Each item in `chunks` should have:
-    - id: str (UUID)
-    - vector: list[float] (dense vector)
-    - sparse_vector: SparseVector | None (optional BM25 sparse vector)
-    - payload: dict with doc_id, chunk_type, filename, page_number, etc.
+    Automatically adapts to collection capabilities:
+    - If the collection supports 'bm25' sparse vectors, upserts dual dense+bm25 vectors.
+    - If the collection is legacy dense-only, upserts dense vectors.
+    - If a vector name error occurs, automatically catches it and retries with dense-only vectors.
     """
     client = await get_client()
     name = _collection_name(user_id)
 
+    has_sparse = await collection_supports_sparse(client, name)
+
     points = []
     for chunk in chunks:
-        # Support dual dense+bm25 vectors and legacy dense-only vectors
-        if "sparse_vector" in chunk and chunk["sparse_vector"] is not None:
+        if has_sparse and "sparse_vector" in chunk and chunk["sparse_vector"] is not None:
             vector = {
                 "": chunk["vector"],
                 "bm25": chunk["sparse_vector"],
@@ -148,16 +141,40 @@ async def upsert_chunks(
             )
         )
 
-    # Upsert in batches of 100 to avoid oversized requests
     batch_size = 100
-    for i in range(0, len(points), batch_size):
-        batch = points[i : i + batch_size]
-        await client.upsert(
-            collection_name=name,
-            points=batch,
-        )
-
-    logger.info(f"Upserted {len(points)} chunks to collection {name}")
+    try:
+        for i in range(0, len(points), batch_size):
+            batch = points[i : i + batch_size]
+            await client.upsert(
+                collection_name=name,
+                points=batch,
+            )
+        logger.info(f"Upserted {len(points)} chunks to collection {name} (sparse={has_sparse})")
+    except Exception as e:
+        # If Qdrant failed because bm25 vector is missing from schema, fallback to dense-only vectors
+        err_str = str(e).lower()
+        if "vector name error" in err_str or "bm25" in err_str or "not existing" in err_str:
+            logger.warning(
+                f"Upsert with sparse vectors rejected by Qdrant schema ({e}). "
+                f"Falling back to dense-only upsert for collection {name}..."
+            )
+            dense_points = [
+                PointStruct(
+                    id=p.id,
+                    vector=p.vector[""] if isinstance(p.vector, dict) else p.vector,
+                    payload=p.payload,
+                )
+                for p in points
+            ]
+            for i in range(0, len(dense_points), batch_size):
+                batch = dense_points[i : i + batch_size]
+                await client.upsert(
+                    collection_name=name,
+                    points=batch,
+                )
+            logger.info(f"Successfully upserted {len(dense_points)} dense-only chunks to collection {name}")
+        else:
+            raise
 
 
 async def search(
