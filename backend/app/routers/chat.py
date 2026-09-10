@@ -520,11 +520,13 @@ async def query(
 
                 # Scope retrieval to specific document if resolved
                 target_doc_filter = scope.target_doc_id if scope.status == "resolved" else None
+                target_filename = scope.target_filename if scope.status == "resolved" else None
                 chunks = await retrieve_chunks(
                     user_id=user_id,
                     question=rewritten,
                     is_aggregation=is_agg,
                     doc_id_filter=target_doc_filter,
+                    filename_filter=target_filename,
                 )
                 logfire.info("🔍 Route: RAG retrieval found {chunk_count} chunks", chunk_count=len(chunks), session_id=str(session_id))
 
@@ -569,8 +571,11 @@ async def query(
                     yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
                     await asyncio.sleep(0)
 
-                # Step 6: Validate citations
-                citations = validate_citations(full_response, chunks)
+                # Step 6: Validate citations (suppress citations if answer is an explicit refusal)
+                if "I don't have enough information in the uploaded documents" in full_response:
+                    citations = []
+                else:
+                    citations = validate_citations(full_response, chunks)
                 chat_span.set_attribute("citations_count", len(citations))
                 yield f"event: citations\ndata: {json.dumps({'citations': citations})}\n\n"
 

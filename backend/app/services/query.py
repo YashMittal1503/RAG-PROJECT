@@ -719,6 +719,26 @@ def detect_aggregation(question: str) -> bool:
     return any(kw in lower_q for kw in AGGREGATION_KEYWORDS)
 
 
+OVERVIEW_KEYWORDS = {
+    "tell me about", "what is this book about", "what is this document about",
+    "what is this paper about", "what is this novel about", "what is it about",
+    "what is the book about", "what is the paper about", "what is the novel about",
+    "give me an overview", "overview", "summary", "summarize", "synopsis",
+    "what happens in", "who wrote", "author of", "premise", "plot summary",
+    "plot of", "introduction to", "intro of", "what is the story", "explain the story",
+    "main character", "protagonist", "key findings", "main idea", "main themes",
+}
+
+
+def is_overview_query(question: str) -> bool:
+    """
+    Check if question asks for an overview, summary, or broad description of a document.
+    Used to attach lead/introductory chunks to provide essential framing context.
+    """
+    lower_q = question.lower()
+    return any(kw in lower_q for kw in OVERVIEW_KEYWORDS)
+
+
 # ── Query rewrite ─────────────────────────────────────────────────────────
 
 REWRITE_SYSTEM_PROMPT = """You are a search query rewriter for a document and tabular data assistant.
@@ -847,17 +867,66 @@ async def retrieve_chunks(
             span.set_attribute("top_source", results[0].get("filename", "unknown"))
             span.set_attribute("retrieved_sources", list(set(r.get("filename", "unknown") for r in results)))
 
-        # If aggregation detected, fetch and prepend up to 3 summary chunks
-        if is_aggregation:
+        # If overview/aggregation detected, fetch and prepend summary chunks and lead chunks
+        is_overview = is_aggregation or is_overview_query(question)
+        span.set_attribute("is_overview_query", is_overview)
+
+        if is_overview:
             summary_chunks = await vector_store.get_summary_chunks(user_id, doc_id_filter=doc_id_filter)
             if summary_chunks:
-                # Deduplicate: remove any summary chunks already in results
                 result_ids = {r["id"] for r in results}
                 new_summaries = [s for s in summary_chunks if s["id"] not in result_ids][:3]
-                # Prepend summaries so they appear first in context
                 results = new_summaries + results
                 span.set_attribute("summary_chunks_added", len(new_summaries))
-                logger.info(f"Added {len(new_summaries)} summary chunks for aggregation query")
+                logger.info(f"Added {len(new_summaries)} summary chunks for overview/aggregation query")
+
+            # For targeted document overview inquiries, anchor with the document's introductory lead chunks
+            if doc_id_filter:
+                try:
+                    from app.database import AsyncSessionLocal
+                    from app.models import Chunk, Document
+                    from sqlalchemy import select
+                    async with AsyncSessionLocal() as db:
+                        lead_doc_name = filename_filter
+                        if not lead_doc_name:
+                            d_res = await db.execute(
+                                select(Document.filename).where(
+                                    Document.id == (UUID(doc_id_filter) if isinstance(doc_id_filter, str) else doc_id_filter)
+                                )
+                            )
+                            lead_doc_name = d_res.scalar_one_or_none() or "document"
+
+                        lead_res = await db.execute(
+                            select(Chunk).where(
+                                Chunk.document_id == (UUID(doc_id_filter) if isinstance(doc_id_filter, str) else doc_id_filter),
+                                Chunk.chunk_index.in_([0, 1]),
+                            ).order_by(Chunk.chunk_index.asc())
+                        )
+                        db_chunks = lead_res.scalars().all()
+                        lead_chunks = [
+                            {
+                                "id": str(c.id),
+                                "document_id": str(c.document_id),
+                                "filename": lead_doc_name,
+                                "page_number": c.page_number,
+                                "row_range_start": c.row_range_start,
+                                "row_range_end": c.row_range_end,
+                                "content": c.content,
+                                "chunk_type": c.chunk_type,
+                                "score": 1.0,
+                            }
+                            for c in db_chunks
+                        ]
+                        if lead_chunks:
+                            result_ids = {r["id"] for r in results}
+                            new_leads = [c for c in lead_chunks if c["id"] not in result_ids]
+                            # Prepend lead chunks so document title/author/intro context comes first
+                            results = new_leads + results
+                            results = results[:5]
+                            span.set_attribute("lead_chunks_added", len(new_leads))
+                            logger.info(f"Added {len(new_leads)} lead chunks for document {doc_id_filter}")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch lead chunks for doc {doc_id_filter}: {e}")
 
         return results
 
@@ -868,7 +937,10 @@ SYSTEM_PROMPT = """You are a helpful document Q&A assistant. Your job is to answ
 
 RULES:
 1. Answer ONLY using information from the provided context chunks.
-2. If the answer is not in the context, say: "I don't have enough information in the uploaded documents to answer this question."
+2. If asked about a document (e.g. "Tell me about [book/doc]", "What is this file/paper about?", "Summarize [doc]"):
+   - Synthesize a comprehensive, well-structured overview using all available details from the provided context chunks (title, author, premise, key characters, main topics, themes, and visible excerpts).
+   - Be transparent and helpful about what is described in the uploaded document excerpts.
+   - ONLY say: "I don't have enough information in the uploaded documents to answer this question." if the context chunks are completely empty, unreadable, or completely unrelated to the question.
 3. When citing information, ALWAYS cite the page number or row range in square brackets, for example: [Page 4] or [Page 12]. For spreadsheets, cite the row range like [Rows 1-50]. For summary chunks, cite [Summary].
    CRITICAL: NEVER output chunk UUIDs, IDs, or write [CHUNK ...]. Always use the human-readable [Page X] or [Summary] tag.
 4. Format your answers in clean, beautiful Markdown:
@@ -876,7 +948,7 @@ RULES:
    - Use bullet points (* or -) or numbered lists for structure.
    - Use Markdown headings (e.g. ### Section Name) to organize long responses.
    - Place citations like [Page 3] directly after the relevant sentence or bullet point.
-5. Do NOT make up, hallucinate, or infer information that is not explicitly stated in the context.
+5. Do NOT make up, hallucinate, or infer information that is not explicitly stated in or supported by the context.
 6. NEVER claim, pretend, or hallucinate that you performed a web search. You do not have external web access and must answer solely from the provided document context.
 7. Be concise, accurate, and professional."""
 
