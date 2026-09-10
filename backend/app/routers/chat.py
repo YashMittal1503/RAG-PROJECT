@@ -40,6 +40,7 @@ from app.services.query import (
     generate_direct_response,
     generate_sql_answer_stream,
     generate_sql_query,
+    generate_tabular_overview_stream,
     get_schema_for_prompt,
     get_tabular_tables,
     retrieve_chunks,
@@ -389,7 +390,8 @@ async def query(
                 should_attempt_sql = has_tabular and (scope.is_tabular or scope.status == "all_docs")
 
                 if should_attempt_sql:
-                    schema_info = await get_schema_for_prompt(user_id)
+                    target_doc_uuid = uuid.UUID(scope.target_doc_id) if (scope.target_doc_id and scope.is_tabular) else None
+                    schema_info = await get_schema_for_prompt(user_id, target_doc_uuid)
 
                     if schema_info:
                         sql = await generate_sql_query(rewritten, schema_info, chat_history)
@@ -434,8 +436,40 @@ async def query(
                                 return
 
                             except Exception as sql_err:
-                                logger.warning(f"SQL execution failed, falling through to RAG pipeline: {sql_err}")
-                                # Fall through to RAG pipeline without emitting sql_query
+                                logger.warning(f"SQL execution failed: {sql_err}")
+                                if not scope.is_tabular:
+                                    pass # will fall through to vector retrieval for all_docs
+
+                        # If the document is specifically a tabular spreadsheet, NEVER fall through to vector retrieval
+                        if scope.is_tabular:
+                            chat_span.set_attribute("route", "tabular_overview")
+                            full_response = ""
+                            async for token in generate_tabular_overview_stream(
+                                question=rewritten,
+                                schema_info=schema_info,
+                                filename=scope.target_filename or "Spreadsheet",
+                            ):
+                                full_response += token
+                                yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+
+                            yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
+
+                            async with AsyncSessionLocal() as save_db:
+                                assistant_msg = ChatMessage(
+                                    session_id=session_id,
+                                    role="assistant",
+                                    content=full_response,
+                                    created_at=datetime.now(timezone.utc),
+                                )
+                                save_db.add(assistant_msg)
+                                await save_db.commit()
+
+                            new_title = await _maybe_update_session_title(full_response)
+                            if new_title:
+                                yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
+
+                            yield f"event: done\ndata: {{}}\n\n"
+                            return
 
                 # Step 4: RAG path — detect aggregation and retrieve chunks
                 chat_span.set_attribute("route", "rag")
@@ -452,12 +486,24 @@ async def query(
                 )
 
                 if not chunks:
-                    # No documents or no relevant chunks found
-                    no_docs_msg = (
-                        "I don't have any documents to search through yet. "
-                        "Please upload some documents first, then ask your question again."
-                    )
+                    # No relevant chunks found in the searched scope
+                    if scope.target_filename:
+                        no_docs_msg = (
+                            f"I searched '{scope.target_filename}', but couldn't find any relevant sections "
+                            "answering your question. Please try asking about a specific topic from the document or rephrasing."
+                        )
+                    elif ready_docs:
+                        no_docs_msg = (
+                            "I searched through your uploaded documents, but couldn't find any relevant sections "
+                            "answering your question. Please try rephrasing your question or asking about a specific topic."
+                        )
+                    else:
+                        no_docs_msg = (
+                            "I don't have any documents to search through yet. "
+                            "Please upload some documents first, then ask your question again."
+                        )
                     yield f"event: token\ndata: {json.dumps({'token': no_docs_msg})}\n\n"
+                    yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
 
                     # Save assistant message
                     async with AsyncSessionLocal() as save_db:

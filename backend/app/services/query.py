@@ -389,6 +389,20 @@ async def analyze_document_scope(
             cleaned_question=question,
         )
 
+    # 4b. Fast heuristic for standard ambiguous queries in multi-doc library
+    ambiguous_patterns = [
+        r"^(what\s+are\s+the\s+)?key\s+findings\b",
+        r"^(can\s+you\s+)?summarize(\s+(the\s+)?(document|file|paper|book|dataset|it|this))?\b",
+        r"^what\s+is\s+(this|the)\s+(document|file|paper|book)\s+about\b",
+        r"^(what\s+are\s+the\s+)?(main\s+takeaways|conclusions)\b",
+        r"^(give\s+me\s+a\s+)?summary(\s+of\s+the\s+(document|file|paper))?\b",
+    ]
+    if not chat_history and any(re.search(p, q_lower) for p in ambiguous_patterns):
+        return DocumentScopeResult(
+            status="needs_clarification",
+            clarification_text=format_clarification_message(available_documents, question),
+        )
+
     # 5. Fast LLM Ambiguity / Scope Classification
     catalog_lines = []
     for i, d in enumerate(available_documents, 1):
@@ -1157,13 +1171,16 @@ RULES:
 2. Output ONLY the raw SQL — no explanation, no notes, no commentary.
 3. Use the exact table and column names from the schema.
 4. For aggregations (SUM, AVG, COUNT, MIN, MAX), apply them on the correct numeric columns.
-5. If the user asks an analytical question specifically about the tabular spreadsheet data (e.g. churn rate, order metrics, sales summaries, column distributions), generate a valid DuckDB aggregation query.
-6. CRITICAL: If the question is about non-tabular topics, research papers, novels, stories, books, code handbooks, or text documents (e.g. "key findings from the paper", "what happens in the story", "who is the author", "explain function", "offer letter"), you MUST output ONLY: CANNOT_ANSWER.
-7. Only return CANNOT_ANSWER if the question has nothing to do with the tables or cannot be answered with SQL.
-8. Always alias aggregated columns with meaningful names (e.g., total_customers, avg_monthly_charges).
-9. Handle NULL or blank values appropriately: for text/varchar columns containing numbers or spaces, ALWAYS use TRY_CAST(TRIM(col) AS DOUBLE) instead of CAST to avoid conversion errors.
-10. If the user asks for "all data" or something very broad, use LIMIT 50.
-11. Use ILIKE for case-insensitive text matching when filtering by text values."""
+5. If the user asks an open-ended, overview, exploratory, or summary question about the spreadsheet/table data (e.g. "key findings", "summary", "overview", "what are the trends", "tell me about the data", "findings in <filename>"):
+   You MUST generate a meaningful analytical aggregation query on the main data table!
+   - For example: SELECT count(*) AS total_records, round(avg(CashbackAmount), 2) AS avg_cashback, sum(Churn) AS churn_count FROM <table>;
+   - Or group by the primary category or status column with count(*);
+   - Do NOT return CANNOT_ANSWER for exploratory data analysis, summaries, or key findings questions on tabular datasets.
+6. ONLY return CANNOT_ANSWER if the user question has NOTHING to do with any tabular data and is clearly asking about a non-tabular file (such as a literary novel plot, a signed offer letter, or a research paper's methodology).
+7. Always alias aggregated columns with meaningful names (e.g., total_customers, avg_monthly_charges).
+8. Handle NULL or blank values appropriately: for text/varchar columns containing numbers or spaces, ALWAYS use TRY_CAST(TRIM(col) AS DOUBLE) instead of CAST to avoid conversion errors.
+9. If the user asks for "all data" or something very broad, use LIMIT 50.
+10. Use ILIKE for case-insensitive text matching when filtering by text values."""
 
 
 SQL_ANSWER_PROMPT = """You are a helpful data analyst assistant. You have been given the results of a SQL query executed on the user's uploaded spreadsheet data.
@@ -1319,13 +1336,57 @@ async def check_tabular_data(user_id: str) -> bool:
     return await asyncio.to_thread(tabular_store.has_tabular_data, user_id)
 
 
-async def get_schema_for_prompt(user_id: str) -> str:
+TABULAR_OVERVIEW_PROMPT = """You are an expert data analyst assistant. The user is asking a question about an uploaded spreadsheet/tabular dataset.
+You have access to the table schema, column names, types, and sample rows from DuckDB.
+
+RULES:
+1. Provide a clear, structured, and insightful response based on the dataset's columns and sample data.
+2. If the user asked for "key findings", "summary", or "overview", analyze the business domain, the variables tracked, key metrics, and highlight notable patterns visible in the schema and sample data.
+3. Suggest specific quantitative questions the user can ask next (e.g. churn rates by customer status, average tenure, correlation between satisfaction score and churn, etc.).
+4. Use clean Markdown formatting with bullet points and bold highlights.
+5. Reference the dataset by its filename if provided, or as "your uploaded spreadsheet data".
+6. Do NOT mention DuckDB, table prefixes (like t_...), or database internals."""
+
+
+async def generate_tabular_overview_stream(
+    question: str,
+    schema_info: str,
+    filename: str = "",
+) -> AsyncGenerator[str, None]:
     """
-    Get the full DuckDB schema for the user, formatted for the LLM prompt.
+    Stream an overview/insight response for tabular data when SQL cannot be generated or fails.
+    """
+    with logfire.span("rag.tabular_overview", question=question, filename=filename) as span:
+        messages = [
+            {"role": "system", "content": TABULAR_OVERVIEW_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Dataset: {filename}\n\n"
+                    f"Database Schema and Sample Rows:\n{schema_info}\n\n"
+                    f"User question: {question}\n\n"
+                    f"Please provide an insightful, structured response answering the user's question based on this dataset:"
+                ),
+            },
+        ]
+        token_count = 0
+        async for token in stream_llm_with_fallback(
+            messages=messages,
+            max_tokens=1000,
+            temperature=0.2,
+        ):
+            token_count += 1
+            yield token
+        span.set_attribute("tokens_generated", token_count)
+
+
+async def get_schema_for_prompt(user_id: str, doc_id: UUID | None = None) -> str:
+    """
+    Get the DuckDB schema for the user (optionally scoped to a specific doc_id), formatted for the LLM prompt.
     Runs in a thread to avoid blocking.
     """
     import asyncio
-    return await asyncio.to_thread(tabular_store.get_table_schema, user_id)
+    return await asyncio.to_thread(tabular_store.get_table_schema, user_id, doc_id)
 
 
 async def execute_sql_query(user_id: str, sql: str) -> dict:
