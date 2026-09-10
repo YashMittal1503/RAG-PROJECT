@@ -145,16 +145,13 @@ async def list_documents(
     db: AsyncSession = Depends(get_db),
 ):
     """List all documents belonging to the authenticated user."""
-    with logfire.span("📋 List Documents", user_id=user_id) as span:
-        result = await db.execute(
-            select(Document)
-            .where(Document.user_id == uuid.UUID(user_id))
-            .order_by(Document.created_at.desc())
-        )
-        docs = result.scalars().all()
-        span.set_attribute("document_count", len(docs))
-        logfire.info("Listed {count} documents for user {user_id}", count=len(docs), user_id=user_id)
-        return [DocumentResponse.model_validate(d) for d in docs]
+    result = await db.execute(
+        select(Document)
+        .where(Document.user_id == uuid.UUID(user_id))
+        .order_by(Document.created_at.desc())
+    )
+    docs = result.scalars().all()
+    return [DocumentResponse.model_validate(d) for d in docs]
 
 
 @router.get("/{doc_id}/status", response_model=DocumentStatusResponse)
@@ -164,25 +161,21 @@ async def get_document_status(
     db: AsyncSession = Depends(get_db),
 ):
     """Get the processing status of a single document (for polling)."""
-    with logfire.span("⏳ Document Status | {doc_id}", doc_id=str(doc_id), user_id=user_id) as span:
-        result = await db.execute(
-            select(Document).where(
-                Document.id == doc_id,
-                Document.user_id == uuid.UUID(user_id),
-            )
+    result = await db.execute(
+        select(Document).where(
+            Document.id == doc_id,
+            Document.user_id == uuid.UUID(user_id),
         )
-        doc = result.scalar_one_or_none()
+    )
+    doc = result.scalar_one_or_none()
 
-        if not doc:
-            span.set_attribute("found", False)
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Document not found.",
-            )
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found.",
+        )
 
-        span.set_attribute("status", doc.status.value)
-        span.set_attribute("chunk_count", doc.chunk_count)
-        return DocumentStatusResponse.model_validate(doc)
+    return DocumentStatusResponse.model_validate(doc)
 
 
 @router.delete("/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)

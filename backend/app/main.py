@@ -116,23 +116,20 @@ else:
     )
     logger.info("Logfire local structured tracing enabled (no token provided).")
 
-# Route standard Python application logs to Logfire for unified trace logs
+# Route standard Python application logs to Logfire for unified trace logs (excluding noisy uvicorn access)
 try:
     logfire_handler = logfire.LogfireLoggingHandler()
     logging.getLogger("app").addHandler(logfire_handler)
-    logging.getLogger("uvicorn.access").addHandler(logfire_handler)
 except Exception as log_err:
     logger.warning(f"Could not attach LogfireLoggingHandler: {log_err}")
 
-# Multi-layer auto-instrumentation for database, HTTP calls, and LLM requests
+# Auto-instrumentation for AI model streaming and external provider HTTP requests
 try:
-    logfire.instrument_sqlalchemy(engine)
-    logfire.instrument_asyncpg()
-    logfire.instrument_httpx(capture_all=True)
     logfire.instrument_openai()
-    logger.info("Logfire multi-layer auto-instrumentations active (SQLAlchemy, asyncpg, httpx, openai).")
+    logfire.instrument_httpx(capture_all=False)
+    logger.info("Logfire AI model & provider auto-instrumentations active (openai, httpx).")
 except Exception as inst_err:
-    logger.warning(f"Could not initialize all Logfire sub-instrumentations: {inst_err}")
+    logger.warning(f"Could not initialize Logfire sub-instrumentations: {inst_err}")
 
 app = FastAPI(
     title="RAG Chatbot API",
@@ -162,25 +159,41 @@ def _logfire_request_attributes_mapper(request_or_ws, attributes):
     return attributes
 
 
+# Instrument FastAPI while excluding routine healthchecks, docs, and high-frequency polling paths
 logfire.instrument_fastapi(
     app,
     capture_headers=True,
     record_send_receive=True,
     request_attributes_mapper=_logfire_request_attributes_mapper,
-    excluded_urls="/api/health,/health",
+    excluded_urls="/api/health,/health,/docs,/openapi.json,/api/chat/sessions$,/api/documents$,.*messages$,.*status$",
 )
+
+
+def _is_routine_request(method: str, path: str) -> bool:
+    """Filter out routine background polling, health-checks, and read-only list fetches."""
+    if path in ("/api/health", "/health", "/docs", "/openapi.json", "/favicon.ico"):
+        return True
+    # Filter routine read-only GET polls that flood the dashboard
+    if method in ("GET", "HEAD", "OPTIONS"):
+        if path in ("/api/chat/sessions", "/api/documents"):
+            return True
+        if path.endswith("/messages") or path.endswith("/status"):
+            return True
+    return False
 
 
 # ── Global HTTP Request / Response Observability Middleware ──────────────────
 @app.middleware("http")
 async def logfire_request_middleware(request: Request, call_next):
-    """Capture every incoming API request and session context with structured timing and metadata."""
+    """Capture significant API actions (queries, uploads, deletions) while suppressing routine background polling."""
     path = request.url.path
-    if path in ("/api/health", "/health"):
+    method = request.method
+    is_routine = _is_routine_request(method, path)
+
+    if is_routine:
         return await call_next(request)
 
     start_time = time.perf_counter()
-    method = request.method
     client_ip = request.client.host if request.client else "unknown"
 
     # Extract session_id or doc_id from path

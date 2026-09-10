@@ -82,15 +82,13 @@ async def list_sessions(
     db: AsyncSession = Depends(get_db),
 ):
     """List all chat sessions for the authenticated user."""
-    with logfire.span("📋 List Chat Sessions", user_id=user_id) as span:
-        result = await db.execute(
-            select(ChatSession)
-            .where(ChatSession.user_id == uuid.UUID(user_id))
-            .order_by(ChatSession.created_at.desc())
-        )
-        sessions = result.scalars().all()
-        span.set_attribute("session_count", len(sessions))
-        return [ChatSessionResponse.model_validate(s) for s in sessions]
+    result = await db.execute(
+        select(ChatSession)
+        .where(ChatSession.user_id == uuid.UUID(user_id))
+        .order_by(ChatSession.created_at.desc())
+    )
+    sessions = result.scalars().all()
+    return [ChatSessionResponse.model_validate(s) for s in sessions]
 
 
 @router.get("/sessions/{session_id}", response_model=ChatSessionResponse)
@@ -100,19 +98,16 @@ async def get_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Get a single chat session by ID."""
-    with logfire.span("🔍 Get Chat Session | {session_id}", session_id=str(session_id), user_id=user_id) as span:
-        result = await db.execute(
-            select(ChatSession).where(
-                ChatSession.id == session_id,
-                ChatSession.user_id == uuid.UUID(user_id),
-            )
+    result = await db.execute(
+        select(ChatSession).where(
+            ChatSession.id == session_id,
+            ChatSession.user_id == uuid.UUID(user_id),
         )
-        session = result.scalar_one_or_none()
-        if not session:
-            span.set_attribute("found", False)
-            raise HTTPException(status_code=404, detail="Chat session not found.")
-        span.set_attribute("title", session.title or "Untitled")
-        return ChatSessionResponse.model_validate(session)
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+    return ChatSessionResponse.model_validate(session)
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -175,26 +170,22 @@ async def get_messages(
     db: AsyncSession = Depends(get_db),
 ):
     """Get all messages in a chat session in a single database roundtrip."""
-    with logfire.span("💬 Get Session Messages | {session_id}", session_id=str(session_id), user_id=user_id) as span:
-        result = await db.execute(
-            select(ChatSession)
-            .options(joinedload(ChatSession.messages))
-            .where(
-                ChatSession.id == session_id,
-                ChatSession.user_id == uuid.UUID(user_id),
-            )
+    result = await db.execute(
+        select(ChatSession)
+        .options(joinedload(ChatSession.messages))
+        .where(
+            ChatSession.id == session_id,
+            ChatSession.user_id == uuid.UUID(user_id),
         )
-        session = result.unique().scalar_one_or_none()
-        if not session:
-            span.set_attribute("message_count", 0)
-            return []
+    )
+    session = result.unique().scalar_one_or_none()
+    if not session:
+        return []
 
-        if session.title:
-            response.headers["X-Session-Title"] = session.title
+    if session.title:
+        response.headers["X-Session-Title"] = session.title
 
-        span.set_attribute("message_count", len(session.messages))
-        span.set_attribute("title", session.title or "Untitled")
-        return [ChatMessageResponse.model_validate(m) for m in session.messages]
+    return [ChatMessageResponse.model_validate(m) for m in session.messages]
 
 
 # ── Streaming query endpoint ──────────────────────────────────────────────
