@@ -17,9 +17,10 @@ import logfire
 from sqlalchemy import update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import Chunk, Document, DocumentStatus
-from app.services import storage, embedding, vector_store
+from app.services import storage, embedding, vector_store, svd_summarizer
 from app.services.parsing import parse_pdf, parse_txt, parse_spreadsheet
 from app.services.chunking import (
     ChunkData,
@@ -174,8 +175,42 @@ async def ingest_document(
                     vectors.extend(sub_vectors)
                     sparse_vectors.extend(sub_sparse)
 
-            # ── Step 3: Store in Qdrant ───────────────────────────────
-            with logfire.span("🗄️ Upsert to Qdrant | {points_count} points", points_count=len(all_chunks)):
+            # ── Step 2.5: SVD-RAG Recursive Tree Construction ──────────
+            all_summary_nodes: list[dict] = []
+            if settings.enable_svd_rag and len(all_chunks) >= settings.svd_min_chunks:
+                with logfire.span("🌲 Build SVD-RAG Recursive Tree | {filename}", filename=filename, leaves=len(all_chunks)) as svd_span:
+                    leaf_dicts = [
+                        {
+                            "id": str(c.id),
+                            "content": c.content,
+                            "chunk_index": c.chunk_index,
+                            "page_number": c.page_number,
+                            "row_range_start": c.row_range_start,
+                            "row_range_end": c.row_range_end,
+                            "token_count": c.token_count,
+                        }
+                        for c in all_chunks
+                    ]
+                    all_summary_nodes, tree_metadata = await asyncio.to_thread(
+                        svd_summarizer.build_recursive_svd_tree,
+                        leaf_chunks=leaf_dicts,
+                        leaf_embeddings=vectors,
+                        cluster_size=settings.svd_cluster_size,
+                        tau=settings.svd_tau,
+                        doc_id=str(doc_id),
+                        filename=filename,
+                    )
+                    svd_span.set_attribute("total_summaries", tree_metadata.get("total_summaries", 0))
+                    svd_span.set_attribute("tree_depth", tree_metadata.get("depth", 0))
+                    svd_span.set_attribute("root_id", tree_metadata.get("root_id"))
+                    logger.info(
+                        f"[{doc_id}] SVD-RAG tree constructed: {len(all_summary_nodes)} summary nodes "
+                        f"across {tree_metadata.get('depth', 0)} level(s)"
+                    )
+
+            # ── Step 3: Store in Qdrant (Flattened Leaves + Summaries) ─
+            total_points = len(all_chunks) + len(all_summary_nodes)
+            with logfire.span("🗄️ Upsert to Qdrant | {points_count} points", points_count=total_points):
                 await vector_store.ensure_collection(user_id)
                 # Purge any previously stored vectors for this doc (safe for re-ingestion)
                 try:
@@ -192,6 +227,8 @@ async def ingest_document(
                         "payload": {
                             "doc_id": str(doc_id),
                             "chunk_type": chunk.chunk_type,
+                            "tree_level": 0,
+                            "is_root": False,
                             "filename": filename,
                             "page_number": chunk.page_number,
                             "row_range_start": chunk.row_range_start,
@@ -200,10 +237,29 @@ async def ingest_document(
                         },
                     })
 
+                for s_node in all_summary_nodes:
+                    qdrant_points.append({
+                        "id": s_node["id"],
+                        "vector": s_node["vector"],
+                        "sparse_vector": s_node["sparse_vector"],
+                        "payload": {
+                            "doc_id": str(doc_id),
+                            "chunk_type": "summary",
+                            "tree_level": s_node["tree_level"],
+                            "is_root": s_node["is_root"],
+                            "child_chunk_ids": s_node["child_chunk_ids"],
+                            "filename": filename,
+                            "page_number": s_node["page_number"],
+                            "row_range_start": None,
+                            "row_range_end": None,
+                            "content": s_node["content"],
+                        },
+                    })
+
                 await vector_store.upsert_chunks(user_id, qdrant_points)
 
             # ── Step 4: Save chunk metadata to Postgres ───────────────
-            with logfire.span("💾 Persist Chunks to Postgres | {chunk_count} chunks", chunk_count=len(all_chunks)):
+            with logfire.span("💾 Persist Chunks to Postgres | {chunk_count} chunks", chunk_count=total_points):
                 # Clean up existing chunks for this document to prevent duplicates on re-ingestion
                 async with AsyncSessionLocal() as session:
                     await session.execute(
@@ -226,6 +282,23 @@ async def ingest_document(
                     )
                     for chunk in all_chunks
                 ]
+
+                # Append SVD summary nodes to Postgres for full document provenance
+                for idx, s_node in enumerate(all_summary_nodes):
+                    db_chunks.append(
+                        Chunk(
+                            id=uuid.UUID(s_node["id"]),
+                            document_id=doc_id,
+                            user_id=uuid.UUID(user_id),
+                            chunk_index=len(all_chunks) + idx,
+                            chunk_type="summary",
+                            content=s_node["content"],
+                            page_number=s_node["page_number"],
+                            row_range_start=None,
+                            row_range_end=None,
+                            token_count=s_node["token_count"],
+                        )
+                    )
 
                 batch_db_size = 100
                 for i in range(0, len(db_chunks), batch_db_size):

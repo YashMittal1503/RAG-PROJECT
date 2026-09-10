@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_dim: int = 384
 
+    # ── SVD-RAG (Singular Value Decomposition Tree-Organized RAG) ────────
+    enable_svd_rag: bool = True
+    svd_tau: float = 0.95
+    svd_cluster_size: int = 6
+    svd_min_chunks: int = 4
+
     # ── Upload limits ─────────────────────────────────────────────────────
     max_file_size_mb: int = 20
     max_batch_size: int = 10

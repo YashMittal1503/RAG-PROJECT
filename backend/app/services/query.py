@@ -941,8 +941,8 @@ RULES:
    - Synthesize a comprehensive, well-structured overview using all available details from the provided context chunks (title, author, premise, key characters, main topics, themes, and visible excerpts).
    - Be transparent and helpful about what is described in the uploaded document excerpts.
    - ONLY say: "I don't have enough information in the uploaded documents to answer this question." if the context chunks are completely empty, unreadable, or completely unrelated to the question.
-3. When citing information, ALWAYS cite the page number or row range in square brackets, for example: [Page 4] or [Page 12]. For spreadsheets, cite the row range like [Rows 1-50]. For summary chunks, cite [Summary].
-   CRITICAL: NEVER output chunk UUIDs, IDs, or write [CHUNK ...]. Always use the human-readable [Page X] or [Summary] tag.
+3. When citing information, ALWAYS cite the page number or row range in square brackets, for example: [Page 4] or [Page 12]. For spreadsheets, cite the row range like [Rows 1-50]. For summary chunks, cite [Summary] or [Root Summary].
+   CRITICAL: NEVER output chunk UUIDs, IDs, or write [CHUNK ...]. Always use the human-readable [Page X], [Summary], or [Root Summary] tag.
 4. Format your answers in clean, beautiful Markdown:
    - Use bold (**text**) for important terms and subheadings.
    - Use bullet points (* or -) or numbered lists for structure.
@@ -1099,12 +1099,16 @@ def _build_context(
             content = compress_chunk_content(content, query)
 
         # Build clean human-friendly label for citation
-        if chunk.get("page_number"):
+        if chunk.get("is_root"):
+            tag = "Root Summary"
+        elif chunk.get("tree_level", 0) > 0:
+            tag = f"Summary L{chunk['tree_level']}"
+        elif chunk_type == "summary":
+            tag = "Summary"
+        elif chunk.get("page_number"):
             tag = f"Page {chunk['page_number']}"
         elif chunk.get("row_range_start"):
             tag = f"Rows {chunk['row_range_start']}-{chunk.get('row_range_end', '?')}"
-        elif chunk_type == "summary":
-            tag = "Summary"
         else:
             tag = f"Document: {filename}"
 
@@ -1198,8 +1202,8 @@ def validate_citations(
             # Match [Rows X-Y] or Rows X-Y
             elif rows is not None and re.search(rf'(?:\[|【|\()?\s*Rows?\s+{rows}\b', full_response, re.IGNORECASE):
                 is_cited = True
-            # Match [Summary]
-            elif chunk.get("chunk_type") == "summary" and re.search(r'(?:\[|【|\()?\s*Summary\b', full_response, re.IGNORECASE):
+            # Match [Summary], [Root Summary], [Summary L1], etc.
+            elif (chunk.get("chunk_type") == "summary" or chunk.get("tree_level", 0) > 0) and re.search(r'(?:\[|【|\()?\s*(?:Root\s+)?Summary(?:\s+L\d+)?\b', full_response, re.IGNORECASE):
                 is_cited = True
             # Match legacy [CHUNK <id>]
             elif cid in full_response:
@@ -1212,6 +1216,8 @@ def validate_citations(
                     "chunk_id": cid,
                     "filename": chunk.get("filename", "unknown"),
                     "page_number": page,
+                    "tree_level": chunk.get("tree_level", 0),
+                    "is_root": chunk.get("is_root", False),
                     "row_range_start": chunk.get("row_range_start"),
                     "row_range_end": chunk.get("row_range_end"),
                     "content_preview": content[:200] + ("..." if len(content) > 200 else ""),
@@ -1225,6 +1231,8 @@ def validate_citations(
                     "chunk_id": chunk["id"],
                     "filename": chunk.get("filename", "unknown"),
                     "page_number": chunk.get("page_number"),
+                    "tree_level": chunk.get("tree_level", 0),
+                    "is_root": chunk.get("is_root", False),
                     "row_range_start": chunk.get("row_range_start"),
                     "row_range_end": chunk.get("row_range_end"),
                     "content_preview": content[:200] + ("..." if len(content) > 200 else ""),

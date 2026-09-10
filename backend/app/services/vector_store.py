@@ -100,7 +100,7 @@ async def ensure_collection(user_id: str, force_recreate: bool = False) -> None:
         )
     
     # Ensure payload indices required for fast filtering exist (safe idempotent calls)
-    for field_name in ("chunk_type", "doc_id", "filename"):
+    for field_name in ("chunk_type", "doc_id", "filename", "tree_level", "is_root"):
         try:
             await client.create_payload_index(
                 collection_name=name,
@@ -194,6 +194,8 @@ async def search(
     chunk_type_filter: str | None = None,
     doc_id_filter: str | None = None,
     filename_filter: str | None = None,
+    tree_level_filter: int | None = None,
+    is_root_filter: bool | None = None,
 ) -> list[dict]:
     """
     Search for similar chunks in the user's collection using Hybrid Search (Dense + BM25 RRF).
@@ -201,7 +203,8 @@ async def search(
     If query_sparse_vector is provided, executes native server-side Reciprocal Rank Fusion (RRF)
     between dense cosine similarity and BM25 keyword matching.
     Otherwise, gracefully falls back to dense vector search.
-    Supports filtering by chunk_type, doc_id, and filename.
+    Supports filtering by chunk_type, doc_id, filename, tree_level, and is_root.
+    Default: Flattened search across all tree levels (leaves + summaries + root).
     """
     client = await get_client()
     name = _collection_name(user_id)
@@ -233,6 +236,20 @@ async def search(
             FieldCondition(
                 key="filename",
                 match=MatchValue(value=filename_filter),
+            )
+        )
+    if tree_level_filter is not None:
+        must_conditions.append(
+            FieldCondition(
+                key="tree_level",
+                match=MatchValue(value=tree_level_filter),
+            )
+        )
+    if is_root_filter is not None:
+        must_conditions.append(
+            FieldCondition(
+                key="is_root",
+                match=MatchValue(value=is_root_filter),
             )
         )
     query_filter = Filter(must=must_conditions) if must_conditions else None
@@ -321,11 +338,14 @@ async def delete_by_document(user_id: str, doc_id: str) -> None:
         logfire.info("Deleted vectors for doc {doc_id} from collection {name}", doc_id=doc_id, name=name)
 
 
-async def get_summary_chunks(user_id: str, doc_id_filter: str | None = None) -> list[dict]:
+async def get_summary_chunks(
+    user_id: str,
+    doc_id_filter: str | None = None,
+    root_only: bool = False,
+) -> list[dict]:
     """
     Retrieve summary-type chunks from the user's collection, optionally filtered by doc_id.
-    Used when an aggregation query is detected, so summary chunks
-    are included in context regardless of vector similarity.
+    Sorts returned summaries with Root summary first, followed by higher tree levels.
     """
     client = await get_client()
     name = _collection_name(user_id)
@@ -349,6 +369,13 @@ async def get_summary_chunks(user_id: str, doc_id_filter: str | None = None) -> 
                 match=MatchValue(value=doc_id_filter),
             )
         )
+    if root_only:
+        must_conditions.append(
+            FieldCondition(
+                key="is_root",
+                match=MatchValue(value=True),
+            )
+        )
 
     # Scroll through matching points
     results, _ = await client.scroll(
@@ -359,7 +386,7 @@ async def get_summary_chunks(user_id: str, doc_id_filter: str | None = None) -> 
         with_vectors=False,
     )
 
-    return [
+    items = [
         {
             "id": str(point.id),
             "score": 1.0,
@@ -367,3 +394,6 @@ async def get_summary_chunks(user_id: str, doc_id_filter: str | None = None) -> 
         }
         for point in results
     ]
+    # Sort: root summary first (is_root=True), then highest tree_level descending
+    items.sort(key=lambda x: (x.get("is_root", False), x.get("tree_level", 1)), reverse=True)
+    return items
