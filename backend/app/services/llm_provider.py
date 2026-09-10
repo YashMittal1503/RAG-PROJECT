@@ -257,13 +257,14 @@ def get_generation_targets() -> List[LLMTarget]:
 
     # Tier 1: Groq models
     if groq_pool.is_available():
-        groq_models = [
+        candidates = [
             settings.groq_model,
             "openai/gpt-oss-120b",
             "qwen/qwen3.8-27b",
-            "openai/gpt-oss-20b",
             "groq/compound-mini",
         ]
+        # Exclude known non-chat or malformed models
+        groq_models = [m for m in candidates if m and m not in ("groq/compound", "openai/gpt-oss-20b")]
         seen_groq = set()
         for m in groq_models:
             if m not in seen_groq:
@@ -331,7 +332,6 @@ def get_fast_targets() -> List[LLMTarget]:
         fast_groq = [
             "qwen/qwen3.8-27b",
             "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
             "groq/compound-mini",
         ]
         for m in fast_groq:

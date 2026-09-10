@@ -573,17 +573,18 @@ export default function ChatPage() {
         if (!trimmed || trimmed.startsWith(":")) return; // skip empty blocks or comments/pings
 
         let eventType = "message";
-        let dataStr = "";
+        const dataLines: string[] = [];
 
-        for (const rawLine of trimmed.split("\n")) {
+        for (const rawLine of chunkText.split("\n")) {
           const line = rawLine.trim();
           if (line.startsWith("event:")) {
             eventType = line.slice(6).trim();
-          } else if (line.startsWith("data:")) {
-            dataStr = line.slice(5).trim();
+          } else if (rawLine.startsWith("data:") || line.startsWith("data:")) {
+            dataLines.push(rawLine.replace(/^data:\s?/, ""));
           }
         }
 
+        const dataStr = dataLines.join("\n").trim();
         if (!dataStr) return;
 
         try {
@@ -665,8 +666,11 @@ export default function ChatPage() {
       }
     } catch (err: any) {
       setError(
-        "Something went wrong generating a response. Please try again in a moment."
+        err.message ||
+          "Something went wrong generating a response. Please try again in a moment."
       );
+      // Remove empty assistant placeholder if failed before emitting tokens
+      setMessages((prev) => prev.filter((m) => m.id !== assistantId || m.content.length > 0));
     } finally {
       setStreaming(false);
       setMessages((latest) => {

@@ -172,7 +172,7 @@ async def get_messages(
     )
     session = result.unique().scalar_one_or_none()
     if not session:
-        raise HTTPException(status_code=404, detail="Chat session not found.")
+        return []
 
     if session.title:
         response.headers["X-Session-Title"] = session.title
@@ -208,7 +208,14 @@ async def query(
         )
         session_obj = result.scalar_one_or_none()
         if not session_obj:
-            raise HTTPException(status_code=404, detail="Chat session not found.")
+            session_obj = ChatSession(
+                id=session_id,
+                user_id=uuid.UUID(user_id),
+                title="New conversation",
+            )
+            db.add(session_obj)
+            await db.commit()
+            logger.info(f"Auto-created session {session_id} for user {user_id[:8]}")
         current_session_title = session_obj.title or "New conversation"
 
         # Save the user message
@@ -289,6 +296,7 @@ async def query(
                     async for token in generate_direct_response(body.question, chat_history):
                         full_response += token
                         yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+                        await asyncio.sleep(0)
 
                     # No citations for chitchat
                     yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
@@ -412,6 +420,7 @@ async def query(
                                 ):
                                     full_response += token
                                     yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+                                    await asyncio.sleep(0)
 
                                 # No vector citations for SQL answers
                                 yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
@@ -451,6 +460,7 @@ async def query(
                             ):
                                 full_response += token
                                 yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+                                await asyncio.sleep(0)
 
                             yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
 
@@ -524,6 +534,7 @@ async def query(
                 async for token in generate_answer_stream(rewritten, chunks):
                     full_response += token
                     yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+                    await asyncio.sleep(0)
 
                 # Step 6: Validate citations
                 citations = validate_citations(full_response, chunks)
@@ -559,7 +570,7 @@ async def query(
         event_stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # Disable proxy buffering
         },
