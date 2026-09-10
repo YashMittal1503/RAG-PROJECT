@@ -403,6 +403,23 @@ async def analyze_document_scope(
             clarification_text=format_clarification_message(available_documents, question),
         )
 
+    # 4c. Short-Term Memory: Inherit active document focus from recent chat history for follow-ups
+    if chat_history:
+        for m in reversed(chat_history):
+            content = m.get("content", "")
+            matched_history = _find_matching_doc_by_keyword(content, available_documents)
+            if matched_history:
+                logger.info(
+                    f"Short-term memory: inheriting active document focus '{matched_history['filename']}' for follow-up: '{question}'"
+                )
+                return DocumentScopeResult(
+                    status="resolved",
+                    target_doc_id=str(matched_history["id"]),
+                    target_filename=matched_history["filename"],
+                    is_tabular=matched_history.get("is_tabular", False),
+                    cleaned_question=question,
+                )
+
     # 5. Fast LLM Ambiguity / Scope Classification
     catalog_lines = []
     for i, d in enumerate(available_documents, 1):
@@ -726,7 +743,13 @@ OVERVIEW_KEYWORDS = {
     "give me an overview", "overview", "summary", "summarize", "synopsis",
     "what happens in", "who wrote", "author of", "premise", "plot summary",
     "plot of", "introduction to", "intro of", "what is the story", "explain the story",
-    "main character", "protagonist", "key findings", "main idea", "main themes",
+    "main character", "protagonist", "narrator", "characters", "key findings", "main idea", "main themes",
+}
+
+CHARACTER_KEYWORDS = {
+    "narrator", "name of the narrator", "who is the narrator", "who tells the story",
+    "main character", "protagonist", "who is the main character", "characters",
+    "who wrote", "author", "speaker", "who is the protagonist",
 }
 
 
@@ -739,6 +762,12 @@ def is_overview_query(question: str) -> bool:
     return any(kw in lower_q for kw in OVERVIEW_KEYWORDS)
 
 
+def is_character_query(question: str) -> bool:
+    """Check if question asks about characters, narrator, protagonist, or author."""
+    lower_q = question.lower()
+    return any(kw in lower_q for kw in CHARACTER_KEYWORDS)
+
+
 # ── Query rewrite ─────────────────────────────────────────────────────────
 
 REWRITE_SYSTEM_PROMPT = """You are a search query rewriter for a document and tabular data assistant.
@@ -746,9 +775,15 @@ Given a conversation history and a user's follow-up message, rewrite it into a s
 
 CRITICAL RULES:
 1. Output ONLY the rewritten question. Never output an answer, explanation, essay, bullet list, or markdown headers.
-2. If the user says "continue", "more", "tell me more", "go on", "elaborate": rewrite it into a question asking for deeper insights, key factors, or metrics about the previous topic (e.g. "What are more details and key factors behind [topic]?").
-3. Strictly maximum 1 sentence under 20 words.
-4. If the question is already self-contained, return it unchanged."""
+2. Conversational Verification & Follow-ups:
+   - If the user says "are you sure?", "really?", "check again", "can you verify?", "are you certain?", "who?":
+     Rewrite it into a specific standalone verification query re-examining the previous question with the active document (e.g. if previous question was about the narrator in Verity, rewrite to: "Who is the narrator or protagonist in the book Verity?").
+   - If the user says "continue", "more", "tell me more", "go on", "elaborate":
+     Rewrite it into a question asking for deeper insights about the previous topic.
+3. Character & Narrator Inquiries:
+   - When the user asks about the "narrator", "who tells the story", or "speaker" of a book or novel, expand to include "narrator, protagonist, or main character in [Document]".
+4. Strictly maximum 1 sentence under 20 words.
+5. If the question is already self-contained, return it unchanged."""
 
 
 async def rewrite_query(
@@ -843,12 +878,12 @@ async def retrieve_chunks(
         query_vector = embedding.embed_query(question)
         query_sparse = embedding.embed_sparse_query(question)
 
-        # Hybrid candidate retrieval (Dense + BM25 via server-side RRF) — top 10 candidates
+        # Hybrid candidate retrieval (Dense + BM25 via server-side RRF) — top 20 candidates
         candidates = await vector_store.search(
             user_id=user_id,
             query_vector=query_vector,
             query_sparse_vector=query_sparse,
-            limit=10,
+            limit=20,
             doc_id_filter=doc_id_filter,
             filename_filter=filename_filter,
         )
@@ -867,9 +902,11 @@ async def retrieve_chunks(
             span.set_attribute("top_source", results[0].get("filename", "unknown"))
             span.set_attribute("retrieved_sources", list(set(r.get("filename", "unknown") for r in results)))
 
-        # If overview/aggregation detected, fetch and prepend summary chunks and lead chunks
-        is_overview = is_aggregation or is_overview_query(question)
+        # If overview/aggregation/character query detected, fetch and prepend summary chunks and lead chunks
+        is_char_query = is_character_query(question)
+        is_overview = is_aggregation or is_overview_query(question) or is_char_query
         span.set_attribute("is_overview_query", is_overview)
+        span.set_attribute("is_character_query", is_char_query)
 
         if is_overview:
             summary_chunks = await vector_store.get_summary_chunks(user_id, doc_id_filter=doc_id_filter)
@@ -880,7 +917,7 @@ async def retrieve_chunks(
                 span.set_attribute("summary_chunks_added", len(new_summaries))
                 logger.info(f"Added {len(new_summaries)} summary chunks for overview/aggregation query")
 
-            # For targeted document overview inquiries, anchor with the document's introductory lead chunks
+            # For targeted document overview or character inquiries, anchor with the document's introductory lead chunks
             if doc_id_filter:
                 try:
                     from app.database import AsyncSessionLocal
@@ -896,10 +933,14 @@ async def retrieve_chunks(
                             )
                             lead_doc_name = d_res.scalar_one_or_none() or "document"
 
+                        # Character/narrator inquiries need opening chapters (chunks 0-6 where characters introduce themselves)
+                        # General overview inquiries need opening lead chunks (0-1)
+                        lead_slice = (Chunk.chunk_index < 7) if is_char_query else Chunk.chunk_index.in_([0, 1])
+
                         lead_res = await db.execute(
                             select(Chunk).where(
                                 Chunk.document_id == (UUID(doc_id_filter) if isinstance(doc_id_filter, str) else doc_id_filter),
-                                Chunk.chunk_index.in_([0, 1]),
+                                lead_slice,
                             ).order_by(Chunk.chunk_index.asc())
                         )
                         db_chunks = lead_res.scalars().all()
@@ -914,6 +955,7 @@ async def retrieve_chunks(
                                 "content": c.content,
                                 "chunk_type": c.chunk_type,
                                 "score": 1.0,
+                                "is_lead": True,
                             }
                             for c in db_chunks
                         ]
@@ -922,7 +964,7 @@ async def retrieve_chunks(
                             new_leads = [c for c in lead_chunks if c["id"] not in result_ids]
                             # Prepend lead chunks so document title/author/intro context comes first
                             results = new_leads + results
-                            results = results[:5]
+                            results = results[:7]
                             span.set_attribute("lead_chunks_added", len(new_leads))
                             logger.info(f"Added {len(new_leads)} lead chunks for document {doc_id_filter}")
                 except Exception as e:
