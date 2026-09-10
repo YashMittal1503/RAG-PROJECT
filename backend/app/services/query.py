@@ -88,7 +88,7 @@ async def classify_intent(
 
     Returns: "retrieve" or "chitchat"
     """
-    with logfire.span("rag.classify_intent", question=question) as span:
+    with logfire.span("🎯 Classify Intent | '{q_short}'", q_short=question[:50], question=question) as span:
         # Fast heuristic for obvious greetings / conversational pleasantries
         cleaned = question.strip().lower()
         cleaned = re.sub(r"[^\w\s]", "", cleaned)
@@ -636,7 +636,7 @@ async def generate_chat_title(
     the user inquiry and the assistant response.
     Returns "New conversation" if the conversation is purely pleasantries.
     """
-    with logfire.span("rag.generate_chat_title", question=current_question[:60]) as span:
+    with logfire.span("🏷️ Synthesize Chat Title | '{q_short}'", q_short=current_question[:50], question=current_question[:60]) as span:
         # Fast check: if only message and it's a simple greeting, return default immediately
         cleaned_q = current_question.strip().lower()
         cleaned_q = re.sub(r"[^\w\s]", "", cleaned_q)
@@ -744,7 +744,7 @@ async def rewrite_query(
     if not chat_history:
         return question
 
-    with logfire.span("rag.rewrite_query", original_question=question, history_turns=len(chat_history)) as span:
+    with logfire.span("🔄 Rewrite Query | '{q_short}'", q_short=question[:50], original_question=question, history_turns=len(chat_history)) as span:
         # Build a condensed history string (last 5 messages)
         recent = chat_history[-5:]
         history_str = "\n".join(
@@ -818,7 +818,7 @@ async def retrieve_chunks(
     2. Search Qdrant for top-K similar chunks (optionally scoped to a specific document)
     3. If aggregation detected, also fetch summary chunks and prepend them
     """
-    with logfire.span("rag.retrieve_chunks", question=question, is_aggregation=is_aggregation, doc_id_filter=doc_id_filter) as span:
+    with logfire.span("🔍 Hybrid Retrieval | '{q_short}'", q_short=question[:50], question=question, is_aggregation=is_aggregation, doc_id_filter=doc_id_filter) as span:
         # Embed the query with dense vector (semantic) and sparse BM25 vector (keyword)
         query_vector = embedding.embed_query(question)
         query_sparse = embedding.embed_sparse_query(question)
@@ -1072,7 +1072,7 @@ async def generate_answer_stream(
     The caller is responsible for accumulating the full response
     for citation validation.
     """
-    with logfire.span("rag.generate_answer", question=question, chunks_count=len(chunks)) as span:
+    with logfire.span("🤖 Stream RAG Answer | '{q_short}'", q_short=question[:50], question=question, chunks_count=len(chunks)) as span:
         context = _build_context(chunks, query=question)
 
         groq = _get_groq()
@@ -1109,7 +1109,7 @@ def validate_citations(
     Extract and validate citation references from the LLM response.
     Supports [Page X], [Rows X-Y], [Summary], and [CHUNK <id>].
     """
-    with logfire.span("rag.validate_citations", chunks_available=len(context_chunks)) as span:
+    with logfire.span("📑 Validate Citations | {chunks_available} chunk(s)", chunks_available=len(context_chunks)) as span:
         valid_citations = []
         seen = set()
 
@@ -1226,7 +1226,7 @@ async def generate_sql_query(
 
     Returns the SQL string, or None if the question can't be answered with SQL.
     """
-    with logfire.span("rag.generate_sql", question=question) as span:
+    with logfire.span("📝 Generate DuckDB SQL | '{q_short}'", q_short=question[:50], question=question) as span:
         messages: list[dict] = [
             {"role": "system", "content": SQL_GENERATION_PROMPT},
             {
@@ -1300,7 +1300,7 @@ async def generate_sql_answer_stream(
     """
     Stream an LLM answer that interprets the SQL results for the user.
     """
-    with logfire.span("rag.generate_sql_answer", question=question, sql_query=sql_query) as span:
+    with logfire.span("🦆 Stream SQL Answer | '{q_short}'", q_short=question[:50], question=question, sql_query=sql_query) as span:
         groq = _get_groq()
 
         messages = [
@@ -1356,7 +1356,7 @@ async def generate_tabular_overview_stream(
     """
     Stream an overview/insight response for tabular data when SQL cannot be generated or fails.
     """
-    with logfire.span("rag.tabular_overview", question=question, filename=filename) as span:
+    with logfire.span("📊 Stream Tabular Overview | {filename}", filename=filename or "Spreadsheet", question=question) as span:
         messages = [
             {"role": "system", "content": TABULAR_OVERVIEW_PROMPT},
             {
@@ -1395,7 +1395,7 @@ async def execute_sql_query(user_id: str, sql: str) -> dict:
     Runs in a thread to avoid blocking.
     """
     import asyncio
-    with logfire.span("duckdb.execute_sql", sql=sql) as span:
+    with logfire.span("🦆 Execute DuckDB SQL | '{sql_short}'", sql_short=sql[:50], sql=sql) as span:
         result = await asyncio.to_thread(tabular_store.execute_sql, user_id, sql)
         span.set_attribute("row_count", result.get("row_count", 0))
         span.set_attribute("columns", result.get("columns", []))

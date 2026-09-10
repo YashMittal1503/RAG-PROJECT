@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
+import logfire
 from sqlalchemy import select, delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,87 +45,98 @@ async def upload_documents(
 
     Returns immediately — the frontend polls for status updates.
     """
-    # Check batch size limit
-    if len(files) > settings.max_batch_size:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Maximum {settings.max_batch_size} files per upload.",
-        )
-
-    documents = []
-    errors = []
-
-    for file in files:
-        try:
-            # Read file content
-            file_bytes = await file.read()
-
-            # Check file size
-            if len(file_bytes) > settings.max_file_size_mb * 1024 * 1024:
-                errors.append({
-                    "filename": file.filename,
-                    "error": f"File exceeds the {settings.max_file_size_mb}MB size limit.",
-                })
-                continue
-
-            # Validate file type by magic bytes
-            file_type, mime_type = validate_file_type(file_bytes, file.filename)
-
-            # Generate document ID
-            doc_id = uuid.uuid4()
-
-            # Upload to Supabase Storage
-            storage_path = await storage.upload_file(
-                user_id=user_id,
-                doc_id=doc_id,
-                filename=file.filename,
-                file_bytes=file_bytes,
-                content_type=mime_type,
+    with logfire.span("📁 Upload Documents | {count} file(s)", count=len(files), user_id=user_id) as span:
+        # Check batch size limit
+        if len(files) > settings.max_batch_size:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Maximum {settings.max_batch_size} files per upload.",
             )
 
-            # Create document record
-            doc = Document(
-                id=doc_id,
-                user_id=uuid.UUID(user_id),
-                filename=file.filename,
-                file_type=file_type,
-                file_size=len(file_bytes),
-                storage_path=storage_path,
-                status=DocumentStatus.QUEUED,
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            )
-            db.add(doc)
-            await db.commit()
-            await db.refresh(doc)
+        documents = []
+        errors = []
 
-            # Start background ingestion (non-blocking) after record is committed
-            asyncio.create_task(
-                ingest_document(
-                    doc_id=doc_id,  
+        for file in files:
+            try:
+                # Read file content
+                file_bytes = await file.read()
+
+                # Check file size
+                if len(file_bytes) > settings.max_file_size_mb * 1024 * 1024:
+                    errors.append({
+                        "filename": file.filename,
+                        "error": f"File exceeds the {settings.max_file_size_mb}MB size limit.",
+                    })
+                    continue
+
+                # Validate file type by magic bytes
+                file_type, mime_type = validate_file_type(file_bytes, file.filename)
+
+                # Generate document ID
+                doc_id = uuid.uuid4()
+
+                # Upload to Supabase Storage
+                storage_path = await storage.upload_file(
                     user_id=user_id,
+                    doc_id=doc_id,
+                    filename=file.filename,
+                    file_bytes=file_bytes,
+                    content_type=mime_type,
+                )
+
+                # Create document record
+                doc = Document(
+                    id=doc_id,
+                    user_id=uuid.UUID(user_id),
                     filename=file.filename,
                     file_type=file_type,
+                    file_size=len(file_bytes),
                     storage_path=storage_path,
+                    status=DocumentStatus.QUEUED,
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
                 )
-            )
+                db.add(doc)
+                await db.commit()
+                await db.refresh(doc)
 
-            documents.append(DocumentResponse.model_validate(doc))
+                # Start background ingestion (non-blocking) after record is committed
+                asyncio.create_task(
+                    ingest_document(
+                        doc_id=doc_id,  
+                        user_id=user_id,
+                        filename=file.filename,
+                        file_type=file_type,
+                        storage_path=storage_path,
+                    )
+                )
 
-        except ValueError as e:
-            # File validation errors (wrong type, blocked format, etc.)
-            errors.append({
-                "filename": file.filename or "unknown",
-                "error": str(e),
-            })
-        except Exception as e:
-            logger.exception(f"Failed to process upload: {file.filename}")
-            errors.append({
-                "filename": file.filename or "unknown",
-                "error": "An unexpected error occurred during upload.",
-            })
+                documents.append(DocumentResponse.model_validate(doc))
+                logfire.info(
+                    "Queued document {doc_id} ('{filename}', {size} bytes, type={file_type})",
+                    doc_id=str(doc_id),
+                    filename=file.filename,
+                    size=len(file_bytes),
+                    file_type=file_type,
+                    user_id=user_id,
+                )
 
-    return UploadResponse(documents=documents, errors=errors)
+            except ValueError as e:
+                # File validation errors (wrong type, blocked format, etc.)
+                errors.append({
+                    "filename": file.filename or "unknown",
+                    "error": str(e),
+                })
+            except Exception as e:
+                logger.exception(f"Failed to process upload: {file.filename}")
+                errors.append({
+                    "filename": file.filename or "unknown",
+                    "error": "An unexpected error occurred during upload.",
+                })
+
+        span.set_attribute("uploaded_count", len(documents))
+        span.set_attribute("error_count", len(errors))
+        return UploadResponse(documents=documents, errors=errors)
 
 
 @router.get("", response_model=list[DocumentResponse])
@@ -133,13 +145,16 @@ async def list_documents(
     db: AsyncSession = Depends(get_db),
 ):
     """List all documents belonging to the authenticated user."""
-    result = await db.execute(
-        select(Document)
-        .where(Document.user_id == uuid.UUID(user_id))
-        .order_by(Document.created_at.desc())
-    )
-    docs = result.scalars().all()
-    return [DocumentResponse.model_validate(d) for d in docs]
+    with logfire.span("📋 List Documents", user_id=user_id) as span:
+        result = await db.execute(
+            select(Document)
+            .where(Document.user_id == uuid.UUID(user_id))
+            .order_by(Document.created_at.desc())
+        )
+        docs = result.scalars().all()
+        span.set_attribute("document_count", len(docs))
+        logfire.info("Listed {count} documents for user {user_id}", count=len(docs), user_id=user_id)
+        return [DocumentResponse.model_validate(d) for d in docs]
 
 
 @router.get("/{doc_id}/status", response_model=DocumentStatusResponse)
@@ -149,21 +164,25 @@ async def get_document_status(
     db: AsyncSession = Depends(get_db),
 ):
     """Get the processing status of a single document (for polling)."""
-    result = await db.execute(
-        select(Document).where(
-            Document.id == doc_id,
-            Document.user_id == uuid.UUID(user_id),
+    with logfire.span("⏳ Document Status | {doc_id}", doc_id=str(doc_id), user_id=user_id) as span:
+        result = await db.execute(
+            select(Document).where(
+                Document.id == doc_id,
+                Document.user_id == uuid.UUID(user_id),
+            )
         )
-    )
-    doc = result.scalar_one_or_none()
+        doc = result.scalar_one_or_none()
 
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found.",
-        )
+        if not doc:
+            span.set_attribute("found", False)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found.",
+            )
 
-    return DocumentStatusResponse.model_validate(doc)
+        span.set_attribute("status", doc.status.value)
+        span.set_attribute("chunk_count", doc.chunk_count)
+        return DocumentStatusResponse.model_validate(doc)
 
 
 @router.delete("/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -178,40 +197,46 @@ async def delete_document(
     - Vectors from Qdrant
     - File from Supabase Storage
     """
-    # Verify document exists and belongs to the user
-    result = await db.execute(
-        select(Document).where(
-            Document.id == doc_id,
-            Document.user_id == uuid.UUID(user_id),
+    with logfire.span("🗑️ Delete Document | {doc_id}", doc_id=str(doc_id), user_id=user_id) as span:
+        # Verify document exists and belongs to the user
+        result = await db.execute(
+            select(Document).where(
+                Document.id == doc_id,
+                Document.user_id == uuid.UUID(user_id),
+            )
         )
-    )
-    doc = result.scalar_one_or_none()
+        doc = result.scalar_one_or_none()
 
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document not found.",
-        )
+        if not doc:
+            span.set_attribute("found", False)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found.",
+            )
 
-    # Delete vectors from Qdrant
-    try:
-        await vector_store.delete_by_document(user_id, str(doc_id))
-    except Exception as e:
-        logger.warning(f"Failed to delete vectors for doc {doc_id}: {e}")
+        span.set_attribute("filename", doc.filename)
 
-    # Delete DuckDB tables for tabular documents
-    if doc.is_tabular:
+        # Delete vectors from Qdrant
         try:
-            import asyncio
-            await asyncio.to_thread(tabular_store.delete_tables, user_id, doc_id)
+            await vector_store.delete_by_document(user_id, str(doc_id))
         except Exception as e:
-            logger.warning(f"Failed to delete DuckDB tables for doc {doc_id}: {e}")
+            logger.warning(f"Failed to delete vectors for doc {doc_id}: {e}")
 
-    # Delete file from Supabase Storage
-    await storage.delete_file(doc.storage_path)
+        # Delete DuckDB tables for tabular documents
+        if doc.is_tabular:
+            try:
+                import asyncio
+                await asyncio.to_thread(tabular_store.delete_tables, user_id, doc_id)
+            except Exception as e:
+                logger.warning(f"Failed to delete DuckDB tables for doc {doc_id}: {e}")
 
-    # Delete document record (chunks cascade automatically)
-    await db.execute(
-        sa_delete(Document).where(Document.id == doc_id)
-    )
-    await db.commit()
+        # Delete file from Supabase Storage
+        await storage.delete_file(doc.storage_path)
+
+        # Delete document record (chunks cascade automatically)
+        await db.execute(
+            sa_delete(Document).where(Document.id == doc_id)
+        )
+        await db.commit()
+        logfire.info("Deleted document {doc_id} ('{filename}') for user {user_id}", doc_id=str(doc_id), filename=doc.filename, user_id=user_id)
+        return None

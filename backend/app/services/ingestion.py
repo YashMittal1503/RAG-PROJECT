@@ -81,36 +81,36 @@ async def ingest_document(
     This function is designed to be called via asyncio.create_task()
     so it runs in the background without blocking the upload response.
     """
-    with logfire.span("ingestion.pipeline", doc_id=str(doc_id), filename=filename, file_type=file_type) as pipe_span:
+    with logfire.span("📥 Ingestion Pipeline | {filename}", filename=filename, doc_id=str(doc_id), file_type=file_type, user_id=user_id) as pipe_span:
         try:
             # ── Step 1: Parsing ───────────────────────────────────────
             await _update_status(doc_id, DocumentStatus.PARSING)
             logger.info(f"[{doc_id}] Parsing {filename} ({file_type})")
 
-            with logfire.span("ingestion.download", storage_path=storage_path):
+            with logfire.span("💾 Download Storage File | {filename}", filename=filename, storage_path=storage_path):
                 file_bytes = await storage.download_file(storage_path)
 
             all_chunks: list[ChunkData] = []
 
             if file_type == "pdf":
-                with logfire.span("ingestion.parse_pdf") as p_span:
+                with logfire.span("📄 Parse PDF (PyMuPDF + RapidOCR) | {filename}", filename=filename) as p_span:
                     pages = await asyncio.to_thread(parse_pdf, file_bytes)
                     p_span.set_attribute("page_count", len(pages))
                 await _update_status(doc_id, DocumentStatus.CHUNKING)
-                with logfire.span("ingestion.chunk_pdf") as c_span:
+                with logfire.span("🧩 Chunk PDF Content | {filename}", filename=filename) as c_span:
                     all_chunks = await asyncio.to_thread(chunk_text, pages, filename=filename)
                     c_span.set_attribute("chunk_count", len(all_chunks))
 
             elif file_type == "txt":
-                with logfire.span("ingestion.parse_txt"):
+                with logfire.span("📄 Parse Text File | {filename}", filename=filename):
                     text = await asyncio.to_thread(parse_txt, file_bytes)
                 await _update_status(doc_id, DocumentStatus.CHUNKING)
-                with logfire.span("ingestion.chunk_txt") as c_span:
+                with logfire.span("🧩 Chunk Text Content | {filename}", filename=filename) as c_span:
                     all_chunks = await asyncio.to_thread(chunk_text_from_string, text, filename=filename)
                     c_span.set_attribute("chunk_count", len(all_chunks))
 
             elif file_type in ("xlsx", "csv"):
-                with logfire.span("ingestion.parse_spreadsheet") as s_span:
+                with logfire.span("📊 Parse Spreadsheet | {filename}", filename=filename) as s_span:
                     sheets = await asyncio.to_thread(parse_spreadsheet, file_bytes, file_type)
                     s_span.set_attribute("sheet_count", len(sheets))
 
@@ -119,7 +119,7 @@ async def ingest_document(
                 logger.info(f"[{doc_id}] Storing {len(sheets)} sheet(s) in DuckDB")
 
                 total_rows = 0
-                with logfire.span("ingestion.store_duckdb") as duck_span:
+                with logfire.span("🦆 Store Tabular in DuckDB | {filename}", filename=filename) as duck_span:
                     for sheet in sheets:
                         result = await asyncio.to_thread(
                             tabular_store.store_dataframe,
@@ -145,6 +145,7 @@ async def ingest_document(
                 )
                 pipe_span.set_attribute("status", "ready")
                 pipe_span.set_attribute("rows_stored", total_rows)
+                logfire.info("✅ Tabular ingestion complete for '{filename}': {total_rows} rows stored in DuckDB", filename=filename, total_rows=total_rows, doc_id=str(doc_id))
                 logger.info(f"[{doc_id}] Tabular ingestion complete — {total_rows} rows stored")
                 return  # Early return — skip the embedding pipeline below
 
@@ -161,7 +162,7 @@ async def ingest_document(
             await _update_status(doc_id, DocumentStatus.EMBEDDING)
             logger.info(f"[{doc_id}] Embedding {len(all_chunks)} chunks (Dense + BM25)")
 
-            with logfire.span("ingestion.embed_chunks", count=len(all_chunks)):
+            with logfire.span("⚡ Generate Embeddings | {count} chunks (Dense + BM25)", count=len(all_chunks)):
                 chunk_texts = [c.content for c in all_chunks]
                 batch_embed_size = 64
                 vectors = []
@@ -174,7 +175,7 @@ async def ingest_document(
                     sparse_vectors.extend(sub_sparse)
 
             # ── Step 3: Store in Qdrant ───────────────────────────────
-            with logfire.span("ingestion.store_qdrant", points_count=len(all_chunks)):
+            with logfire.span("🗄️ Upsert to Qdrant | {points_count} points", points_count=len(all_chunks)):
                 await vector_store.ensure_collection(user_id)
                 # Purge any previously stored vectors for this doc (safe for re-ingestion)
                 try:
@@ -202,7 +203,7 @@ async def ingest_document(
                 await vector_store.upsert_chunks(user_id, qdrant_points)
 
             # ── Step 4: Save chunk metadata to Postgres ───────────────
-            with logfire.span("ingestion.save_postgres_chunks", chunk_count=len(all_chunks)):
+            with logfire.span("💾 Persist Chunks to Postgres | {chunk_count} chunks", chunk_count=len(all_chunks)):
                 # Clean up existing chunks for this document to prevent duplicates on re-ingestion
                 async with AsyncSessionLocal() as session:
                     await session.execute(
@@ -248,6 +249,7 @@ async def ingest_document(
                 chunk_count=len(all_chunks),
             )
             pipe_span.set_attribute("status", "ready")
+            logfire.info("✅ Ingestion complete for '{filename}': {chunk_count} chunks indexed", filename=filename, chunk_count=len(all_chunks), doc_id=str(doc_id))
             logger.info(f"[{doc_id}] Ingestion complete — {len(all_chunks)} chunks ready")
 
         except ValueError as e:

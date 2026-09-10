@@ -62,15 +62,18 @@ async def create_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new chat session."""
-    session = ChatSession(
-        user_id=uuid.UUID(user_id),
-        title=body.title,
-        created_at=datetime.now(timezone.utc),
-    )
-    db.add(session)
-    await db.commit()
-    await db.refresh(session)
-    return ChatSessionResponse.model_validate(session)
+    with logfire.span("💬 Create Chat Session | '{title}'", title=body.title, user_id=user_id) as span:
+        session = ChatSession(
+            user_id=uuid.UUID(user_id),
+            title=body.title,
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(session)
+        await db.commit()
+        await db.refresh(session)
+        span.set_attribute("session_id", str(session.id))
+        logfire.info("Created session {session_id} for user {user_id}", session_id=str(session.id), user_id=user_id)
+        return ChatSessionResponse.model_validate(session)
 
 
 @router.get("/sessions", response_model=list[ChatSessionResponse])
@@ -79,13 +82,15 @@ async def list_sessions(
     db: AsyncSession = Depends(get_db),
 ):
     """List all chat sessions for the authenticated user."""
-    result = await db.execute(
-        select(ChatSession)
-        .where(ChatSession.user_id == uuid.UUID(user_id))
-        .order_by(ChatSession.created_at.desc())
-    )
-    sessions = result.scalars().all()
-    return [ChatSessionResponse.model_validate(s) for s in sessions]
+    with logfire.span("📋 List Chat Sessions", user_id=user_id) as span:
+        result = await db.execute(
+            select(ChatSession)
+            .where(ChatSession.user_id == uuid.UUID(user_id))
+            .order_by(ChatSession.created_at.desc())
+        )
+        sessions = result.scalars().all()
+        span.set_attribute("session_count", len(sessions))
+        return [ChatSessionResponse.model_validate(s) for s in sessions]
 
 
 @router.get("/sessions/{session_id}", response_model=ChatSessionResponse)
@@ -95,16 +100,19 @@ async def get_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Get a single chat session by ID."""
-    result = await db.execute(
-        select(ChatSession).where(
-            ChatSession.id == session_id,
-            ChatSession.user_id == uuid.UUID(user_id),
+    with logfire.span("🔍 Get Chat Session | {session_id}", session_id=str(session_id), user_id=user_id) as span:
+        result = await db.execute(
+            select(ChatSession).where(
+                ChatSession.id == session_id,
+                ChatSession.user_id == uuid.UUID(user_id),
+            )
         )
-    )
-    session = result.scalar_one_or_none()
-    if not session:
-        raise HTTPException(status_code=404, detail="Chat session not found.")
-    return ChatSessionResponse.model_validate(session)
+        session = result.scalar_one_or_none()
+        if not session:
+            span.set_attribute("found", False)
+            raise HTTPException(status_code=404, detail="Chat session not found.")
+        span.set_attribute("title", session.title or "Untitled")
+        return ChatSessionResponse.model_validate(session)
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -114,19 +122,22 @@ async def delete_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a chat session and all its messages."""
-    result = await db.execute(
-        select(ChatSession).where(
-            ChatSession.id == session_id,
-            ChatSession.user_id == uuid.UUID(user_id),
+    with logfire.span("🗑️ Delete Chat Session | {session_id}", session_id=str(session_id), user_id=user_id) as span:
+        result = await db.execute(
+            select(ChatSession).where(
+                ChatSession.id == session_id,
+                ChatSession.user_id == uuid.UUID(user_id),
+            )
         )
-    )
-    session = result.scalar_one_or_none()
-    if not session:
-        raise HTTPException(status_code=404, detail="Chat session not found.")
+        session = result.scalar_one_or_none()
+        if not session:
+            span.set_attribute("found", False)
+            raise HTTPException(status_code=404, detail="Chat session not found.")
 
-    await db.delete(session)
-    await db.commit()
-    return None
+        await db.delete(session)
+        await db.commit()
+        logfire.info("Deleted session {session_id} for user {user_id}", session_id=str(session_id), user_id=user_id)
+        return None
 
 
 @router.patch("/sessions/{session_id}", response_model=ChatSessionResponse)
@@ -137,21 +148,23 @@ async def update_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Update a chat session's title."""
-    result = await db.execute(
-        select(ChatSession).where(
-            ChatSession.id == session_id,
-            ChatSession.user_id == uuid.UUID(user_id),
+    with logfire.span("✏️ Update Session Title | {session_id}", session_id=str(session_id), title=body.title.strip(), user_id=user_id) as span:
+        result = await db.execute(
+            select(ChatSession).where(
+                ChatSession.id == session_id,
+                ChatSession.user_id == uuid.UUID(user_id),
+            )
         )
-    )
-    session = result.scalar_one_or_none()
-    if not session:
-        raise HTTPException(status_code=404, detail="Chat session not found.")
+        session = result.scalar_one_or_none()
+        if not session:
+            span.set_attribute("found", False)
+            raise HTTPException(status_code=404, detail="Chat session not found.")
 
-    session.title = body.title.strip()
-    await db.commit()
-    await db.refresh(session)
-    return ChatSessionResponse.model_validate(session)
-
+        session.title = body.title.strip()
+        await db.commit()
+        await db.refresh(session)
+        logfire.info("Updated title for session {session_id} to '{title}'", session_id=str(session_id), title=session.title)
+        return ChatSessionResponse.model_validate(session)
 
 
 @router.get("/sessions/{session_id}/messages", response_model=list[ChatMessageResponse])
@@ -162,22 +175,26 @@ async def get_messages(
     db: AsyncSession = Depends(get_db),
 ):
     """Get all messages in a chat session in a single database roundtrip."""
-    result = await db.execute(
-        select(ChatSession)
-        .options(joinedload(ChatSession.messages))
-        .where(
-            ChatSession.id == session_id,
-            ChatSession.user_id == uuid.UUID(user_id),
+    with logfire.span("💬 Get Session Messages | {session_id}", session_id=str(session_id), user_id=user_id) as span:
+        result = await db.execute(
+            select(ChatSession)
+            .options(joinedload(ChatSession.messages))
+            .where(
+                ChatSession.id == session_id,
+                ChatSession.user_id == uuid.UUID(user_id),
+            )
         )
-    )
-    session = result.unique().scalar_one_or_none()
-    if not session:
-        return []
+        session = result.unique().scalar_one_or_none()
+        if not session:
+            span.set_attribute("message_count", 0)
+            return []
 
-    if session.title:
-        response.headers["X-Session-Title"] = session.title
+        if session.title:
+            response.headers["X-Session-Title"] = session.title
 
-    return [ChatMessageResponse.model_validate(m) for m in session.messages]
+        span.set_attribute("message_count", len(session.messages))
+        span.set_attribute("title", session.title or "Untitled")
+        return [ChatMessageResponse.model_validate(m) for m in session.messages]
 
 
 # ── Streaming query endpoint ──────────────────────────────────────────────
@@ -274,7 +291,9 @@ async def query(
     async def event_stream():
         """SSE event generator."""
         with logfire.span(
-            "rag.chat_flow",
+            "💬 Chat Stream | Session {session_short} | '{question_short}'",
+            session_short=str(session_id)[:8],
+            question_short=body.question[:50],
             session_id=str(session_id),
             user_id=user_id,
             question=body.question,
@@ -287,10 +306,12 @@ async def query(
                 # Step 0: Classify intent — does this need document retrieval?
                 intent = await classify_intent(body.question, chat_history)
                 chat_span.set_attribute("intent", intent)
+                logfire.info("🎯 Query Intent: {intent} for '{question}'", intent=intent, question=body.question[:60], session_id=str(session_id))
                 logger.info(f"Query intent: {intent} for '{body.question[:80]}'")
 
                 if intent == "chitchat":
                     chat_span.set_attribute("route", "chitchat")
+                    logfire.info("💬 Route: direct conversational response", session_id=str(session_id))
                     # Direct response — no retrieval needed
                     full_response = ""
                     async for token in generate_direct_response(body.question, chat_history):
@@ -315,8 +336,10 @@ async def query(
                     # Check for title update
                     new_title = await _maybe_update_session_title(full_response)
                     if new_title:
+                        logfire.info("🏷️ Session Title: '{title}'", title=new_title, session_id=str(session_id))
                         yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
 
+                    logfire.info("✅ Finished chitchat stream ({length} chars)", length=len(full_response), session_id=str(session_id))
                     yield f"event: done\ndata: {{}}\n\n"
                     return
 
@@ -349,6 +372,7 @@ async def query(
                 # 1a. User has no documents uploaded
                 if scope.status == "no_documents":
                     chat_span.set_attribute("route", "no_documents")
+                    logfire.info("⚠️ Route: user has no ready documents", user_id=user_id, session_id=str(session_id))
                     no_docs_msg = scope.clarification_text or "You don't have any uploaded documents yet. Please upload a document to get started."
                     yield f"event: token\ndata: {json.dumps({'token': no_docs_msg})}\n\n"
                     yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
@@ -367,6 +391,7 @@ async def query(
                 # 1b. Query is ambiguous across multiple documents — ask for clarification
                 if scope.status == "needs_clarification":
                     chat_span.set_attribute("route", "clarification")
+                    logfire.info("❓ Route: ambiguous query across multiple documents — asking for clarification", session_id=str(session_id))
                     clarification_msg = scope.clarification_text
                     yield f"event: token\ndata: {json.dumps({'token': clarification_msg})}\n\n"
                     yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
@@ -383,6 +408,7 @@ async def query(
 
                     new_title = await _maybe_update_session_title(clarification_msg)
                     if new_title:
+                        logfire.info("🏷️ Session Title: '{title}'", title=new_title, session_id=str(session_id))
                         yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
 
                     yield f"event: done\ndata: {{}}\n\n"
@@ -411,6 +437,7 @@ async def query(
 
                                 # ONLY emit sql_query event after successful execution
                                 chat_span.set_attribute("route", "sql")
+                                logfire.info("🦆 Route: Executed DuckDB SQL: {sql}", sql=sql, session_id=str(session_id))
                                 yield f"event: sql_query\ndata: {json.dumps({'sql': sql})}\n\n"
 
                                 # Stream the LLM interpretation of the results
@@ -439,8 +466,10 @@ async def query(
                                 # Check for title update
                                 new_title = await _maybe_update_session_title(full_response)
                                 if new_title:
+                                    logfire.info("🏷️ Session Title: '{title}'", title=new_title, session_id=str(session_id))
                                     yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
 
+                                logfire.info("✅ SQL query stream completed ({length} chars)", length=len(full_response), session_id=str(session_id))
                                 yield f"event: done\ndata: {{}}\n\n"
                                 return
 
@@ -452,6 +481,7 @@ async def query(
                         # If the document is specifically a tabular spreadsheet, NEVER fall through to vector retrieval
                         if scope.is_tabular:
                             chat_span.set_attribute("route", "tabular_overview")
+                            logfire.info("📊 Route: Tabular overview stream for '{filename}'", filename=scope.target_filename or "Spreadsheet", session_id=str(session_id))
                             full_response = ""
                             async for token in generate_tabular_overview_stream(
                                 question=rewritten,
@@ -476,8 +506,10 @@ async def query(
 
                             new_title = await _maybe_update_session_title(full_response)
                             if new_title:
+                                logfire.info("🏷️ Session Title: '{title}'", title=new_title, session_id=str(session_id))
                                 yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
 
+                            logfire.info("✅ Tabular overview stream completed ({length} chars)", length=len(full_response), session_id=str(session_id))
                             yield f"event: done\ndata: {{}}\n\n"
                             return
 
@@ -494,6 +526,7 @@ async def query(
                     is_aggregation=is_agg,
                     doc_id_filter=target_doc_filter,
                 )
+                logfire.info("🔍 Route: RAG retrieval found {chunk_count} chunks", chunk_count=len(chunks), session_id=str(session_id))
 
                 if not chunks:
                     # No relevant chunks found in the searched scope
@@ -556,8 +589,10 @@ async def query(
                 # Step 7: Auto-name / refine chat title
                 new_title = await _maybe_update_session_title(full_response)
                 if new_title:
+                    logfire.info("🏷️ Session Title: '{title}'", title=new_title, session_id=str(session_id))
                     yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
 
+                logfire.info("✅ RAG response stream completed ({length} chars, {citations} citations)", length=len(full_response), citations=len(citations), session_id=str(session_id))
                 yield f"event: done\ndata: {{}}\n\n"
 
             except Exception as e:

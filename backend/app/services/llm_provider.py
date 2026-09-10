@@ -435,7 +435,7 @@ async def call_llm_with_cross_provider_fallback(
                     f"with model: {target.model}"
                 )
                 with logfire.span(
-                    "llm.call",
+                    "🤖 LLM Call | {provider}/{model}",
                     provider=target.provider,
                     model=target.model,
                     key_id=slot.masked_key,
@@ -514,7 +514,7 @@ async def stream_llm_with_cross_provider_fallback(
                     f"with model: {target.model}"
                 )
                 with logfire.span(
-                    "llm.stream",
+                    "🤖 LLM Stream | {provider}/{model}",
                     provider=target.provider,
                     model=target.model,
                     key_id=slot.masked_key,

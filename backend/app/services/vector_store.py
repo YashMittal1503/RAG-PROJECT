@@ -13,6 +13,7 @@ Each point stores:
 
 import logging
 from uuid import UUID
+import logfire
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
@@ -294,28 +295,30 @@ async def delete_by_document(user_id: str, doc_id: str) -> None:
     """
     Delete all vectors belonging to a specific document from the user's collection.
     """
-    client = await get_client()
-    name = _collection_name(user_id)
+    with logfire.span("🗑️ Qdrant Delete Vectors | doc={doc_id}", doc_id=doc_id, user_id=user_id) as span:
+        client = await get_client()
+        name = _collection_name(user_id)
 
-    # Check if collection exists before trying to delete
-    collections = await client.get_collections()
-    existing_names = [c.name for c in collections.collections]
-    if name not in existing_names:
-        return
+        # Check if collection exists before trying to delete
+        collections = await client.get_collections()
+        existing_names = [c.name for c in collections.collections]
+        if name not in existing_names:
+            return
 
-    await client.delete(
-        collection_name=name,
-        points_selector=Filter(
-            must=[
-                FieldCondition(
-                    key="doc_id",
-                    match=MatchValue(value=doc_id),
-                )
-            ]
-        ),
-    )
+        await client.delete(
+            collection_name=name,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(
+                        key="doc_id",
+                        match=MatchValue(value=doc_id),
+                    )
+                ]
+            ),
+        )
 
-    logger.info(f"Deleted vectors for doc {doc_id} from collection {name}")
+        logger.info(f"Deleted vectors for doc {doc_id} from collection {name}")
+        logfire.info("Deleted vectors for doc {doc_id} from collection {name}", doc_id=doc_id, name=name)
 
 
 async def get_summary_chunks(user_id: str, doc_id_filter: str | None = None) -> list[dict]:
