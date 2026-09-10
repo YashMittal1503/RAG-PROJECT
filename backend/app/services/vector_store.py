@@ -70,19 +70,22 @@ async def collection_supports_sparse(client: AsyncQdrantClient, name: str) -> bo
         return False
 
 
-async def ensure_collection(user_id: str) -> None:
+async def ensure_collection(user_id: str, force_recreate: bool = False) -> None:
     """
     Create the user's collection if it doesn't already exist,
-    or ensure payload indices are present on existing collections.
+    or recreate it if force_recreate is True,
+    and ensure payload indices are present.
     """
     client = await get_client()
     name = _collection_name(user_id)
 
-    # Check if collection already exists
-    collections = await client.get_collections()
-    existing_names = [c.name for c in collections.collections]
+    exists = await client.collection_exists(name)
+    if exists and force_recreate:
+        logger.info(f"Force recreating collection {name} with dense + sparse vector config...")
+        await client.delete_collection(name)
+        exists = False
 
-    if name not in existing_names:
+    if not exists:
         logger.info(f"Creating Qdrant collection with Dense + BM25 sparse vectors: {name}")
         await client.create_collection(
             collection_name=name,
@@ -105,6 +108,11 @@ async def ensure_collection(user_id: str) -> None:
             )
         except Exception:
             pass  # Index already exists or cannot be altered
+
+
+async def recreate_collection(user_id: str) -> None:
+    """Delete and recreate the user's collection with dual dense + sparse BM25 vector config."""
+    await ensure_collection(user_id, force_recreate=True)
 
 
 async def upsert_chunks(

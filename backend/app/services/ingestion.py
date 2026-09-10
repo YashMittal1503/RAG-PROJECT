@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timezone
 
 import logfire
-from sqlalchemy import update
+from sqlalchemy import update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
@@ -176,6 +176,11 @@ async def ingest_document(
             # ── Step 3: Store in Qdrant ───────────────────────────────
             with logfire.span("ingestion.store_qdrant", points_count=len(all_chunks)):
                 await vector_store.ensure_collection(user_id)
+                # Purge any previously stored vectors for this doc (safe for re-ingestion)
+                try:
+                    await vector_store.delete_by_document(user_id, str(doc_id))
+                except Exception as del_err:
+                    logger.warning(f"[{doc_id}] Could not clear previous vectors: {del_err}")
 
                 qdrant_points = []
                 for chunk, vector, sparse_vector in zip(all_chunks, vectors, sparse_vectors):
@@ -198,6 +203,13 @@ async def ingest_document(
 
             # ── Step 4: Save chunk metadata to Postgres ───────────────
             with logfire.span("ingestion.save_postgres_chunks", chunk_count=len(all_chunks)):
+                # Clean up existing chunks for this document to prevent duplicates on re-ingestion
+                async with AsyncSessionLocal() as session:
+                    await session.execute(
+                        delete(Chunk).where(Chunk.document_id == doc_id)
+                    )
+                    await session.commit()
+
                 db_chunks = [
                     Chunk(
                         id=uuid.UUID(chunk.id),
