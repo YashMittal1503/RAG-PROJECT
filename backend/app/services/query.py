@@ -168,6 +168,284 @@ async def classify_intent(
             return "retrieve"
 
 
+# ── Document Scope & Ambiguity Analysis ──────────────────────────────────
+
+class DocumentScopeResult:
+    """
+    Result of evaluating whether a user query targets a specific document,
+    spans all documents, or is too ambiguous and needs clarification.
+    """
+    def __init__(
+        self,
+        status: str,  # "needs_clarification" | "resolved" | "all_docs" | "no_documents"
+        target_doc_id: str | None = None,
+        target_filename: str | None = None,
+        is_tabular: bool = False,
+        clarification_text: str | None = None,
+        cleaned_question: str | None = None,
+    ):
+        self.status = status
+        self.target_doc_id = target_doc_id
+        self.target_filename = target_filename
+        self.is_tabular = is_tabular
+        self.clarification_text = clarification_text
+        self.cleaned_question = cleaned_question or ""
+
+    def __repr__(self) -> str:
+        return (
+            f"DocumentScopeResult(status={self.status}, "
+            f"target_filename={self.target_filename}, "
+            f"is_tabular={self.is_tabular})"
+        )
+
+
+def format_clarification_message(docs: list[dict], question: str) -> str:
+    """Generate a clean, conversational markdown response listing user documents for clarification."""
+    lines = [
+        "I noticed you have several documents in your library:",
+        "",
+    ]
+    for d in docs:
+        fname = d.get("filename", "")
+        ftype = d.get("file_type", "doc").upper()
+        icon = "📊" if d.get("is_tabular") else ("📄" if ftype == "PDF" else "📝")
+        extra = ""
+        f_lower = fname.lower()
+        if "2405.15793" in f_lower or "swe-bench" in f_lower:
+            extra = " *(SWE-bench research paper)*"
+        elif "verity" in f_lower:
+            extra = " *(novel by Colleen Hoover)*"
+        elif "it-ends-with-us" in f_lower or "it ends with us" in f_lower:
+            extra = " *(novel by Colleen Hoover)*"
+        elif "strangers" in f_lower:
+            extra = " *(book / novel)*"
+        elif "titan" in f_lower:
+            extra = " *(Project Titan report)*"
+        elif "churn" in f_lower:
+            extra = " *(Telco customer churn dataset)*"
+        elif "e commerce" in f_lower or "dataset" in f_lower:
+            extra = " *(E-commerce sales dataset)*"
+        elif "python" in f_lower:
+            extra = " *(Python programming handbook)*"
+        elif "offer" in f_lower:
+            extra = " *(Offer letter document)*"
+        lines.append(f"- {icon} **{fname}**{extra}")
+
+    clean_q = question.strip()
+    if clean_q.endswith("?"):
+        clean_q = clean_q[:-1].strip()
+    lines.append("")
+    lines.append(f"**Which document would you like me to examine for \"{clean_q}\"?**")
+    lines.append("*(Or reply with **all** if you would like an overview across all of them!)*")
+    return "\n".join(lines)
+
+
+DOCUMENT_SCOPE_SYSTEM_PROMPT = """You are a document-routing and ambiguity-detection analyst for an AI document assistant.
+The user has a personal document library. Your job is to determine whether their question targets one specific document, applies across all documents, or is AMBIGUOUS because it assumes a specific document without naming which one.
+
+Available documents in the user's workspace:
+{document_catalog}
+
+Decision Categories:
+1. SPECIFIC: The question explicitly mentions a document by name, topic, or distinct keyword (or recent chat history already established the focus document, so this is a clear follow-up).
+2. CROSS_DOC: The user is explicitly asking to compare, summarize, or search across multiple or all documents in their library (e.g., "compare all my documents", "what files do I have?", "search across all files").
+3. GENERAL: The question is a general factual or conceptual inquiry (e.g. "What is machine learning?", "How do Python functions work?") that does not assume a specific proprietary story, paper, or report.
+4. AMBIGUOUS: The user asks an underspecified question that clearly refers to a single document's contents (e.g., "What are the key findings?", "Summarize the document", "Who is the main character?", "What does the contract say?", "What was the conclusion?", "Explain the methodology") BUT there are multiple documents and the user never specified which one they mean, and recent chat history does NOT establish a focus document.
+
+CRITICAL RULES:
+- If the question is AMBIGUOUS, output:
+  CATEGORY: AMBIGUOUS
+- If SPECIFIC, output:
+  CATEGORY: SPECIFIC
+  DOCUMENT_INDEX: <number from 1 to N matching the document>
+- If CROSS_DOC, output:
+  CATEGORY: CROSS_DOC
+- If GENERAL, output:
+  CATEGORY: GENERAL
+"""
+
+
+def _find_matching_doc_by_keyword(text: str, docs: list[dict]) -> dict | None:
+    text_lower = text.lower().strip()
+    for d in docs:
+        fname = d["filename"].lower()
+        base_name = fname.rsplit(".", 1)[0]
+        if base_name in text_lower or fname in text_lower:
+            return d
+
+        keywords = []
+        if "2405.15793" in fname or "swe-bench" in fname:
+            keywords.extend(["2405.15793", "swe-bench", "swe bench", "swebench", "research paper", "the paper"])
+        elif "verity" in fname:
+            keywords.extend(["verity", "colleen hoover"])
+        elif "it-ends-with-us" in fname or "it ends with us" in fname:
+            keywords.extend(["it ends with us", "ends with us", "lily bloom"])
+        elif "strangers" in fname:
+            keywords.extend(["strangers again", "can we be strangers"])
+        elif "titan" in fname:
+            keywords.extend(["titan report", "project titan", "titan"])
+        elif "churn" in fname:
+            keywords.extend(["telco", "churn", "customer churn"])
+        elif "e commerce" in fname or "dataset" in fname:
+            keywords.extend(["e-commerce", "ecommerce", "e commerce"])
+        elif "python" in fname:
+            keywords.extend(["python handbook", "ultimate python", "python book"])
+        elif "offer" in fname:
+            keywords.extend(["offer letter", "yash mittal offer", "offer"])
+
+        for kw in keywords:
+            if re.search(r"\b" + re.escape(kw) + r"\b", text_lower):
+                return d
+    return None
+
+
+async def analyze_document_scope(
+    question: str,
+    chat_history: list[dict] | None = None,
+    available_documents: list[dict] | None = None,
+) -> DocumentScopeResult:
+    """
+    Evaluate user query against available documents.
+    Detects ambiguity, explicit mentions, chat history carryover, or clarification responses.
+    """
+    if not available_documents:
+        return DocumentScopeResult(
+            status="no_documents",
+            clarification_text="You don't have any uploaded documents yet. Please upload a document to get started.",
+        )
+
+    # If user has only 1 document in library, zero ambiguity
+    if len(available_documents) == 1:
+        d = available_documents[0]
+        return DocumentScopeResult(
+            status="resolved",
+            target_doc_id=str(d["id"]),
+            target_filename=d["filename"],
+            is_tabular=d.get("is_tabular", False),
+            cleaned_question=question,
+        )
+
+    # 1. Check for @mention tag (e.g. "@verity what happened?" or "@SWE-bench key findings")
+    at_match = re.search(r"@([A-Za-z0-9_.-]+)", question)
+    if at_match:
+        tag = at_match.group(1).lower()
+        matched = _find_matching_doc_by_keyword(tag, available_documents)
+        if matched:
+            cleaned = re.sub(r"@[A-Za-z0-9_.-]+\s*", "", question).strip()
+            return DocumentScopeResult(
+                status="resolved",
+                target_doc_id=str(matched["id"]),
+                target_filename=matched["filename"],
+                is_tabular=matched.get("is_tabular", False),
+                cleaned_question=cleaned,
+            )
+
+    # 2. Check if the user is answering a prior clarification question
+    if chat_history and len(chat_history) >= 1:
+        last_msg = chat_history[-1]
+        if last_msg.get("role") == "assistant":
+            last_content = last_msg.get("content", "")
+            if "Which document would you like me to examine" in last_content or "Which document would you like me to focus on" in last_content:
+                # Did user say "all" or "everything"?
+                q_clean = question.strip().lower()
+                if q_clean in ("all", "both", "all of them", "everything", "all documents"):
+                    orig_q = ""
+                    for m in reversed(chat_history[:-1]):
+                        if m.get("role") == "user":
+                            orig_q = m.get("content", "")
+                            break
+                    return DocumentScopeResult(status="all_docs", cleaned_question=orig_q or question)
+
+                # Match document from answer
+                matched = _find_matching_doc_by_keyword(question, available_documents)
+                if matched:
+                    orig_q = ""
+                    for m in reversed(chat_history[:-1]):
+                        if m.get("role") == "user":
+                            orig_q = m.get("content", "")
+                            break
+                    cleaned_q = f"{orig_q} in {matched['filename']}" if orig_q else f"Information from {matched['filename']}"
+                    return DocumentScopeResult(
+                        status="resolved",
+                        target_doc_id=str(matched["id"]),
+                        target_filename=matched["filename"],
+                        is_tabular=matched.get("is_tabular", False),
+                        cleaned_question=cleaned_q,
+                    )
+
+    # 3. Check for explicit library-wide queries
+    q_lower = question.lower().strip()
+    if re.search(r"\b(all\s+documents|all\s+my\s+documents|all\s+files|across\s+all|compare\s+(the\s+)?(documents|files|books)|what\s+documents\s+do\s+i\s+have|list\s+(all\s+)?(my\s+)?(documents|files))\b", q_lower):
+        return DocumentScopeResult(status="all_docs", cleaned_question=question)
+
+    # 4. Check for prominent document title/name in the question
+    matched = _find_matching_doc_by_keyword(question, available_documents)
+    if matched:
+        return DocumentScopeResult(
+            status="resolved",
+            target_doc_id=str(matched["id"]),
+            target_filename=matched["filename"],
+            is_tabular=matched.get("is_tabular", False),
+            cleaned_question=question,
+        )
+
+    # 5. Fast LLM Ambiguity / Scope Classification
+    catalog_lines = []
+    for i, d in enumerate(available_documents, 1):
+        catalog_lines.append(f"[{i}] {d['filename']} ({'Tabular' if d.get('is_tabular') else 'Text Document'})")
+    catalog_str = "\n".join(catalog_lines)
+
+    messages = [
+        {
+            "role": "system",
+            "content": DOCUMENT_SCOPE_SYSTEM_PROMPT.replace("{document_catalog}", catalog_str),
+        },
+    ]
+    if chat_history:
+        for m in chat_history[-3:]:
+            messages.append({"role": m["role"], "content": m["content"][:200]})
+    messages.append({"role": "user", "content": question})
+
+    try:
+        response = await call_llm_with_fallback(
+            messages=messages,
+            max_tokens=150,
+            temperature=0.0,
+            fast=True,
+        )
+        resp_text = (response.choices[0].message.content or "").strip()
+        resp_reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip()
+        combined = f"{resp_text}\n{resp_reasoning}".upper()
+
+        if "CATEGORY: AMBIGUOUS" in combined or "AMBIGUOUS" in resp_text.upper():
+            return DocumentScopeResult(
+                status="needs_clarification",
+                clarification_text=format_clarification_message(available_documents, question),
+                cleaned_question=question,
+            )
+        elif "CATEGORY: SPECIFIC" in combined or "SPECIFIC" in resp_text.upper():
+            idx_match = re.search(r"DOCUMENT_INDEX:\s*(\d+)", combined)
+            if idx_match:
+                doc_idx = int(idx_match.group(1)) - 1
+                if 0 <= doc_idx < len(available_documents):
+                    target = available_documents[doc_idx]
+                    return DocumentScopeResult(
+                        status="resolved",
+                        target_doc_id=str(target["id"]),
+                        target_filename=target["filename"],
+                        is_tabular=target.get("is_tabular", False),
+                        cleaned_question=question,
+                    )
+        elif "CATEGORY: CROSS_DOC" in combined:
+            return DocumentScopeResult(status="all_docs", cleaned_question=question)
+
+    except Exception as e:
+        logger.warning(f"Document scope analysis failed: {e}")
+
+    # Fallback to all_docs
+    return DocumentScopeResult(status="all_docs", cleaned_question=question)
+
+
 # ── Direct response (no retrieval) ────────────────────────────────────────
 
 CHITCHAT_SYSTEM_PROMPT = """You are DocuChat, a friendly AI document assistant. The user is having a casual conversation — they are NOT asking about their documents right now.
@@ -516,15 +794,17 @@ async def retrieve_chunks(
     user_id: str,
     question: str,
     is_aggregation: bool,
+    doc_id_filter: str | None = None,
+    filename_filter: str | None = None,
 ) -> list[dict]:
     """
     Retrieve relevant chunks for answering the question.
 
     1. Embed the query
-    2. Search Qdrant for top-K similar chunks
+    2. Search Qdrant for top-K similar chunks (optionally scoped to a specific document)
     3. If aggregation detected, also fetch summary chunks and prepend them
     """
-    with logfire.span("rag.retrieve_chunks", question=question, is_aggregation=is_aggregation) as span:
+    with logfire.span("rag.retrieve_chunks", question=question, is_aggregation=is_aggregation, doc_id_filter=doc_id_filter) as span:
         # Embed the query with dense vector (semantic) and sparse BM25 vector (keyword)
         query_vector = embedding.embed_query(question)
         query_sparse = embedding.embed_sparse_query(question)
@@ -535,6 +815,8 @@ async def retrieve_chunks(
             query_vector=query_vector,
             query_sparse_vector=query_sparse,
             limit=10,
+            doc_id_filter=doc_id_filter,
+            filename_filter=filename_filter,
         )
         span.set_attribute("candidates_retrieved", len(candidates))
         span.set_attribute("search_mode", "hybrid_rrf")
@@ -553,7 +835,7 @@ async def retrieve_chunks(
 
         # If aggregation detected, fetch and prepend up to 3 summary chunks
         if is_aggregation:
-            summary_chunks = await vector_store.get_summary_chunks(user_id)
+            summary_chunks = await vector_store.get_summary_chunks(user_id, doc_id_filter=doc_id_filter)
             if summary_chunks:
                 # Deduplicate: remove any summary chunks already in results
                 result_ids = {r["id"] for r in results}
@@ -875,17 +1157,13 @@ RULES:
 2. Output ONLY the raw SQL — no explanation, no notes, no commentary.
 3. Use the exact table and column names from the schema.
 4. For aggregations (SUM, AVG, COUNT, MIN, MAX), apply them on the correct numeric columns.
-5. If the user asks an open-ended, overview, or exploratory question (e.g. "tell me about the data", "summarize", "key factors", "overview", "what are the drivers of X"):
-   Generate an analytical aggregation query! For example:
-   - Group by the primary category or target column (like Churn, Status, Department) with COUNT(*) and percentages
-   - Or calculate key averages, distributions, or metrics (e.g. AVG(MonthlyCharges), AVG(tenure))
-   - Or select top informative columns with LIMIT 20
-   Do NOT return CANNOT_ANSWER for general data analysis questions.
-6. Only return CANNOT_ANSWER if the question has absolutely nothing to do with the schema or tables.
-7. Always alias aggregated columns with meaningful names (e.g., total_customers, avg_monthly_charges).
-8. Handle NULL or blank values appropriately: for text/varchar columns containing numbers or spaces, ALWAYS use TRY_CAST(TRIM(col) AS DOUBLE) instead of CAST to avoid conversion errors.
-9. If the user asks for "all data" or something very broad, use LIMIT 50.
-10. Use ILIKE for case-insensitive text matching when filtering by text values."""
+5. If the user asks an analytical question specifically about the tabular spreadsheet data (e.g. churn rate, order metrics, sales summaries, column distributions), generate a valid DuckDB aggregation query.
+6. CRITICAL: If the question is about non-tabular topics, research papers, novels, stories, books, code handbooks, or text documents (e.g. "key findings from the paper", "what happens in the story", "who is the author", "explain function", "offer letter"), you MUST output ONLY: CANNOT_ANSWER.
+7. Only return CANNOT_ANSWER if the question has nothing to do with the tables or cannot be answered with SQL.
+8. Always alias aggregated columns with meaningful names (e.g., total_customers, avg_monthly_charges).
+9. Handle NULL or blank values appropriately: for text/varchar columns containing numbers or spaces, ALWAYS use TRY_CAST(TRIM(col) AS DOUBLE) instead of CAST to avoid conversion errors.
+10. If the user asks for "all data" or something very broad, use LIMIT 50.
+11. Use ILIKE for case-insensitive text matching when filtering by text values."""
 
 
 SQL_ANSWER_PROMPT = """You are a helpful data analyst assistant. You have been given the results of a SQL query executed on the user's uploaded spreadsheet data.

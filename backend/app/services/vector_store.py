@@ -191,6 +191,8 @@ async def search(
     query_sparse_vector: SparseVector | None = None,
     limit: int = 8,
     chunk_type_filter: str | None = None,
+    doc_id_filter: str | None = None,
+    filename_filter: str | None = None,
 ) -> list[dict]:
     """
     Search for similar chunks in the user's collection using Hybrid Search (Dense + BM25 RRF).
@@ -198,6 +200,7 @@ async def search(
     If query_sparse_vector is provided, executes native server-side Reciprocal Rank Fusion (RRF)
     between dense cosine similarity and BM25 keyword matching.
     Otherwise, gracefully falls back to dense vector search.
+    Supports filtering by chunk_type, doc_id, and filename.
     """
     client = await get_client()
     name = _collection_name(user_id)
@@ -208,17 +211,30 @@ async def search(
     if name not in existing_names:
         return []
 
-    # Build optional filter
-    query_filter = None
+    # Build optional filter conditions
+    must_conditions = []
     if chunk_type_filter:
-        query_filter = Filter(
-            must=[
-                FieldCondition(
-                    key="chunk_type",
-                    match=MatchValue(value=chunk_type_filter),
-                )
-            ]
+        must_conditions.append(
+            FieldCondition(
+                key="chunk_type",
+                match=MatchValue(value=chunk_type_filter),
+            )
         )
+    if doc_id_filter:
+        must_conditions.append(
+            FieldCondition(
+                key="doc_id",
+                match=MatchValue(value=doc_id_filter),
+            )
+        )
+    if filename_filter:
+        must_conditions.append(
+            FieldCondition(
+                key="filename",
+                match=MatchValue(value=filename_filter),
+            )
+        )
+    query_filter = Filter(must=must_conditions) if must_conditions else None
 
     # If sparse BM25 query vector is provided, execute Hybrid Search with RRF
     if query_sparse_vector is not None:
@@ -302,9 +318,9 @@ async def delete_by_document(user_id: str, doc_id: str) -> None:
     logger.info(f"Deleted vectors for doc {doc_id} from collection {name}")
 
 
-async def get_summary_chunks(user_id: str) -> list[dict]:
+async def get_summary_chunks(user_id: str, doc_id_filter: str | None = None) -> list[dict]:
     """
-    Retrieve ALL summary-type chunks from the user's collection.
+    Retrieve summary-type chunks from the user's collection, optionally filtered by doc_id.
     Used when an aggregation query is detected, so summary chunks
     are included in context regardless of vector similarity.
     """
@@ -317,17 +333,24 @@ async def get_summary_chunks(user_id: str) -> list[dict]:
     if name not in existing_names:
         return []
 
-    # Scroll through all points with chunk_type="summary"
+    must_conditions = [
+        FieldCondition(
+            key="chunk_type",
+            match=MatchValue(value="summary"),
+        )
+    ]
+    if doc_id_filter:
+        must_conditions.append(
+            FieldCondition(
+                key="doc_id",
+                match=MatchValue(value=doc_id_filter),
+            )
+        )
+
+    # Scroll through matching points
     results, _ = await client.scroll(
         collection_name=name,
-        scroll_filter=Filter(
-            must=[
-                FieldCondition(
-                    key="chunk_type",
-                    match=MatchValue(value="summary"),
-                )
-            ]
-        ),
+        scroll_filter=Filter(must=must_conditions),
         limit=100,
         with_payload=True,
         with_vectors=False,

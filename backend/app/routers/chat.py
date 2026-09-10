@@ -20,7 +20,7 @@ from sqlalchemy.orm import joinedload
 
 from app.auth import get_current_user
 from app.database import AsyncSessionLocal, get_db
-from app.models import ChatMessage, ChatSession
+from app.models import ChatMessage, ChatSession, Document, DocumentStatus
 from app.schemas import (
     ChatMessageResponse,
     ChatSessionCreate,
@@ -29,6 +29,7 @@ from app.schemas import (
     QueryRequest,
 )
 from app.services.query import (
+    analyze_document_scope,
     check_tabular_data,
     classify_intent,
     detect_aggregation,
@@ -310,27 +311,97 @@ async def query(
                     yield f"event: done\ndata: {{}}\n\n"
                     return
 
-                # Step 1: Rewrite query (for retrieve intent)
-                rewritten = await rewrite_query(body.question, chat_history)
+                # Step 1: Analyze Document Scope & Ambiguity across user's library
+                async with AsyncSessionLocal() as session:
+                    result = await session.execute(
+                        select(Document).where(
+                            Document.user_id == user_id,
+                            Document.status == DocumentStatus.READY,
+                        )
+                    )
+                    ready_docs = [
+                        {
+                            "id": str(d.id),
+                            "filename": d.filename,
+                            "file_type": d.file_type,
+                            "is_tabular": d.is_tabular,
+                            "chunk_count": d.chunk_count,
+                        }
+                        for d in result.scalars().all()
+                    ]
 
-                # Step 2: Check if user has tabular data for SQL pipeline
+                scope = await analyze_document_scope(
+                    question=body.question,
+                    chat_history=chat_history,
+                    available_documents=ready_docs,
+                )
+                logger.info(f"Document scope analysis: status={scope.status}, target={scope.target_filename}")
+
+                # 1a. User has no documents uploaded
+                if scope.status == "no_documents":
+                    chat_span.set_attribute("route", "no_documents")
+                    no_docs_msg = scope.clarification_text or "You don't have any uploaded documents yet. Please upload a document to get started."
+                    yield f"event: token\ndata: {json.dumps({'token': no_docs_msg})}\n\n"
+                    yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
+                    async with AsyncSessionLocal() as save_db:
+                        assistant_msg = ChatMessage(
+                            session_id=session_id,
+                            role="assistant",
+                            content=no_docs_msg,
+                            created_at=datetime.now(timezone.utc),
+                        )
+                        save_db.add(assistant_msg)
+                        await save_db.commit()
+                    yield f"event: done\ndata: {{}}\n\n"
+                    return
+
+                # 1b. Query is ambiguous across multiple documents — ask for clarification
+                if scope.status == "needs_clarification":
+                    chat_span.set_attribute("route", "clarification")
+                    clarification_msg = scope.clarification_text
+                    yield f"event: token\ndata: {json.dumps({'token': clarification_msg})}\n\n"
+                    yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
+
+                    async with AsyncSessionLocal() as save_db:
+                        assistant_msg = ChatMessage(
+                            session_id=session_id,
+                            role="assistant",
+                            content=clarification_msg,
+                            created_at=datetime.now(timezone.utc),
+                        )
+                        save_db.add(assistant_msg)
+                        await save_db.commit()
+
+                    new_title = await _maybe_update_session_title(clarification_msg)
+                    if new_title:
+                        yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
+
+                    yield f"event: done\ndata: {{}}\n\n"
+                    return
+
+                # Step 2: Rewrite query (using cleaned or effective question)
+                effective_q = scope.cleaned_question if scope.cleaned_question else body.question
+                rewritten = await rewrite_query(effective_q, chat_history)
+
+                # Step 3: Check if user has tabular data for SQL pipeline
                 has_tabular = await check_tabular_data(user_id)
+                # Only attempt SQL if target document is tabular or scope is cross_doc
+                should_attempt_sql = has_tabular and (scope.is_tabular or scope.status == "all_docs")
 
-                if has_tabular:
-                    # ── Text-to-SQL path ──────────────────────────────
+                if should_attempt_sql:
                     schema_info = await get_schema_for_prompt(user_id)
 
                     if schema_info:
                         sql = await generate_sql_query(rewritten, schema_info, chat_history)
 
                         if sql:
-                            chat_span.set_attribute("route", "sql")
-                            # Send the SQL query to the frontend for transparency
-                            yield f"event: sql_query\ndata: {json.dumps({'sql': sql})}\n\n"
-
                             try:
                                 sql_result = await execute_sql_query(user_id, sql)
                                 sql_result_text = format_sql_result(sql_result)
+
+                                # ONLY emit sql_query event after successful execution
+                                chat_span.set_attribute("route", "sql")
+                                yield f"event: sql_query\ndata: {json.dumps({'sql': sql})}\n\n"
 
                                 # Stream the LLM interpretation of the results
                                 full_response = ""
@@ -364,15 +435,21 @@ async def query(
 
                             except Exception as sql_err:
                                 logger.warning(f"SQL execution failed, falling through to RAG pipeline: {sql_err}")
-                                # Fall through to RAG pipeline below
+                                # Fall through to RAG pipeline without emitting sql_query
 
-                # Step 3: RAG path — detect aggregation
+                # Step 4: RAG path — detect aggregation and retrieve chunks
                 chat_span.set_attribute("route", "rag")
                 is_agg = detect_aggregation(rewritten)
                 chat_span.set_attribute("is_aggregation", is_agg)
 
-                # Step 4: Retrieve chunks
-                chunks = await retrieve_chunks(user_id, rewritten, is_agg)
+                # Scope retrieval to specific document if resolved
+                target_doc_filter = scope.target_doc_id if scope.status == "resolved" else None
+                chunks = await retrieve_chunks(
+                    user_id=user_id,
+                    question=rewritten,
+                    is_aggregation=is_agg,
+                    doc_id_filter=target_doc_filter,
+                )
 
                 if not chunks:
                     # No documents or no relevant chunks found
