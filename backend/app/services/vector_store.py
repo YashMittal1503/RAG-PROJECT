@@ -13,6 +13,7 @@ Each point stores:
 
 import logging
 from uuid import UUID
+import logfire
 
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
@@ -58,19 +59,34 @@ def _collection_name(user_id: str) -> str:
     return f"docs_{user_id.replace('-', '_')}"
 
 
-async def ensure_collection(user_id: str) -> None:
+async def collection_supports_sparse(client: AsyncQdrantClient, name: str) -> bool:
+    """Check whether a collection has the 'bm25' sparse vector configured."""
+    try:
+        coll_info = await client.get_collection(name)
+        return bool(
+            coll_info.config.params.sparse_vectors
+            and "bm25" in coll_info.config.params.sparse_vectors
+        )
+    except Exception:
+        return False
+
+
+async def ensure_collection(user_id: str, force_recreate: bool = False) -> None:
     """
     Create the user's collection if it doesn't already exist,
-    or upgrade an existing collection to support BM25 sparse vectors.
+    or recreate it if force_recreate is True,
+    and ensure payload indices are present.
     """
     client = await get_client()
     name = _collection_name(user_id)
 
-    # Check if collection already exists
-    collections = await client.get_collections()
-    existing_names = [c.name for c in collections.collections]
+    exists = await client.collection_exists(name)
+    if exists and force_recreate:
+        logger.info(f"Force recreating collection {name} with dense + sparse vector config...")
+        await client.delete_collection(name)
+        exists = False
 
-    if name not in existing_names:
+    if not exists:
         logger.info(f"Creating Qdrant collection with Dense + BM25 sparse vectors: {name}")
         await client.create_collection(
             collection_name=name,
@@ -82,35 +98,22 @@ async def ensure_collection(user_id: str) -> None:
                 "bm25": SparseVectorParams(),
             },
         )
-        # Create payload indices required for filtering
-        await client.create_payload_index(
-            collection_name=name,
-            field_name="chunk_type",
-            field_schema=PayloadSchemaType.KEYWORD,
-        )
-        await client.create_payload_index(
-            collection_name=name,
-            field_name="doc_id",
-            field_schema=PayloadSchemaType.KEYWORD,
-        )
-    else:
-        # Check if existing collection already has sparse_vectors_config
+    
+    # Ensure payload indices required for fast filtering exist (safe idempotent calls)
+    for field_name in ("chunk_type", "doc_id", "filename"):
         try:
-            coll_info = await client.get_collection(name)
-            has_sparse = (
-                coll_info.config.params.sparse_vectors
-                and "bm25" in coll_info.config.params.sparse_vectors
+            await client.create_payload_index(
+                collection_name=name,
+                field_name=field_name,
+                field_schema=PayloadSchemaType.KEYWORD,
             )
-            if not has_sparse:
-                logger.info(f"Upgrading existing collection {name} with BM25 sparse vector index...")
-                await client.update_collection(
-                    collection_name=name,
-                    sparse_vectors_config={
-                        "bm25": SparseVectorParams(),
-                    },
-                )
-        except Exception as e:
-            logger.warning(f"Could not verify/upgrade sparse config on collection {name}: {e}")
+        except Exception:
+            pass  # Index already exists or cannot be altered
+
+
+async def recreate_collection(user_id: str) -> None:
+    """Delete and recreate the user's collection with dual dense + sparse BM25 vector config."""
+    await ensure_collection(user_id, force_recreate=True)
 
 
 async def upsert_chunks(
@@ -119,20 +122,19 @@ async def upsert_chunks(
 ) -> None:
     """
     Upsert chunk vectors and metadata into the user's Qdrant collection.
-
-    Each item in `chunks` should have:
-    - id: str (UUID)
-    - vector: list[float] (dense vector)
-    - sparse_vector: SparseVector | None (optional BM25 sparse vector)
-    - payload: dict with doc_id, chunk_type, filename, page_number, etc.
+    Automatically adapts to collection capabilities:
+    - If the collection supports 'bm25' sparse vectors, upserts dual dense+bm25 vectors.
+    - If the collection is legacy dense-only, upserts dense vectors.
+    - If a vector name error occurs, automatically catches it and retries with dense-only vectors.
     """
     client = await get_client()
     name = _collection_name(user_id)
 
+    has_sparse = await collection_supports_sparse(client, name)
+
     points = []
     for chunk in chunks:
-        # Support dual dense+bm25 vectors and legacy dense-only vectors
-        if "sparse_vector" in chunk and chunk["sparse_vector"] is not None:
+        if has_sparse and "sparse_vector" in chunk and chunk["sparse_vector"] is not None:
             vector = {
                 "": chunk["vector"],
                 "bm25": chunk["sparse_vector"],
@@ -148,16 +150,40 @@ async def upsert_chunks(
             )
         )
 
-    # Upsert in batches of 100 to avoid oversized requests
     batch_size = 100
-    for i in range(0, len(points), batch_size):
-        batch = points[i : i + batch_size]
-        await client.upsert(
-            collection_name=name,
-            points=batch,
-        )
-
-    logger.info(f"Upserted {len(points)} chunks to collection {name}")
+    try:
+        for i in range(0, len(points), batch_size):
+            batch = points[i : i + batch_size]
+            await client.upsert(
+                collection_name=name,
+                points=batch,
+            )
+        logger.info(f"Upserted {len(points)} chunks to collection {name} (sparse={has_sparse})")
+    except Exception as e:
+        # If Qdrant failed because bm25 vector is missing from schema, fallback to dense-only vectors
+        err_str = str(e).lower()
+        if "vector name error" in err_str or "bm25" in err_str or "not existing" in err_str:
+            logger.warning(
+                f"Upsert with sparse vectors rejected by Qdrant schema ({e}). "
+                f"Falling back to dense-only upsert for collection {name}..."
+            )
+            dense_points = [
+                PointStruct(
+                    id=p.id,
+                    vector=p.vector[""] if isinstance(p.vector, dict) else p.vector,
+                    payload=p.payload,
+                )
+                for p in points
+            ]
+            for i in range(0, len(dense_points), batch_size):
+                batch = dense_points[i : i + batch_size]
+                await client.upsert(
+                    collection_name=name,
+                    points=batch,
+                )
+            logger.info(f"Successfully upserted {len(dense_points)} dense-only chunks to collection {name}")
+        else:
+            raise
 
 
 async def search(
@@ -166,6 +192,8 @@ async def search(
     query_sparse_vector: SparseVector | None = None,
     limit: int = 8,
     chunk_type_filter: str | None = None,
+    doc_id_filter: str | None = None,
+    filename_filter: str | None = None,
 ) -> list[dict]:
     """
     Search for similar chunks in the user's collection using Hybrid Search (Dense + BM25 RRF).
@@ -173,6 +201,7 @@ async def search(
     If query_sparse_vector is provided, executes native server-side Reciprocal Rank Fusion (RRF)
     between dense cosine similarity and BM25 keyword matching.
     Otherwise, gracefully falls back to dense vector search.
+    Supports filtering by chunk_type, doc_id, and filename.
     """
     client = await get_client()
     name = _collection_name(user_id)
@@ -183,17 +212,30 @@ async def search(
     if name not in existing_names:
         return []
 
-    # Build optional filter
-    query_filter = None
+    # Build optional filter conditions
+    must_conditions = []
     if chunk_type_filter:
-        query_filter = Filter(
-            must=[
-                FieldCondition(
-                    key="chunk_type",
-                    match=MatchValue(value=chunk_type_filter),
-                )
-            ]
+        must_conditions.append(
+            FieldCondition(
+                key="chunk_type",
+                match=MatchValue(value=chunk_type_filter),
+            )
         )
+    if doc_id_filter:
+        must_conditions.append(
+            FieldCondition(
+                key="doc_id",
+                match=MatchValue(value=doc_id_filter),
+            )
+        )
+    if filename_filter:
+        must_conditions.append(
+            FieldCondition(
+                key="filename",
+                match=MatchValue(value=filename_filter),
+            )
+        )
+    query_filter = Filter(must=must_conditions) if must_conditions else None
 
     # If sparse BM25 query vector is provided, execute Hybrid Search with RRF
     if query_sparse_vector is not None:
@@ -253,33 +295,35 @@ async def delete_by_document(user_id: str, doc_id: str) -> None:
     """
     Delete all vectors belonging to a specific document from the user's collection.
     """
-    client = await get_client()
-    name = _collection_name(user_id)
+    with logfire.span("🗑️ Qdrant Delete Vectors | doc={doc_id}", doc_id=doc_id, user_id=user_id) as span:
+        client = await get_client()
+        name = _collection_name(user_id)
 
-    # Check if collection exists before trying to delete
-    collections = await client.get_collections()
-    existing_names = [c.name for c in collections.collections]
-    if name not in existing_names:
-        return
+        # Check if collection exists before trying to delete
+        collections = await client.get_collections()
+        existing_names = [c.name for c in collections.collections]
+        if name not in existing_names:
+            return
 
-    await client.delete(
-        collection_name=name,
-        points_selector=Filter(
-            must=[
-                FieldCondition(
-                    key="doc_id",
-                    match=MatchValue(value=doc_id),
-                )
-            ]
-        ),
-    )
+        await client.delete(
+            collection_name=name,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(
+                        key="doc_id",
+                        match=MatchValue(value=doc_id),
+                    )
+                ]
+            ),
+        )
 
-    logger.info(f"Deleted vectors for doc {doc_id} from collection {name}")
+        logger.info(f"Deleted vectors for doc {doc_id} from collection {name}")
+        logfire.info("Deleted vectors for doc {doc_id} from collection {name}", doc_id=doc_id, name=name)
 
 
-async def get_summary_chunks(user_id: str) -> list[dict]:
+async def get_summary_chunks(user_id: str, doc_id_filter: str | None = None) -> list[dict]:
     """
-    Retrieve ALL summary-type chunks from the user's collection.
+    Retrieve summary-type chunks from the user's collection, optionally filtered by doc_id.
     Used when an aggregation query is detected, so summary chunks
     are included in context regardless of vector similarity.
     """
@@ -292,17 +336,24 @@ async def get_summary_chunks(user_id: str) -> list[dict]:
     if name not in existing_names:
         return []
 
-    # Scroll through all points with chunk_type="summary"
+    must_conditions = [
+        FieldCondition(
+            key="chunk_type",
+            match=MatchValue(value="summary"),
+        )
+    ]
+    if doc_id_filter:
+        must_conditions.append(
+            FieldCondition(
+                key="doc_id",
+                match=MatchValue(value=doc_id_filter),
+            )
+        )
+
+    # Scroll through matching points
     results, _ = await client.scroll(
         collection_name=name,
-        scroll_filter=Filter(
-            must=[
-                FieldCondition(
-                    key="chunk_type",
-                    match=MatchValue(value="summary"),
-                )
-            ]
-        ),
+        scroll_filter=Filter(must=must_conditions),
         limit=100,
         with_payload=True,
         with_vectors=False,

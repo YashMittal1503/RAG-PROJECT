@@ -44,7 +44,7 @@ def rerank_chunks(
     query: str,
     chunks: list[dict],
     top_k: int = 5,
-    min_score: float = 0.001,
+    min_score: float = 0.0001,
 ) -> list[dict]:
     """
     Rerank a list of retrieved chunks using FlashRank cross-encoder.
@@ -82,7 +82,8 @@ def rerank_chunks(
                 original_chunk["vector_score"] = original_chunk.get("score", 0.0)
                 # Keep score updated to rerank_score for downstream consistency
                 original_chunk["score"] = float(item["score"])
-                if item["score"] >= min_score or len(reranked_chunks) < 2:
+                # Preserve candidates up to top_k so exploratory narrative queries are not starved
+                if item["score"] >= min_score or len(reranked_chunks) < top_k:
                     reranked_chunks.append(original_chunk)
 
         result = reranked_chunks[:top_k]

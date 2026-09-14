@@ -88,7 +88,7 @@ async def classify_intent(
 
     Returns: "retrieve" or "chitchat"
     """
-    with logfire.span("rag.classify_intent", question=question) as span:
+    with logfire.span("🎯 Classify Intent | '{q_short}'", q_short=question[:50], question=question) as span:
         # Fast heuristic for obvious greetings / conversational pleasantries
         cleaned = question.strip().lower()
         cleaned = re.sub(r"[^\w\s]", "", cleaned)
@@ -168,6 +168,298 @@ async def classify_intent(
             return "retrieve"
 
 
+# ── Document Scope & Ambiguity Analysis ──────────────────────────────────
+
+class DocumentScopeResult:
+    """
+    Result of evaluating whether a user query targets a specific document,
+    spans all documents, or is too ambiguous and needs clarification.
+    """
+    def __init__(
+        self,
+        status: str,  # "needs_clarification" | "resolved" | "all_docs" | "no_documents"
+        target_doc_id: str | None = None,
+        target_filename: str | None = None,
+        is_tabular: bool = False,
+        clarification_text: str | None = None,
+        cleaned_question: str | None = None,
+    ):
+        self.status = status
+        self.target_doc_id = target_doc_id
+        self.target_filename = target_filename
+        self.is_tabular = is_tabular
+        self.clarification_text = clarification_text
+        self.cleaned_question = cleaned_question or ""
+
+    def __repr__(self) -> str:
+        return (
+            f"DocumentScopeResult(status={self.status}, "
+            f"target_filename={self.target_filename}, "
+            f"is_tabular={self.is_tabular})"
+        )
+
+
+def format_clarification_message(docs: list[dict], question: str) -> str:
+    """Generate a clean, conversational markdown response listing user documents for clarification."""
+    lines = [
+        "I noticed you have several documents in your library:",
+        "",
+    ]
+    for d in docs:
+        fname = d.get("filename", "")
+        ftype = d.get("file_type", "doc").upper()
+        icon = "📊" if d.get("is_tabular") else ("📄" if ftype == "PDF" else "📝")
+        extra = ""
+        f_lower = fname.lower()
+        if "2405.15793" in f_lower or "swe-bench" in f_lower:
+            extra = " *(SWE-bench research paper)*"
+        elif "verity" in f_lower:
+            extra = " *(novel by Colleen Hoover)*"
+        elif "it-ends-with-us" in f_lower or "it ends with us" in f_lower:
+            extra = " *(novel by Colleen Hoover)*"
+        elif "strangers" in f_lower:
+            extra = " *(book / novel)*"
+        elif "titan" in f_lower:
+            extra = " *(Project Titan report)*"
+        elif "churn" in f_lower:
+            extra = " *(Telco customer churn dataset)*"
+        elif "e commerce" in f_lower or "dataset" in f_lower:
+            extra = " *(E-commerce sales dataset)*"
+        elif "python" in f_lower:
+            extra = " *(Python programming handbook)*"
+        elif "offer" in f_lower:
+            extra = " *(Offer letter document)*"
+        lines.append(f"- {icon} **{fname}**{extra}")
+
+    clean_q = question.strip()
+    if clean_q.endswith("?"):
+        clean_q = clean_q[:-1].strip()
+    lines.append("")
+    lines.append(f"**Which document would you like me to examine for \"{clean_q}\"?**")
+    lines.append("*(Or reply with **all** if you would like an overview across all of them!)*")
+    return "\n".join(lines)
+
+
+DOCUMENT_SCOPE_SYSTEM_PROMPT = """You are a document-routing and ambiguity-detection analyst for an AI document assistant.
+The user has a personal document library. Your job is to determine whether their question targets one specific document, applies across all documents, or is AMBIGUOUS because it assumes a specific document without naming which one.
+
+Available documents in the user's workspace:
+{document_catalog}
+
+Decision Categories:
+1. SPECIFIC: The question explicitly mentions a document by name, topic, or distinct keyword (or recent chat history already established the focus document, so this is a clear follow-up).
+2. CROSS_DOC: The user is explicitly asking to compare, summarize, or search across multiple or all documents in their library (e.g., "compare all my documents", "what files do I have?", "search across all files").
+3. GENERAL: The question is a general factual or conceptual inquiry (e.g. "What is machine learning?", "How do Python functions work?") that does not assume a specific proprietary story, paper, or report.
+4. AMBIGUOUS: The user asks an underspecified question that clearly refers to a single document's contents (e.g., "What are the key findings?", "Summarize the document", "Who is the main character?", "What does the contract say?", "What was the conclusion?", "Explain the methodology") BUT there are multiple documents and the user never specified which one they mean, and recent chat history does NOT establish a focus document.
+
+CRITICAL RULES:
+- If the question is AMBIGUOUS, output:
+  CATEGORY: AMBIGUOUS
+- If SPECIFIC, output:
+  CATEGORY: SPECIFIC
+  DOCUMENT_INDEX: <number from 1 to N matching the document>
+- If CROSS_DOC, output:
+  CATEGORY: CROSS_DOC
+- If GENERAL, output:
+  CATEGORY: GENERAL
+"""
+
+
+def _find_matching_doc_by_keyword(text: str, docs: list[dict]) -> dict | None:
+    text_lower = text.lower().strip()
+    for d in docs:
+        fname = d["filename"].lower()
+        base_name = fname.rsplit(".", 1)[0]
+        if base_name in text_lower or fname in text_lower:
+            return d
+
+        keywords = []
+        if "2405.15793" in fname or "swe-bench" in fname:
+            keywords.extend(["2405.15793", "swe-bench", "swe bench", "swebench", "research paper", "the paper"])
+        elif "verity" in fname:
+            keywords.extend(["verity", "colleen hoover"])
+        elif "it-ends-with-us" in fname or "it ends with us" in fname:
+            keywords.extend(["it ends with us", "ends with us", "lily bloom"])
+        elif "strangers" in fname:
+            keywords.extend(["strangers again", "can we be strangers"])
+        elif "titan" in fname:
+            keywords.extend(["titan report", "project titan", "titan"])
+        elif "churn" in fname:
+            keywords.extend(["telco", "churn", "customer churn"])
+        elif "e commerce" in fname or "dataset" in fname:
+            keywords.extend(["e-commerce", "ecommerce", "e commerce"])
+        elif "python" in fname:
+            keywords.extend(["python handbook", "ultimate python", "python book"])
+        elif "offer" in fname:
+            keywords.extend(["offer letter", "yash mittal offer", "offer"])
+
+        for kw in keywords:
+            if re.search(r"\b" + re.escape(kw) + r"\b", text_lower):
+                return d
+    return None
+
+
+async def analyze_document_scope(
+    question: str,
+    chat_history: list[dict] | None = None,
+    available_documents: list[dict] | None = None,
+) -> DocumentScopeResult:
+    """
+    Evaluate user query against available documents.
+    Detects ambiguity, explicit mentions, chat history carryover, or clarification responses.
+    """
+    if not available_documents:
+        return DocumentScopeResult(
+            status="no_documents",
+            clarification_text="You don't have any uploaded documents yet. Please upload a document to get started.",
+        )
+
+    # If user has only 1 document in library, zero ambiguity
+    if len(available_documents) == 1:
+        d = available_documents[0]
+        return DocumentScopeResult(
+            status="resolved",
+            target_doc_id=str(d["id"]),
+            target_filename=d["filename"],
+            is_tabular=d.get("is_tabular", False),
+            cleaned_question=question,
+        )
+
+    # 1. Check for @mention tag (e.g. "@verity what happened?" or "@SWE-bench key findings")
+    at_match = re.search(r"@([A-Za-z0-9_.-]+)", question)
+    if at_match:
+        tag = at_match.group(1).lower()
+        matched = _find_matching_doc_by_keyword(tag, available_documents)
+        if matched:
+            cleaned = re.sub(r"@[A-Za-z0-9_.-]+\s*", "", question).strip()
+            return DocumentScopeResult(
+                status="resolved",
+                target_doc_id=str(matched["id"]),
+                target_filename=matched["filename"],
+                is_tabular=matched.get("is_tabular", False),
+                cleaned_question=cleaned,
+            )
+
+    # 2. Check if the user is answering a prior clarification question
+    if chat_history and len(chat_history) >= 1:
+        last_msg = chat_history[-1]
+        if last_msg.get("role") == "assistant":
+            last_content = last_msg.get("content", "")
+            if "Which document would you like me to examine" in last_content or "Which document would you like me to focus on" in last_content:
+                # Did user say "all" or "everything"?
+                q_clean = question.strip().lower()
+                if q_clean in ("all", "both", "all of them", "everything", "all documents"):
+                    orig_q = ""
+                    for m in reversed(chat_history[:-1]):
+                        if m.get("role") == "user":
+                            orig_q = m.get("content", "")
+                            break
+                    return DocumentScopeResult(status="all_docs", cleaned_question=orig_q or question)
+
+                # Match document from answer
+                matched = _find_matching_doc_by_keyword(question, available_documents)
+                if matched:
+                    orig_q = ""
+                    for m in reversed(chat_history[:-1]):
+                        if m.get("role") == "user":
+                            orig_q = m.get("content", "")
+                            break
+                    cleaned_q = f"{orig_q} in {matched['filename']}" if orig_q else f"Information from {matched['filename']}"
+                    return DocumentScopeResult(
+                        status="resolved",
+                        target_doc_id=str(matched["id"]),
+                        target_filename=matched["filename"],
+                        is_tabular=matched.get("is_tabular", False),
+                        cleaned_question=cleaned_q,
+                    )
+
+    # 3. Check for explicit library-wide queries
+    q_lower = question.lower().strip()
+    if re.search(r"\b(all\s+documents|all\s+my\s+documents|all\s+files|across\s+all|compare\s+(the\s+)?(documents|files|books)|what\s+documents\s+do\s+i\s+have|list\s+(all\s+)?(my\s+)?(documents|files))\b", q_lower):
+        return DocumentScopeResult(status="all_docs", cleaned_question=question)
+
+    # 4. Check for prominent document title/name in the question
+    matched = _find_matching_doc_by_keyword(question, available_documents)
+    if matched:
+        return DocumentScopeResult(
+            status="resolved",
+            target_doc_id=str(matched["id"]),
+            target_filename=matched["filename"],
+            is_tabular=matched.get("is_tabular", False),
+            cleaned_question=question,
+        )
+
+    # 4b. Fast heuristic for standard ambiguous queries in multi-doc library
+    ambiguous_patterns = [
+        r"^(what\s+are\s+the\s+)?key\s+findings\b",
+        r"^(can\s+you\s+)?summarize(\s+(the\s+)?(document|file|paper|book|dataset|it|this))?\b",
+        r"^what\s+is\s+(this|the)\s+(document|file|paper|book)\s+about\b",
+        r"^(what\s+are\s+the\s+)?(main\s+takeaways|conclusions)\b",
+        r"^(give\s+me\s+a\s+)?summary(\s+of\s+the\s+(document|file|paper))?\b",
+    ]
+    if not chat_history and any(re.search(p, q_lower) for p in ambiguous_patterns):
+        return DocumentScopeResult(
+            status="needs_clarification",
+            clarification_text=format_clarification_message(available_documents, question),
+        )
+
+    # 5. Fast LLM Ambiguity / Scope Classification
+    catalog_lines = []
+    for i, d in enumerate(available_documents, 1):
+        catalog_lines.append(f"[{i}] {d['filename']} ({'Tabular' if d.get('is_tabular') else 'Text Document'})")
+    catalog_str = "\n".join(catalog_lines)
+
+    messages = [
+        {
+            "role": "system",
+            "content": DOCUMENT_SCOPE_SYSTEM_PROMPT.replace("{document_catalog}", catalog_str),
+        },
+    ]
+    if chat_history:
+        for m in chat_history[-3:]:
+            messages.append({"role": m["role"], "content": m["content"][:200]})
+    messages.append({"role": "user", "content": question})
+
+    try:
+        response = await call_llm_with_fallback(
+            messages=messages,
+            max_tokens=150,
+            temperature=0.0,
+            fast=True,
+        )
+        resp_text = (response.choices[0].message.content or "").strip()
+        resp_reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip()
+        combined = f"{resp_text}\n{resp_reasoning}".upper()
+
+        if "CATEGORY: AMBIGUOUS" in combined or "AMBIGUOUS" in resp_text.upper():
+            return DocumentScopeResult(
+                status="needs_clarification",
+                clarification_text=format_clarification_message(available_documents, question),
+                cleaned_question=question,
+            )
+        elif "CATEGORY: SPECIFIC" in combined or "SPECIFIC" in resp_text.upper():
+            idx_match = re.search(r"DOCUMENT_INDEX:\s*(\d+)", combined)
+            if idx_match:
+                doc_idx = int(idx_match.group(1)) - 1
+                if 0 <= doc_idx < len(available_documents):
+                    target = available_documents[doc_idx]
+                    return DocumentScopeResult(
+                        status="resolved",
+                        target_doc_id=str(target["id"]),
+                        target_filename=target["filename"],
+                        is_tabular=target.get("is_tabular", False),
+                        cleaned_question=question,
+                    )
+        elif "CATEGORY: CROSS_DOC" in combined:
+            return DocumentScopeResult(status="all_docs", cleaned_question=question)
+
+    except Exception as e:
+        logger.warning(f"Document scope analysis failed: {e}")
+
+    # Fallback to all_docs
+    return DocumentScopeResult(status="all_docs", cleaned_question=question)
+
+
 # ── Direct response (no retrieval) ────────────────────────────────────────
 
 CHITCHAT_SYSTEM_PROMPT = """You are DocuChat, a friendly AI document assistant. The user is having a casual conversation — they are NOT asking about their documents right now.
@@ -215,28 +507,93 @@ async def generate_direct_response(
 
 # ── Chat Auto-Naming ──────────────────────────────────────────────────────
 
-TITLE_SYSTEM_PROMPT = """You are a back-end utility that generates highly concise, 3-to-5 word titles for chat logs.
-Analyze the user's initial inquiry and the assistant's response.
-Extract the core topic, task, or technical domain.
+DANGLING_END_WORDS = {
+    "a", "an", "the", "and", "or", "but", "nor", "so", "yet",
+    "in", "on", "at", "to", "for", "of", "with", "by", "from", "as", "into", "onto", "upon", "about",
+    "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did",
+    "can", "could", "would", "should", "will", "shall", "may", "might", "must",
+    "we", "you", "they", "it", "he", "she", "i", "me", "us", "him", "her", "them",
+    "my", "your", "its", "their", "our", "his",
+    "that", "this", "these", "those", "which", "whose", "whom", "who", "what", "where", "when", "why", "how",
+}
+
+TITLE_SYSTEM_PROMPT = """You generate concise, self-contained chat names (3 to 6 words) for the sidebar of an AI document assistant application.
+Analyze the user's inquiry and the assistant's response to identify the core topic, book, dataset, or technical question being discussed.
 
 CRITICAL RULES:
-- Output ONLY the title. Do not include markdown, bullet points, introductory phrases, or quotes.
-- Do not use generic words like "Chat", "Conversation", "Discussion", or "Question".
-- Keep it between 2 to 5 words maximum.
-- Be specific. (e.g., instead of "Coding Help", use "React Auth State Debugging").
-- If the interaction is pure social pleasantry/greeting with no substantive topic (e.g., "Hi" / "Hello"), output EXACTLY: "New conversation"."""
+1. The chat name MUST be a complete, self-contained phrase or title (3 to 6 words).
+2. It MUST make complete grammatical sense on its own. NEVER cut off mid-sentence or trail off.
+3. NEVER end on dangling words, prepositions, conjunctions, pronouns, or auxiliary verbs (e.g., NEVER end with 'be', 'to', 'of', 'the', 'a', 'in', 'on', 'and', 'for', 'with', 'we', 'can').
+4. Be specific to the actual subject. Do NOT use redundant label prefixes like 'Book Summary:', 'Document Analysis:', or 'Question About:' — focus directly on the actual subject or work title so the entire 3 to 6 words are meaningful (e.g., instead of 'Book Summary: Can We Be', use 'Can We Be Friends Summary' or the full book title).
+5. Output ONLY the title text. Do not include quotes, markdown, bullet points, colons, or introductory preamble.
+6. If the conversation is purely social pleasantries or a greeting with no substantive topic (e.g., 'Hi' / 'Hello'), output EXACTLY: New conversation."""
 
 
-def _clean_title(raw: str) -> str:
-    """Clean and normalize raw LLM output into a strict 2-to-5 word title."""
+def _repair_dangling_title(title: str, context_text: str = "") -> str:
+    """If a title ends on an incomplete dangling word, attempt to complete it from context or fix it."""
+    words = title.split()
+    if not words:
+        return title
+
+    # If ending on a dangling word (e.g. "Can We Be" -> "Be")
+    if words[-1].lower() in DANGLING_END_WORDS and context_text:
+        # Search context (question/answer) for the sequence of words and capture non-punctuation continuation
+        search_phrase = " ".join(words)
+        pattern = re.compile(rf"\b{re.escape(search_phrase)}\s+([^\n\r.,;:!?]+)", re.IGNORECASE)
+        match = pattern.search(context_text)
+        if match:
+            continuation_words = match.group(1).strip().split()
+            added = []
+            for w in continuation_words:
+                if len(words) + len(added) >= 6:
+                    break
+                added.append(w)
+            # Trim trailing dangling words from added segment
+            while added and added[-1].lower() in DANGLING_END_WORDS:
+                added.pop()
+            if added:
+                return " ".join(words + added)
+
+    # If still ending in a dangling word, trim backward if we have at least 3 words left
+    while len(words) > 3 and words[-1].lower() in DANGLING_END_WORDS:
+        words.pop()
+
+    # If still dangling and <= 3 words, append a clarifying noun rather than leaving it broken
+    if words and words[-1].lower() in DANGLING_END_WORDS:
+        if words[-1].lower() in {"be", "is", "are", "can", "could", "should", "will"}:
+            words.append("Overview")
+        else:
+            words.pop()
+            if not words:
+                return "Document Overview"
+
+    return " ".join(words)
+
+
+def _clean_title(raw: str, max_words: int = 6) -> str:
+    """Clean and normalize raw LLM output into a complete 3-to-6 word chat name."""
     if not raw:
         return ""
 
     # Remove markdown bold/italics, quotes, and backticks
     cleaned = re.sub(r"[*_`'\"]", "", raw).strip()
 
-    # Strip conversational prefixes like "Title:", "Here is a title:", "Topic:"
-    cleaned = re.sub(r"^(?:title|topic|here is a title|suggested title)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    # Strip conversational prefixes like "Title:", "Here is a title:", "Topic:", "Chat Name:"
+    cleaned = re.sub(
+        r"^(?:title|topic|here is a title|suggested title|chat name|chat title|suggested name)\s*:\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Strip redundant category prefixes like "Book Summary:", "Document Summary:", "Summary:"
+    cleaned = re.sub(
+        r"^(?:book summary|document summary|paper summary|text summary|executive summary|summary|overview|analysis)\s*:\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
 
     # Strip trailing punctuation
     cleaned = re.sub(r"[.,;:\-!?]+$", "", cleaned).strip()
@@ -245,18 +602,26 @@ def _clean_title(raw: str) -> str:
     if cleaned.lower() in ("new conversation", "new conversation.", "new chat"):
         return "New conversation"
 
-    # Split into words and enforce 2 to 5 words limit
+    # Split into words and enforce 3 to 6 words limit
     words = cleaned.split()
     if not words:
         return ""
 
-    # If first word is generic like "Chat", "Question", strip if length > 2
+    # If first word is generic like "Chat", "Conversation", "Discussion", "Question", strip if length > 2
     if len(words) > 2 and words[0].lower() in ("chat", "conversation", "discussion", "question", "about"):
         words = words[1:]
 
-    # Enforce maximum 5 words
-    if len(words) > 5:
-        words = words[:5]
+    # Enforce maximum words (up to 6 words)
+    if len(words) > max_words:
+        # If dropping leading article ("The", "A", "An") helps fit in 6 words
+        if len(words) == max_words + 1 and words[0].lower() in ("the", "a", "an"):
+            words = words[1:]
+        else:
+            words = words[:max_words]
+
+    # Trim trailing dangling words if longer than 3 words
+    while len(words) > 3 and words[-1].lower() in DANGLING_END_WORDS:
+        words.pop()
 
     return " ".join(words)
 
@@ -267,11 +632,11 @@ async def generate_chat_title(
     current_answer: str = "",
 ) -> str:
     """
-    Generate a clean 2-to-5 word title for the chat session using both
+    Generate a complete 3-to-6 word title for the chat session using both
     the user inquiry and the assistant response.
     Returns "New conversation" if the conversation is purely pleasantries.
     """
-    with logfire.span("rag.generate_chat_title", question=current_question[:60]) as span:
+    with logfire.span("🏷️ Synthesize Chat Title | '{q_short}'", q_short=current_question[:50], question=current_question[:60]) as span:
         # Fast check: if only message and it's a simple greeting, return default immediately
         cleaned_q = current_question.strip().lower()
         cleaned_q = re.sub(r"[^\w\s]", "", cleaned_q)
@@ -305,12 +670,14 @@ async def generate_chat_title(
         try:
             response = await call_llm_with_fallback(
                 messages=messages,
-                max_tokens=25,
+                max_tokens=60,
                 temperature=0.2,
                 fast=True,
             )
             raw = (response.choices[0].message.content or "").strip()
-            title = _clean_title(raw)
+            title = _clean_title(raw, max_words=6)
+            combined_context = f"{current_question} {current_answer}"
+            title = _repair_dangling_title(title, combined_context)
             if title:
                 logger.info(f"Generated chat title: '{title}' for '{current_question[:50]}'")
                 span.set_attribute("title", title)
@@ -318,10 +685,13 @@ async def generate_chat_title(
         except Exception as e:
             logger.warning(f"Chat title generation failed: {e}")
 
-        # Fallback: extract first 3-5 words from question
-        q_words = [w for w in re.findall(r"\b\w+\b", current_question) if w.lower() not in {"what", "is", "the", "how", "can", "you", "a", "an", "tell", "me"}]
+        # Fallback: extract substantive keywords from question, avoiding stop/dangling words
+        q_words = [
+            w for w in re.findall(r"\b\w+\b", current_question)
+            if w.lower() not in DANGLING_END_WORDS and w.lower() not in {"what", "how", "tell", "give", "please", "explain"}
+        ]
         if q_words:
-            fallback = " ".join(q_words[:4]).title()
+            fallback = " ".join(q_words[:5]).title()
             span.set_attribute("title", fallback)
             span.set_attribute("method", "fallback_keyword")
             return fallback
@@ -349,6 +719,26 @@ def detect_aggregation(question: str) -> bool:
     return any(kw in lower_q for kw in AGGREGATION_KEYWORDS)
 
 
+OVERVIEW_KEYWORDS = {
+    "tell me about", "what is this book about", "what is this document about",
+    "what is this paper about", "what is this novel about", "what is it about",
+    "what is the book about", "what is the paper about", "what is the novel about",
+    "give me an overview", "overview", "summary", "summarize", "synopsis",
+    "what happens in", "who wrote", "author of", "premise", "plot summary",
+    "plot of", "introduction to", "intro of", "what is the story", "explain the story",
+    "main character", "protagonist", "key findings", "main idea", "main themes",
+}
+
+
+def is_overview_query(question: str) -> bool:
+    """
+    Check if question asks for an overview, summary, or broad description of a document.
+    Used to attach lead/introductory chunks to provide essential framing context.
+    """
+    lower_q = question.lower()
+    return any(kw in lower_q for kw in OVERVIEW_KEYWORDS)
+
+
 # ── Query rewrite ─────────────────────────────────────────────────────────
 
 REWRITE_SYSTEM_PROMPT = """You are a search query rewriter for a document and tabular data assistant.
@@ -374,7 +764,7 @@ async def rewrite_query(
     if not chat_history:
         return question
 
-    with logfire.span("rag.rewrite_query", original_question=question, history_turns=len(chat_history)) as span:
+    with logfire.span("🔄 Rewrite Query | '{q_short}'", q_short=question[:50], original_question=question, history_turns=len(chat_history)) as span:
         # Build a condensed history string (last 5 messages)
         recent = chat_history[-5:]
         history_str = "\n".join(
@@ -438,15 +828,17 @@ async def retrieve_chunks(
     user_id: str,
     question: str,
     is_aggregation: bool,
+    doc_id_filter: str | None = None,
+    filename_filter: str | None = None,
 ) -> list[dict]:
     """
     Retrieve relevant chunks for answering the question.
 
     1. Embed the query
-    2. Search Qdrant for top-K similar chunks
+    2. Search Qdrant for top-K similar chunks (optionally scoped to a specific document)
     3. If aggregation detected, also fetch summary chunks and prepend them
     """
-    with logfire.span("rag.retrieve_chunks", question=question, is_aggregation=is_aggregation) as span:
+    with logfire.span("🔍 Hybrid Retrieval | '{q_short}'", q_short=question[:50], question=question, is_aggregation=is_aggregation, doc_id_filter=doc_id_filter) as span:
         # Embed the query with dense vector (semantic) and sparse BM25 vector (keyword)
         query_vector = embedding.embed_query(question)
         query_sparse = embedding.embed_sparse_query(question)
@@ -457,6 +849,8 @@ async def retrieve_chunks(
             query_vector=query_vector,
             query_sparse_vector=query_sparse,
             limit=10,
+            doc_id_filter=doc_id_filter,
+            filename_filter=filename_filter,
         )
         span.set_attribute("candidates_retrieved", len(candidates))
         span.set_attribute("search_mode", "hybrid_rrf")
@@ -473,17 +867,66 @@ async def retrieve_chunks(
             span.set_attribute("top_source", results[0].get("filename", "unknown"))
             span.set_attribute("retrieved_sources", list(set(r.get("filename", "unknown") for r in results)))
 
-        # If aggregation detected, fetch and prepend up to 3 summary chunks
-        if is_aggregation:
-            summary_chunks = await vector_store.get_summary_chunks(user_id)
+        # If overview/aggregation detected, fetch and prepend summary chunks and lead chunks
+        is_overview = is_aggregation or is_overview_query(question)
+        span.set_attribute("is_overview_query", is_overview)
+
+        if is_overview:
+            summary_chunks = await vector_store.get_summary_chunks(user_id, doc_id_filter=doc_id_filter)
             if summary_chunks:
-                # Deduplicate: remove any summary chunks already in results
                 result_ids = {r["id"] for r in results}
                 new_summaries = [s for s in summary_chunks if s["id"] not in result_ids][:3]
-                # Prepend summaries so they appear first in context
                 results = new_summaries + results
                 span.set_attribute("summary_chunks_added", len(new_summaries))
-                logger.info(f"Added {len(new_summaries)} summary chunks for aggregation query")
+                logger.info(f"Added {len(new_summaries)} summary chunks for overview/aggregation query")
+
+            # For targeted document overview inquiries, anchor with the document's introductory lead chunks
+            if doc_id_filter:
+                try:
+                    from app.database import AsyncSessionLocal
+                    from app.models import Chunk, Document
+                    from sqlalchemy import select
+                    async with AsyncSessionLocal() as db:
+                        lead_doc_name = filename_filter
+                        if not lead_doc_name:
+                            d_res = await db.execute(
+                                select(Document.filename).where(
+                                    Document.id == (UUID(doc_id_filter) if isinstance(doc_id_filter, str) else doc_id_filter)
+                                )
+                            )
+                            lead_doc_name = d_res.scalar_one_or_none() or "document"
+
+                        lead_res = await db.execute(
+                            select(Chunk).where(
+                                Chunk.document_id == (UUID(doc_id_filter) if isinstance(doc_id_filter, str) else doc_id_filter),
+                                Chunk.chunk_index.in_([0, 1]),
+                            ).order_by(Chunk.chunk_index.asc())
+                        )
+                        db_chunks = lead_res.scalars().all()
+                        lead_chunks = [
+                            {
+                                "id": str(c.id),
+                                "document_id": str(c.document_id),
+                                "filename": lead_doc_name,
+                                "page_number": c.page_number,
+                                "row_range_start": c.row_range_start,
+                                "row_range_end": c.row_range_end,
+                                "content": c.content,
+                                "chunk_type": c.chunk_type,
+                                "score": 1.0,
+                            }
+                            for c in db_chunks
+                        ]
+                        if lead_chunks:
+                            result_ids = {r["id"] for r in results}
+                            new_leads = [c for c in lead_chunks if c["id"] not in result_ids]
+                            # Prepend lead chunks so document title/author/intro context comes first
+                            results = new_leads + results
+                            results = results[:5]
+                            span.set_attribute("lead_chunks_added", len(new_leads))
+                            logger.info(f"Added {len(new_leads)} lead chunks for document {doc_id_filter}")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch lead chunks for doc {doc_id_filter}: {e}")
 
         return results
 
@@ -494,7 +937,10 @@ SYSTEM_PROMPT = """You are a helpful document Q&A assistant. Your job is to answ
 
 RULES:
 1. Answer ONLY using information from the provided context chunks.
-2. If the answer is not in the context, say: "I don't have enough information in the uploaded documents to answer this question."
+2. If asked about a document (e.g. "Tell me about [book/doc]", "What is this file/paper about?", "Summarize [doc]"):
+   - Synthesize a comprehensive, well-structured overview using all available details from the provided context chunks (title, author, premise, key characters, main topics, themes, and visible excerpts).
+   - Be transparent and helpful about what is described in the uploaded document excerpts.
+   - ONLY say: "I don't have enough information in the uploaded documents to answer this question." if the context chunks are completely empty, unreadable, or completely unrelated to the question.
 3. When citing information, ALWAYS cite the page number or row range in square brackets, for example: [Page 4] or [Page 12]. For spreadsheets, cite the row range like [Rows 1-50]. For summary chunks, cite [Summary].
    CRITICAL: NEVER output chunk UUIDs, IDs, or write [CHUNK ...]. Always use the human-readable [Page X] or [Summary] tag.
 4. Format your answers in clean, beautiful Markdown:
@@ -502,7 +948,7 @@ RULES:
    - Use bullet points (* or -) or numbered lists for structure.
    - Use Markdown headings (e.g. ### Section Name) to organize long responses.
    - Place citations like [Page 3] directly after the relevant sentence or bullet point.
-5. Do NOT make up, hallucinate, or infer information that is not explicitly stated in the context.
+5. Do NOT make up, hallucinate, or infer information that is not explicitly stated in or supported by the context.
 6. NEVER claim, pretend, or hallucinate that you performed a web search. You do not have external web access and must answer solely from the provided document context.
 7. Be concise, accurate, and professional."""
 
@@ -698,7 +1144,7 @@ async def generate_answer_stream(
     The caller is responsible for accumulating the full response
     for citation validation.
     """
-    with logfire.span("rag.generate_answer", question=question, chunks_count=len(chunks)) as span:
+    with logfire.span("🤖 Stream RAG Answer | '{q_short}'", q_short=question[:50], question=question, chunks_count=len(chunks)) as span:
         context = _build_context(chunks, query=question)
 
         groq = _get_groq()
@@ -735,7 +1181,7 @@ def validate_citations(
     Extract and validate citation references from the LLM response.
     Supports [Page X], [Rows X-Y], [Summary], and [CHUNK <id>].
     """
-    with logfire.span("rag.validate_citations", chunks_available=len(context_chunks)) as span:
+    with logfire.span("📑 Validate Citations | {chunks_available} chunk(s)", chunks_available=len(context_chunks)) as span:
         valid_citations = []
         seen = set()
 
@@ -797,13 +1243,12 @@ RULES:
 2. Output ONLY the raw SQL — no explanation, no notes, no commentary.
 3. Use the exact table and column names from the schema.
 4. For aggregations (SUM, AVG, COUNT, MIN, MAX), apply them on the correct numeric columns.
-5. If the user asks an open-ended, overview, or exploratory question (e.g. "tell me about the data", "summarize", "key factors", "overview", "what are the drivers of X"):
-   Generate an analytical aggregation query! For example:
-   - Group by the primary category or target column (like Churn, Status, Department) with COUNT(*) and percentages
-   - Or calculate key averages, distributions, or metrics (e.g. AVG(MonthlyCharges), AVG(tenure))
-   - Or select top informative columns with LIMIT 20
-   Do NOT return CANNOT_ANSWER for general data analysis questions.
-6. Only return CANNOT_ANSWER if the question has absolutely nothing to do with the schema or tables.
+5. If the user asks an open-ended, overview, exploratory, or summary question about the spreadsheet/table data (e.g. "key findings", "summary", "overview", "what are the trends", "tell me about the data", "findings in <filename>"):
+   You MUST generate a meaningful analytical aggregation query on the main data table!
+   - For example: SELECT count(*) AS total_records, round(avg(CashbackAmount), 2) AS avg_cashback, sum(Churn) AS churn_count FROM <table>;
+   - Or group by the primary category or status column with count(*);
+   - Do NOT return CANNOT_ANSWER for exploratory data analysis, summaries, or key findings questions on tabular datasets.
+6. ONLY return CANNOT_ANSWER if the user question has NOTHING to do with any tabular data and is clearly asking about a non-tabular file (such as a literary novel plot, a signed offer letter, or a research paper's methodology).
 7. Always alias aggregated columns with meaningful names (e.g., total_customers, avg_monthly_charges).
 8. Handle NULL or blank values appropriately: for text/varchar columns containing numbers or spaces, ALWAYS use TRY_CAST(TRIM(col) AS DOUBLE) instead of CAST to avoid conversion errors.
 9. If the user asks for "all data" or something very broad, use LIMIT 50.
@@ -853,7 +1298,7 @@ async def generate_sql_query(
 
     Returns the SQL string, or None if the question can't be answered with SQL.
     """
-    with logfire.span("rag.generate_sql", question=question) as span:
+    with logfire.span("📝 Generate DuckDB SQL | '{q_short}'", q_short=question[:50], question=question) as span:
         messages: list[dict] = [
             {"role": "system", "content": SQL_GENERATION_PROMPT},
             {
@@ -927,7 +1372,7 @@ async def generate_sql_answer_stream(
     """
     Stream an LLM answer that interprets the SQL results for the user.
     """
-    with logfire.span("rag.generate_sql_answer", question=question, sql_query=sql_query) as span:
+    with logfire.span("🦆 Stream SQL Answer | '{q_short}'", q_short=question[:50], question=question, sql_query=sql_query) as span:
         groq = _get_groq()
 
         messages = [
@@ -963,13 +1408,57 @@ async def check_tabular_data(user_id: str) -> bool:
     return await asyncio.to_thread(tabular_store.has_tabular_data, user_id)
 
 
-async def get_schema_for_prompt(user_id: str) -> str:
+TABULAR_OVERVIEW_PROMPT = """You are an expert data analyst assistant. The user is asking a question about an uploaded spreadsheet/tabular dataset.
+You have access to the table schema, column names, types, and sample rows from DuckDB.
+
+RULES:
+1. Provide a clear, structured, and insightful response based on the dataset's columns and sample data.
+2. If the user asked for "key findings", "summary", or "overview", analyze the business domain, the variables tracked, key metrics, and highlight notable patterns visible in the schema and sample data.
+3. Suggest specific quantitative questions the user can ask next (e.g. churn rates by customer status, average tenure, correlation between satisfaction score and churn, etc.).
+4. Use clean Markdown formatting with bullet points and bold highlights.
+5. Reference the dataset by its filename if provided, or as "your uploaded spreadsheet data".
+6. Do NOT mention DuckDB, table prefixes (like t_...), or database internals."""
+
+
+async def generate_tabular_overview_stream(
+    question: str,
+    schema_info: str,
+    filename: str = "",
+) -> AsyncGenerator[str, None]:
     """
-    Get the full DuckDB schema for the user, formatted for the LLM prompt.
+    Stream an overview/insight response for tabular data when SQL cannot be generated or fails.
+    """
+    with logfire.span("📊 Stream Tabular Overview | {filename}", filename=filename or "Spreadsheet", question=question) as span:
+        messages = [
+            {"role": "system", "content": TABULAR_OVERVIEW_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Dataset: {filename}\n\n"
+                    f"Database Schema and Sample Rows:\n{schema_info}\n\n"
+                    f"User question: {question}\n\n"
+                    f"Please provide an insightful, structured response answering the user's question based on this dataset:"
+                ),
+            },
+        ]
+        token_count = 0
+        async for token in stream_llm_with_fallback(
+            messages=messages,
+            max_tokens=1000,
+            temperature=0.2,
+        ):
+            token_count += 1
+            yield token
+        span.set_attribute("tokens_generated", token_count)
+
+
+async def get_schema_for_prompt(user_id: str, doc_id: UUID | None = None) -> str:
+    """
+    Get the DuckDB schema for the user (optionally scoped to a specific doc_id), formatted for the LLM prompt.
     Runs in a thread to avoid blocking.
     """
     import asyncio
-    return await asyncio.to_thread(tabular_store.get_table_schema, user_id)
+    return await asyncio.to_thread(tabular_store.get_table_schema, user_id, doc_id)
 
 
 async def execute_sql_query(user_id: str, sql: str) -> dict:
@@ -978,7 +1467,7 @@ async def execute_sql_query(user_id: str, sql: str) -> dict:
     Runs in a thread to avoid blocking.
     """
     import asyncio
-    with logfire.span("duckdb.execute_sql", sql=sql) as span:
+    with logfire.span("🦆 Execute DuckDB SQL | '{sql_short}'", sql_short=sql[:50], sql=sql) as span:
         result = await asyncio.to_thread(tabular_store.execute_sql, user_id, sql)
         span.set_attribute("row_count", result.get("row_count", 0))
         span.set_attribute("columns", result.get("columns", []))

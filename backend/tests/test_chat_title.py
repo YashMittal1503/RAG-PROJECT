@@ -36,8 +36,25 @@ def test_clean_title_strips_conversational_prefixes_and_punctuation():
 def test_clean_title_enforces_word_limit():
     long_raw = "Analysis of quarterly enterprise sales performance across eastern regional territories"
     cleaned = _clean_title(long_raw)
-    assert len(cleaned.split()) <= 5
-    assert cleaned == "Analysis of quarterly enterprise sales"
+    assert len(cleaned.split()) <= 6
+    assert cleaned == "Analysis of quarterly enterprise sales performance"
+
+
+def test_clean_title_strips_book_and_document_summary_prefixes():
+    assert _clean_title("Book Summary: Can We Be Friends") == "Can We Be Friends"
+    assert _clean_title("Document Summary: Customer Churn Metrics") == "Customer Churn Metrics"
+    assert _clean_title("Summary: Machine Learning Optimization") == "Machine Learning Optimization"
+
+
+def test_clean_title_trims_dangling_trailing_words():
+    assert _clean_title("Customer Churn Prediction Model in the") == "Customer Churn Prediction Model"
+
+
+def test_repair_dangling_title_completes_from_context():
+    from app.services.query import _repair_dangling_title
+    context = "Can you give me a summary of the book Can We Be Friends by the author?"
+    repaired = _repair_dangling_title("Can We Be", context)
+    assert repaired == "Can We Be Friends"
 
 
 def test_clean_title_preserves_new_conversation():

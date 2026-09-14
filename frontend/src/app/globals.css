@@ -30,28 +30,28 @@
   --font-mono: var(--font-geist-mono);
 }
 
-/* ── Dark theme (default) ─────────────────────────────────────────────── */
+/* ── Dark theme (Claude obsidian & terracotta aesthetic) ─────────────── */
 
 :root {
-  --background: #0b0f1a;
-  --foreground: #e8ecf4;
-  --card: #111827;
-  --card-foreground: #e8ecf4;
-  --primary: #6366f1;
+  --background: #191817;
+  --foreground: #f0f0ee;
+  --card: #222225;
+  --card-foreground: #f0f0ee;
+  --primary: #d97757;
   --primary-foreground: #ffffff;
-  --secondary: #1e293b;
-  --secondary-foreground: #cbd5e1;
-  --muted: #1e293b;
-  --muted-foreground: #94a3b8;
-  --accent: #6366f1;
+  --secondary: #28272a;
+  --secondary-foreground: #e4e4e7;
+  --muted: #202023;
+  --muted-foreground: #9ca3af;
+  --accent: #d97757;
   --accent-foreground: #ffffff;
   --destructive: #ef4444;
   --destructive-foreground: #ffffff;
-  --border: #1e293b;
-  --input: #1e293b;
-  --ring: #6366f1;
-  --sidebar: #0f172a;
-  --sidebar-foreground: #e8ecf4;
+  --border: #2e2e32;
+  --input: #242427;
+  --ring: #d97757;
+  --sidebar: #141415;
+  --sidebar-foreground: #f0f0ee;
   --radius: 0.75rem;
 }
 
