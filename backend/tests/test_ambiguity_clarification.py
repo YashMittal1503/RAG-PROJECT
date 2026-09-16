@@ -155,26 +155,64 @@ async def test_scope_active_document_followup():
             ],
         },
     ]
-    scope = await analyze_document_scope(
-        question="26038?",
-        chat_history=chat_history,
-        available_documents=docs,
-    )
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    dummy_response = MagicMock()
+    choice = MagicMock()
+    choice.message.content = "CATEGORY: SPECIFIC [6]"
+    dummy_response.choices = [choice]
+
+    with patch("app.services.query.call_llm_with_fallback", new_callable=AsyncMock) as mock_llm:
+        mock_llm.return_value = dummy_response
+        scope = await analyze_document_scope(
+            question="26038?",
+            chat_history=chat_history,
+            available_documents=docs,
+        )
     assert scope.status == "resolved"
     assert scope.target_doc_id == "doc-sih"
     assert scope.target_filename == "SIH_2026_All_226_Problem_Statements_Master_Catalogue.pdf"
 
 
+
 @pytest.mark.anyio
 async def test_rewrite_query_preserves_entity_code():
     """Follow-up questions like '26038?' retain entity code prefixes like 'SIH26038'."""
+    from unittest.mock import AsyncMock, MagicMock, patch
     from app.services.query import rewrite_query
+
     chat_history = [
         {"role": "user", "content": "ok, tell me what is PS SIH26040?"},
         {"role": "assistant", "content": "**PS SIH26040 – Overview**\n- Problem Statement Code: SIH26040"},
     ]
-    rewritten = await rewrite_query("26038?", chat_history)
-    assert "26038" in rewritten
-    assert "SIH" in rewritten.upper()
+    dummy_response = MagicMock()
+    choice = MagicMock()
+    choice.message.content = "What is problem statement SIH26038?"
+    dummy_response.choices = [choice]
+
+    with patch("app.services.query.call_llm_with_fallback", new_callable=AsyncMock) as mock_llm:
+        mock_llm.return_value = dummy_response
+        rewritten = await rewrite_query("26038?", chat_history)
+
+        assert "26038" in rewritten
+        assert "SIH" in rewritten.upper()
+        assert mock_llm.called
+        call_kwargs = mock_llm.call_args[1]
+        assert call_kwargs.get("fast") is True
+        messages = call_kwargs["messages"]
+        assert any("SIH26040" in m["content"] for m in messages if m["role"] == "user")
+
+
+@pytest.mark.anyio
+async def test_rewrite_query_fallback_on_error():
+    """When LLM rewrite fails, rewrite_query safely falls back to the original question."""
+    from unittest.mock import patch
+    from app.services.query import rewrite_query
+
+    chat_history = [{"role": "user", "content": "Hello"}]
+    with patch("app.services.query.call_llm_with_fallback", side_effect=Exception("API timeout")):
+        result = await rewrite_query("26038?", chat_history)
+        assert result == "26038?"
+
 
 
