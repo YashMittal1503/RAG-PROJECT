@@ -247,12 +247,13 @@ Available documents in the user's workspace:
 {document_catalog}
 
 Decision Categories:
-1. SPECIFIC: The question explicitly mentions a document by name, topic, or distinct keyword (or recent chat history already established the focus document, so this is a clear follow-up).
+1. SPECIFIC: The question explicitly mentions a document by name, topic, or distinct keyword, OR recent conversation history already established a focus document and this question is a follow-up inquiry (e.g. asking about another item, code, section, or character from that same document).
 2. CROSS_DOC: The user is explicitly asking to compare, summarize, or search across multiple or all documents in their library (e.g., "compare all my documents", "what files do I have?", "search across all files").
 3. GENERAL: The question is a general factual or conceptual inquiry (e.g. "What is machine learning?", "How do Python functions work?") that does not assume a specific proprietary story, paper, or report.
-4. AMBIGUOUS: The user asks an underspecified question that clearly refers to a single document's contents (e.g., "What are the key findings?", "Summarize the document", "Who is the main character?", "What does the contract say?", "What was the conclusion?", "Explain the methodology") BUT there are multiple documents and the user never specified which one they mean, and recent chat history does NOT establish a focus document.
+4. AMBIGUOUS: The user asks an underspecified question that clearly refers to a single document's contents (e.g., "What are the key findings?", "Summarize the document", "Who is the main character?", "What does the contract say?") BUT there are multiple documents and the user never specified which one they mean, and recent chat history does NOT establish a focus document.
 
 CRITICAL RULES:
+- Output ONLY the category and index in this exact format. Do NOT answer the user's question!
 - If the question is AMBIGUOUS, output:
   CATEGORY: AMBIGUOUS
 - If SPECIFIC, output:
@@ -403,27 +404,58 @@ async def analyze_document_scope(
             clarification_text=format_clarification_message(available_documents, question),
         )
 
+    # 4c. Detect active focus document from prior assistant citations in chat_history
+    active_doc = None
+    if chat_history:
+        for m in reversed(chat_history):
+            if m.get("role") == "assistant" and m.get("citations"):
+                filenames = set(
+                    c["filename"]
+                    for c in m["citations"]
+                    if isinstance(c, dict) and "filename" in c
+                )
+                if len(filenames) == 1:
+                    active_filename = list(filenames)[0]
+                    for d in available_documents:
+                        if d["filename"].lower() == active_filename.lower():
+                            active_doc = d
+                            break
+                    if active_doc:
+                        break
+
     # 5. Fast LLM Ambiguity / Scope Classification
     catalog_lines = []
     for i, d in enumerate(available_documents, 1):
         catalog_lines.append(f"[{i}] {d['filename']} ({'Tabular' if d.get('is_tabular') else 'Text Document'})")
     catalog_str = "\n".join(catalog_lines)
 
+    scope_user_content = ""
+    if chat_history:
+        recent = chat_history[-3:]
+        history_str = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:200]}"
+            for m in recent
+        )
+        scope_user_content += f"Recent conversation context:\n{history_str}\n\n"
+        if active_doc:
+            scope_user_content += f"Active document established in conversation: {active_doc['filename']}\n\n"
+    scope_user_content += f"User's question to classify: {question}\n\nScope classification:"
+
     messages = [
         {
             "role": "system",
             "content": DOCUMENT_SCOPE_SYSTEM_PROMPT.replace("{document_catalog}", catalog_str),
         },
+        {
+            "role": "user",
+            "content": scope_user_content,
+        },
     ]
-    if chat_history:
-        for m in chat_history[-3:]:
-            messages.append({"role": m["role"], "content": m["content"][:200]})
-    messages.append({"role": "user", "content": question})
 
     try:
         response = await call_llm_with_fallback(
             messages=messages,
-            max_tokens=150,
+            max_tokens=60,
             temperature=0.0,
             fast=True,
         )
@@ -432,6 +464,14 @@ async def analyze_document_scope(
         combined = f"{resp_text}\n{resp_reasoning}".upper()
 
         if "CATEGORY: AMBIGUOUS" in combined or "AMBIGUOUS" in resp_text.upper():
+            if active_doc:
+                return DocumentScopeResult(
+                    status="resolved",
+                    target_doc_id=str(active_doc["id"]),
+                    target_filename=active_doc["filename"],
+                    is_tabular=active_doc.get("is_tabular", False),
+                    cleaned_question=question,
+                )
             return DocumentScopeResult(
                 status="needs_clarification",
                 clarification_text=format_clarification_message(available_documents, question),
@@ -450,11 +490,29 @@ async def analyze_document_scope(
                         is_tabular=target.get("is_tabular", False),
                         cleaned_question=question,
                     )
+            if active_doc:
+                return DocumentScopeResult(
+                    status="resolved",
+                    target_doc_id=str(active_doc["id"]),
+                    target_filename=active_doc["filename"],
+                    is_tabular=active_doc.get("is_tabular", False),
+                    cleaned_question=question,
+                )
         elif "CATEGORY: CROSS_DOC" in combined:
             return DocumentScopeResult(status="all_docs", cleaned_question=question)
 
     except Exception as e:
         logger.warning(f"Document scope analysis failed: {e}")
+
+    # Fallback: if user established an active focus document, maintain focus for follow-ups
+    if active_doc:
+        return DocumentScopeResult(
+            status="resolved",
+            target_doc_id=str(active_doc["id"]),
+            target_filename=active_doc["filename"],
+            is_tabular=active_doc.get("is_tabular", False),
+            cleaned_question=question,
+        )
 
     # Fallback to all_docs
     return DocumentScopeResult(status="all_docs", cleaned_question=question)
@@ -746,9 +804,10 @@ Given a conversation history and a user's follow-up message, rewrite it into a s
 
 CRITICAL RULES:
 1. Output ONLY the rewritten question. Never output an answer, explanation, essay, bullet list, or markdown headers.
-2. If the user says "continue", "more", "tell me more", "go on", "elaborate": rewrite it into a question asking for deeper insights, key factors, or metrics about the previous topic (e.g. "What are more details and key factors behind [topic]?").
-3. Strictly maximum 1 sentence under 20 words.
-4. If the question is already self-contained, return it unchanged."""
+2. Preserve all specific entity identifiers, code prefixes, acronyms, and formatting from recent conversation context (e.g. if the prior turn discussed a code or identifier like 'REQ-101' or 'PROJ-50', rewrite a follow-up like '102?' to retain that prefix, such as 'What is REQ-102?').
+3. If the user says "continue", "more", "tell me more", "go on", "elaborate": rewrite it into a question asking for deeper insights, key factors, or metrics about the previous topic (e.g. "What are more details and key factors behind [topic]?").
+4. Strictly maximum 1 sentence under 20 words.
+5. If the question is already self-contained, return it unchanged."""
 
 
 async def rewrite_query(

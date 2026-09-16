@@ -236,7 +236,7 @@ async def query(
         db.add(user_msg)
         await db.commit()
 
-        # Get chat history for query rewrite and title synthesis
+        # Get chat history for query rewrite, scope analysis, and title synthesis
         result = await db.execute(
             select(ChatMessage)
             .where(ChatMessage.session_id == session_id)
@@ -244,7 +244,7 @@ async def query(
         )
         all_messages = result.scalars().all()
         chat_history = [
-            {"role": m.role, "content": m.content}
+            {"role": m.role, "content": m.content, "citations": m.citations}
             for m in all_messages[:-1]  # Exclude the just-added user message
         ]
         user_message_count = len([m for m in all_messages if m.role == "user"])
@@ -409,10 +409,12 @@ async def query(
                 effective_q = scope.cleaned_question if scope.cleaned_question else body.question
                 rewritten = await rewrite_query(effective_q, chat_history)
 
-                # Step 3: Check if user has tabular data for SQL pipeline
+                # Step 3: SQL pipeline — ONLY for tabular (CSV/XLSX) documents
+                # SQL is never attempted for PDFs, DOCX, or text files, even if
+                # the user also has spreadsheets in their library. The scope
+                # analysis must have explicitly resolved to a tabular document.
                 has_tabular = await check_tabular_data(user_id)
-                # Only attempt SQL if target document is tabular or scope is cross_doc
-                should_attempt_sql = has_tabular and (scope.is_tabular or scope.status == "all_docs")
+                should_attempt_sql = has_tabular and scope.is_tabular
 
                 if should_attempt_sql:
                     target_doc_uuid = uuid.UUID(scope.target_doc_id) if (scope.target_doc_id and scope.is_tabular) else None

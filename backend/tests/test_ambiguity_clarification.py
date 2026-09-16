@@ -135,3 +135,46 @@ async def test_scope_ambiguous_query_triggers_clarification():
     assert "2405.15793v3.pdf" in scope.clarification_text
     assert "Verity-By-Colleen-Hoover.pdf" in scope.clarification_text
     assert "Which document would you like me to examine" in scope.clarification_text
+
+
+
+
+@pytest.mark.anyio
+async def test_scope_active_document_followup():
+    """If recent assistant response cited a document, a follow-up query maintains focus on that document."""
+    docs = SAMPLE_DOCS + [
+        {"id": "doc-sih", "filename": "SIH_2026_All_226_Problem_Statements_Master_Catalogue.pdf", "file_type": "pdf", "is_tabular": False}
+    ]
+    chat_history = [
+        {"role": "user", "content": "ok, tell me what is PS SIH26040?"},
+        {
+            "role": "assistant",
+            "content": "**PS SIH26040 – Overview**\nProblem Statement Code: SIH26040...",
+            "citations": [
+                {"filename": "SIH_2026_All_226_Problem_Statements_Master_Catalogue.pdf", "page_number": 3}
+            ],
+        },
+    ]
+    scope = await analyze_document_scope(
+        question="26038?",
+        chat_history=chat_history,
+        available_documents=docs,
+    )
+    assert scope.status == "resolved"
+    assert scope.target_doc_id == "doc-sih"
+    assert scope.target_filename == "SIH_2026_All_226_Problem_Statements_Master_Catalogue.pdf"
+
+
+@pytest.mark.anyio
+async def test_rewrite_query_preserves_entity_code():
+    """Follow-up questions like '26038?' retain entity code prefixes like 'SIH26038'."""
+    from app.services.query import rewrite_query
+    chat_history = [
+        {"role": "user", "content": "ok, tell me what is PS SIH26040?"},
+        {"role": "assistant", "content": "**PS SIH26040 – Overview**\n- Problem Statement Code: SIH26040"},
+    ]
+    rewritten = await rewrite_query("26038?", chat_history)
+    assert "26038" in rewritten
+    assert "SIH" in rewritten.upper()
+
+
