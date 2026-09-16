@@ -91,6 +91,7 @@ export default function DashboardLayout({
 
   // Backend health & delete modal
   const [backendAwake, setBackendAwake] = useState<boolean | null>(true);
+  const [modelsReady, setModelsReady] = useState<boolean | null>(true);
   const [sessionToDelete, setSessionToDelete] = useState<{
     id: string;
     title: string;
@@ -129,13 +130,15 @@ export default function DashboardLayout({
 
     const check = async () => {
       const health = await checkBackendHealth();
-      setBackendAwake(health.awake && health.modelLoaded);
+      setBackendAwake(health.awake);
+      setModelsReady(health.modelLoaded);
 
       if (!health.awake || !health.modelLoaded) {
         interval = setInterval(async () => {
           const h = await checkBackendHealth();
+          setBackendAwake(h.awake);
+          setModelsReady(h.modelLoaded);
           if (h.awake && h.modelLoaded) {
-            setBackendAwake(true);
             clearInterval(interval);
           }
         }, 3000);
@@ -626,7 +629,7 @@ export default function DashboardLayout({
           </div>
         )}
 
-        {/* Backend wake-up banner */}
+        {/* Backend fully asleep — server itself is unreachable */}
         {backendAwake === false && (
           <div className="bg-amber-500/10 border-b border-amber-500/20 px-4 py-2.5 flex items-center gap-3 animate-fade-in z-20">
             <div className="flex gap-1">
@@ -635,7 +638,21 @@ export default function DashboardLayout({
               <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse-dot" style={{ animationDelay: "600ms" }} />
             </div>
             <p className="text-xs text-amber-300">
-              The backend is waking up — this can take up to a minute on the free tier. Hang tight!
+              Backend is asleep and waking up — this can take up to a minute on the free tier. Hang tight!
+            </p>
+          </div>
+        )}
+
+        {/* Backend is up, AI models still loading in the background — informational, not blocking */}
+        {backendAwake === true && modelsReady === false && (
+          <div className="bg-sky-500/10 border-b border-sky-500/20 px-4 py-2.5 flex items-center gap-3 animate-fade-in z-20">
+            <div className="flex gap-1">
+              <span className="w-2 h-2 rounded-full bg-sky-400 animate-pulse-dot" style={{ animationDelay: "0ms" }} />
+              <span className="w-2 h-2 rounded-full bg-sky-400 animate-pulse-dot" style={{ animationDelay: "300ms" }} />
+              <span className="w-2 h-2 rounded-full bg-sky-400 animate-pulse-dot" style={{ animationDelay: "600ms" }} />
+            </div>
+            <p className="text-xs text-sky-300">
+              Backend is online. AI models are still loading in the background — your first question or upload may take a few extra seconds.
             </p>
           </div>
         )}
@@ -679,7 +696,7 @@ export default function DashboardLayout({
   );
 }
 
-// ── Session Item Component with Hover Options & Inline Rename ───────────────
+// ── Session Item Component with Hover Options & Inline Rename ─────────────────────────────────
 
 interface SessionItemProps {
   session: any;
