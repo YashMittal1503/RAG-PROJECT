@@ -56,14 +56,14 @@ async def lifespan(app: FastAPI):
     - Closes Qdrant client connection and SQLAlchemy engine.
     """
     # ── Startup ───────────────────────────────────────────────────────
-    logger.info("Starting up — pre-warming services...")
-    embedding.init_model()
-    embedding.init_sparse_model()
-    reranker.init_ranker()
+    # ML models (BGE embeddings, BM25, FlashRank) are NOT loaded here.
+    # They initialize lazily on first use via get_model()/get_sparse_model()/get_ranker()
+    # to keep startup RSS under Render's 512 MB memory limit.
+    logger.info("Starting up — pre-warming services (models load on first use)...")
     warm_up_auth()
     await warm_up_db()
     heartbeat_task = asyncio.create_task(db_heartbeat_task())
-    logger.info("Startup complete — all services pre-warmed and ready.")
+    logger.info("Startup complete — DB & Auth warmed, models will load on first use.")
 
     yield  # App is running
 

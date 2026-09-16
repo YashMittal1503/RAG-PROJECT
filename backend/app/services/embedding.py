@@ -9,6 +9,7 @@ running CPU-efficiently within free-tier resource bounds.
 """
 
 import logging
+import threading
 from typing import Optional
 
 import numpy as np
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 # Module-level model references — initialized once during lifespan startup
 _model: Optional[TextEmbedding] = None
 _sparse_model: Optional[SparseTextEmbedding] = None
+_model_lock = threading.Lock()
+_sparse_lock = threading.Lock()
 
 SPARSE_MODEL_NAME = "Qdrant/bm25"
 
@@ -43,9 +46,12 @@ def init_model() -> TextEmbedding:
 
 
 def get_model() -> TextEmbedding:
-    """Get the loaded dense model, raising if not initialized."""
-    if _model is None:
-        return init_model()
+    """Get the loaded dense model, initializing lazily on first use (thread-safe)."""
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is None:
+            init_model()
     return _model
 
 
@@ -88,10 +94,12 @@ def init_sparse_model() -> SparseTextEmbedding:
 
 
 def get_sparse_model() -> SparseTextEmbedding:
-    """Get the loaded sparse model, initializing if needed."""
-    global _sparse_model
-    if _sparse_model is None:
-        return init_sparse_model()
+    """Get the loaded sparse model, initializing lazily on first use (thread-safe)."""
+    if _sparse_model is not None:
+        return _sparse_model
+    with _sparse_lock:
+        if _sparse_model is None:
+            init_sparse_model()
     return _sparse_model
 
 

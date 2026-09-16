@@ -7,6 +7,7 @@ search to significantly improve Context Precision.
 """
 
 import logging
+import threading
 import time
 from typing import Optional
 from flashrank import Ranker, RerankRequest
@@ -14,6 +15,7 @@ from flashrank import Ranker, RerankRequest
 logger = logging.getLogger(__name__)
 
 _ranker: Optional[Ranker] = None
+_ranker_lock = threading.Lock()
 
 
 def init_ranker(model_name: str = "ms-marco-TinyBERT-L-2-v2") -> Ranker:
@@ -28,10 +30,12 @@ def init_ranker(model_name: str = "ms-marco-TinyBERT-L-2-v2") -> Ranker:
 
 
 def get_ranker() -> Ranker:
-    """Get the loaded ranker, initializing if necessary."""
-    global _ranker
-    if _ranker is None:
-        return init_ranker()
+    """Get the loaded ranker, initializing lazily on first use (thread-safe)."""
+    if _ranker is not None:
+        return _ranker
+    with _ranker_lock:
+        if _ranker is None:
+            init_ranker()
     return _ranker
 
 
