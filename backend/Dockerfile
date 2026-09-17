@@ -6,13 +6,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 && rm
 WORKDIR /app
 
 # ── Memory optimizations for 512 MB Render free-tier ─────────────────────
-# OMP_NUM_THREADS=1: ONNX Runtime defaults to N threads per core; cap to 1
-#   saves ~24 MB of thread stack memory on multi-core instances.
-# TOKENIZERS_PARALLELISM=false: Prevents HuggingFace tokenizers from forking.
-# MALLOC_TRIM_THRESHOLD_: Aggressively return freed memory to OS.
-ENV OMP_NUM_THREADS=1
-ENV TOKENIZERS_PARALLELISM=false
-ENV MALLOC_TRIM_THRESHOLD_=65536
+# Keep common numerical/native backends single-threaded. Multiple independent
+# thread pools can otherwise add avoidable stack and working-memory overhead.
+ENV OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    TOKENIZERS_PARALLELISM=false \
+    MALLOC_TRIM_THRESHOLD_=65536
 
 # Install dependencies first (layer caching)
 COPY requirements.txt .
