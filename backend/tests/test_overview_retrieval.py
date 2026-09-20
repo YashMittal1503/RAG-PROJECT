@@ -47,7 +47,9 @@ class TestRerankerCandidateRetention:
             for i in range(10)
         ]
 
-        with patch("app.services.reranker.get_ranker", return_value=mock_ranker):
+        with patch("app.services.reranker.settings.enable_reranker", True), patch(
+            "app.services.reranker.get_ranker", return_value=mock_ranker
+        ):
             results = rerank_chunks(
                 query="Tell me about the novel",
                 chunks=candidates,
@@ -56,6 +58,23 @@ class TestRerankerCandidateRetention:
             )
 
             # Must preserve up to top_k (5) candidates, not decimate to 2
+            assert len(results) == 5
+            assert results[0]["id"] == "chunk-0"
+            assert results[4]["id"] == "chunk-4"
+
+    def test_rerank_disabled_passthrough(self):
+        """Test that disabling reranker passes Qdrant Hybrid RRF candidates through directly."""
+        candidates = [
+            {"id": f"chunk-{i}", "content": f"Passage text {i}", "score": 0.9 - (i * 0.05)}
+            for i in range(10)
+        ]
+
+        with patch("app.services.reranker.settings.enable_reranker", False):
+            results = rerank_chunks(
+                query="Tell me about the novel",
+                chunks=candidates,
+                top_k=5,
+            )
             assert len(results) == 5
             assert results[0]["id"] == "chunk-0"
             assert results[4]["id"] == "chunk-4"

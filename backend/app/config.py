@@ -36,9 +36,10 @@ class Settings(BaseSettings):
     groq_api_keys: str | None = None
     groq_model: str = "openai/gpt-oss-120b"
 
-    # ── Embedding ─────────────────────────────────────────────────────────
+    # ── Embedding & Reranker ──────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_dim: int = 384
+    enable_reranker: bool = False  # False for 512MB hosts (Render free tier); Qdrant Cloud handles Hybrid RRF natively
 
     # ── Upload limits ─────────────────────────────────────────────────────
     max_file_size_mb: int = 20

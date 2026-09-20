@@ -19,6 +19,40 @@ from qdrant_client.models import SparseVector
 from app.config import settings
 from app.utils.memory import release_memory
 
+# ── FastEmbed ONNX Runtime Session Tuning for 512 MB Containers ───────────
+# ONNX Runtime default enables cpu_mem_arena, which permanently retains all
+# tensor evaluation buffers in C++ heap. Setting enable_cpu_mem_arena=False
+# forces immediate buffer deallocation back to system allocator on inference completion.
+from fastembed.common.onnx_model import OnnxModel
+
+_orig_load_onnx_model = OnnxModel.load_onnx_model
+
+
+def _bounded_load_onnx_model(
+    self,
+    model_dir,
+    model_file,
+    threads=None,
+    providers=None,
+):
+    import onnxruntime as ort
+
+    model_path = model_dir / model_file
+    onnx_providers = ["CPUExecutionProvider"] if providers is None else list(providers)
+
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.enable_cpu_mem_arena = False
+    so.intra_op_num_threads = 1
+    so.inter_op_num_threads = 1
+
+    self.model = ort.InferenceSession(
+        str(model_path), providers=onnx_providers, sess_options=so
+    )
+
+
+OnnxModel.load_onnx_model = _bounded_load_onnx_model
+
 logger = logging.getLogger(__name__)
 
 # Module-level model references — initialized lazily on first use
@@ -78,7 +112,9 @@ def embed_query(text: str) -> list[float]:
     """
     model = get_model()
     embeddings = list(model.query_embed(text, batch_size=1))
-    return embeddings[0].tolist()
+    result = embeddings[0].tolist()
+    release_memory()
+    return result
 
 
 # ── Sparse Embeddings (BM25) ──────────────────────────────────────────────
@@ -135,7 +171,9 @@ def embed_sparse_query(text: str) -> SparseVector:
     model = get_sparse_model()
     embeddings = list(model.query_embed(text, batch_size=1))
     emb = embeddings[0]
-    return SparseVector(
+    result = SparseVector(
         indices=emb.indices.tolist(),
         values=emb.values.tolist(),
     )
+    release_memory()
+    return result

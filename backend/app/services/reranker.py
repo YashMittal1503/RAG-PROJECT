@@ -12,6 +12,7 @@ import time
 from typing import Optional
 from flashrank import Ranker, RerankRequest
 
+from app.config import settings
 from app.utils.memory import release_memory
 
 logger = logging.getLogger(__name__)
@@ -21,12 +22,38 @@ _ranker_lock = threading.Lock()
 
 
 def init_ranker(model_name: str = "ms-marco-TinyBERT-L-2-v2") -> Ranker:
-    """Initialize and cache the FlashRank model."""
+    """
+    Initialize and cache the FlashRank model with bounded ONNX session options.
+    Enforces enable_cpu_mem_arena=False and threads=1 to fit 512MB containers.
+    """
     global _ranker
     if _ranker is None:
-        logger.info(f"Loading FlashRank reranker model: {model_name}")
+        logger.info(f"Loading FlashRank reranker model: {model_name} (bounded session)")
         t0 = time.time()
-        _ranker = Ranker(model_name=model_name)
+        ranker = Ranker(model_name=model_name)
+
+        # Optimize the underlying ONNX Runtime session to prevent memory hoarding
+        try:
+            import onnxruntime as ort
+            from flashrank.Config import model_file_map
+
+            if model_name in model_file_map and hasattr(ranker, "model_dir"):
+                so = ort.SessionOptions()
+                so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                so.enable_cpu_mem_arena = False
+                so.intra_op_num_threads = 1
+                so.inter_op_num_threads = 1
+                model_path = str(ranker.model_dir / model_file_map[model_name])
+                ranker.session = ort.InferenceSession(
+                    model_path,
+                    sess_options=so,
+                    providers=["CPUExecutionProvider"],
+                )
+                logger.info("FlashRank ONNX session tuned (arena=False, threads=1)")
+        except Exception as opt_err:
+            logger.warning(f"Could not apply ONNX session tuning to FlashRank: {opt_err}")
+
+        _ranker = ranker
         logger.info(f"FlashRank reranker loaded in {(time.time() - t0)*1000:.1f}ms")
     return _ranker
 
@@ -55,6 +82,10 @@ def rerank_chunks(
     """
     Rerank a list of retrieved chunks using FlashRank cross-encoder.
 
+    When settings.enable_reranker is False (default for 512MB memory environments),
+    gracefully passes through Qdrant Cloud's server-side Hybrid RRF ranking,
+    consuming 0 MB of container RAM.
+
     Each chunk dict must have 'content' or 'text'.
     Returns the top_k reranked chunks with updated 'rerank_score' and re-sorted.
     If reranking fails or no chunks provided, falls back gracefully to original chunks.
@@ -62,14 +93,27 @@ def rerank_chunks(
     if not chunks or len(chunks) <= 1:
         return chunks
 
+    # Zero-memory path for 512MB RAM containers: rely directly on Qdrant's Hybrid RRF
+    if not settings.enable_reranker:
+        logger.debug(
+            f"Reranking skipped (settings.enable_reranker=False). "
+            f"Using Qdrant Cloud Hybrid RRF ranking ({len(chunks[:top_k])} chunks)."
+        )
+        return chunks[:top_k]
+
     try:
         ranker = get_ranker()
 
+        # Bound candidates to top_k * 2 (max 6) to avoid multi-chunk BERT cross-encoder spikes
+        eval_chunks = chunks[: min(len(chunks), top_k * 2, 6)]
+
         passages = []
         chunk_map = {}
-        for i, chunk in enumerate(chunks):
+        for i, chunk in enumerate(eval_chunks):
             chunk_id = chunk.get("id") or str(i)
-            text = chunk.get("content") or chunk.get("text") or ""
+            # Truncate text to 350 chars (~70 words). Drastically minimizes BERT quadratic
+            # attention memory overhead while preserving the core topical relevance.
+            text = (chunk.get("content") or chunk.get("text") or "")[:350]
             passages.append({"id": str(chunk_id), "text": text})
             chunk_map[str(chunk_id)] = chunk
 
@@ -86,9 +130,7 @@ def rerank_chunks(
                 original_chunk = dict(chunk_map[cid])
                 original_chunk["rerank_score"] = float(item["score"])
                 original_chunk["vector_score"] = original_chunk.get("score", 0.0)
-                # Keep score updated to rerank_score for downstream consistency
                 original_chunk["score"] = float(item["score"])
-                # Preserve candidates up to top_k so exploratory narrative queries are not starved
                 if item["score"] >= min_score or len(reranked_chunks) < top_k:
                     reranked_chunks.append(original_chunk)
 
@@ -96,12 +138,13 @@ def rerank_chunks(
         top_orig = result[0].get("vector_score", 0.0) if result else 0.0
         top_new = result[0]["score"] if result else 0.0
         logger.info(
-            f"Reranked {len(chunks)} -> {len(result)} chunks in {elapsed_ms:.1f}ms "
+            f"Reranked {len(eval_chunks)} -> {len(result)} chunks in {elapsed_ms:.1f}ms "
             f"(top score: {top_new:.4f} vs vector: {top_orig:.4f})"
         )
-        release_memory()
         return result
 
     except Exception as e:
         logger.error(f"FlashRank reranking failed: {e}. Falling back to vector search order.")
         return chunks[:top_k]
+    finally:
+        release_memory()
