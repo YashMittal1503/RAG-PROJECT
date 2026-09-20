@@ -18,6 +18,7 @@ from app.config import settings
 from app.services import embedding, vector_store, reranker
 from app.services.chunking import count_tokens
 from app.services import tabular_store
+from app.utils.memory import release_memory
 
 logger = logging.getLogger(__name__)
 
@@ -987,6 +988,7 @@ async def retrieve_chunks(
                 except Exception as e:
                     logger.warning(f"Failed to fetch lead chunks for doc {doc_id_filter}: {e}")
 
+        release_memory()
         return results
 
 

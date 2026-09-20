@@ -7,6 +7,14 @@ Assembles the app with:
 - All API routers
 """
 
+import os
+# Restrict OpenMP / BLAS / ONNX runtime to single-thread pools for low-memory container safety
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import logging
 from contextlib import asynccontextmanager
 

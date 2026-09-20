@@ -60,6 +60,15 @@ def _table_name(doc_id: uuid.UUID, sheet_name: str) -> str:
     return f"t_{_table_prefix(doc_id)}_{_sanitize_name(sheet_name)}"
 
 
+def _connect(db_file: str, read_only: bool = False) -> duckdb.DuckDBPyConnection:
+    """Open DuckDB connection with strict memory limits (64MB) and single-threaded execution."""
+    return duckdb.connect(
+        db_file,
+        read_only=read_only,
+        config={"memory_limit": "64MB", "threads": "1"},
+    )
+
+
 # ── Public API ────────────────────────────────────────────────────────────
 
 def store_dataframe(
@@ -93,7 +102,7 @@ def store_dataframe(
     df = df.copy()
     df.columns = clean_cols
 
-    conn = duckdb.connect(db_file)
+    conn = _connect(db_file)
     try:
         # Drop if exists (idempotent re-upload)
         conn.execute(f"DROP TABLE IF EXISTS {table}")
@@ -134,7 +143,7 @@ def get_table_schema(user_id: str, doc_id: uuid.UUID | None = None) -> str:
     if not os.path.exists(db_file):
         return ""
 
-    conn = duckdb.connect(db_file, read_only=True)
+    conn = _connect(db_file, read_only=True)
     try:
         # Get all tables
         tables = conn.execute(
@@ -217,7 +226,7 @@ def execute_sql(user_id: str, sql: str) -> dict[str, Any]:
     # Convert any strict CAST(...) to TRY_CAST(...) to gracefully handle dirty data or blank spaces
     cleaned = re.sub(r"\bCAST\s*\(", "TRY_CAST(", cleaned, flags=re.IGNORECASE)
 
-    conn = duckdb.connect(db_file, read_only=True)
+    conn = _connect(db_file, read_only=True)
     try:
         result = conn.execute(cleaned)
         columns = [desc[0] for desc in result.description]
@@ -251,7 +260,7 @@ def delete_tables(user_id: str, doc_id: uuid.UUID) -> None:
 
     prefix = f"t_{_table_prefix(doc_id)}_"
 
-    conn = duckdb.connect(db_file)
+    conn = _connect(db_file)
     try:
         tables = conn.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
@@ -276,7 +285,7 @@ def list_tables(user_id: str) -> list[str]:
     if not os.path.exists(db_file):
         return []
 
-    conn = duckdb.connect(db_file, read_only=True)
+    conn = _connect(db_file, read_only=True)
     try:
         tables = conn.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"

@@ -12,6 +12,8 @@ import time
 from typing import Optional
 from flashrank import Ranker, RerankRequest
 
+from app.utils.memory import release_memory
+
 logger = logging.getLogger(__name__)
 
 _ranker: Optional[Ranker] = None
@@ -97,6 +99,7 @@ def rerank_chunks(
             f"Reranked {len(chunks)} -> {len(result)} chunks in {elapsed_ms:.1f}ms "
             f"(top score: {top_new:.4f} vs vector: {top_orig:.4f})"
         )
+        release_memory()
         return result
 
     except Exception as e:

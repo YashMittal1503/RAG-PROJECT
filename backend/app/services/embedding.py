@@ -17,10 +17,11 @@ from fastembed import TextEmbedding, SparseTextEmbedding
 from qdrant_client.models import SparseVector
 
 from app.config import settings
+from app.utils.memory import release_memory
 
 logger = logging.getLogger(__name__)
 
-# Module-level model references — initialized once during lifespan startup
+# Module-level model references — initialized lazily on first use
 _model: Optional[TextEmbedding] = None
 _sparse_model: Optional[SparseTextEmbedding] = None
 _model_lock = threading.Lock()
@@ -33,14 +34,12 @@ SPARSE_MODEL_NAME = "Qdrant/bm25"
 
 def init_model() -> TextEmbedding:
     """
-    Load the FastEmbed dense model. Called once during FastAPI lifespan startup.
-
-    The model is downloaded on first run and cached locally.
-    Subsequent loads are fast (~1-2 seconds).
+    Load the FastEmbed dense model with threads=1 to prevent OpenMP
+    thread stack inflation in memory-constrained containers (512MB RAM).
     """
     global _model
-    logger.info(f"Loading dense embedding model: {settings.embedding_model}")
-    _model = TextEmbedding(model_name=settings.embedding_model)
+    logger.info(f"Loading dense embedding model: {settings.embedding_model} (threads=1)")
+    _model = TextEmbedding(model_name=settings.embedding_model, threads=1)
     logger.info("Dense embedding model loaded successfully")
     return _model
 
@@ -62,21 +61,23 @@ def is_model_loaded() -> bool:
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     """
-    Embed a list of document texts into dense vectors.
+    Embed a list of document texts into dense vectors with bounded batch size.
     """
     if not texts:
         return []
     model = get_model()
-    embeddings = list(model.embed(texts))
-    return [emb.tolist() for emb in embeddings]
+    embeddings = list(model.embed(texts, batch_size=32, parallel=None))
+    result = [emb.tolist() for emb in embeddings]
+    release_memory()
+    return result
 
 
 def embed_query(text: str) -> list[float]:
     """
-    Embed a single query text into a dense vector.
+    Embed a single query text into a dense vector with batch_size=1.
     """
     model = get_model()
-    embeddings = list(model.query_embed(text))
+    embeddings = list(model.query_embed(text, batch_size=1))
     return embeddings[0].tolist()
 
 
@@ -84,11 +85,11 @@ def embed_query(text: str) -> list[float]:
 
 def init_sparse_model() -> SparseTextEmbedding:
     """
-    Load the FastEmbed BM25 sparse model. Called once during lifespan startup.
+    Load the FastEmbed BM25 sparse model with threads=1.
     """
     global _sparse_model
-    logger.info(f"Loading sparse BM25 embedding model: {SPARSE_MODEL_NAME}")
-    _sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
+    logger.info(f"Loading sparse BM25 embedding model: {SPARSE_MODEL_NAME} (threads=1)")
+    _sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL_NAME, threads=1)
     logger.info("Sparse BM25 embedding model loaded successfully")
     return _sparse_model
 
@@ -110,27 +111,29 @@ def is_sparse_model_loaded() -> bool:
 
 def embed_sparse_texts(texts: list[str]) -> list[SparseVector]:
     """
-    Embed document texts into Qdrant SparseVector objects using BM25.
+    Embed document texts into Qdrant SparseVector objects using BM25 with bounded batch size.
     """
     if not texts:
         return []
     model = get_sparse_model()
-    embeddings = list(model.embed(texts))
-    return [
+    embeddings = list(model.embed(texts, batch_size=32, parallel=None))
+    result = [
         SparseVector(
             indices=emb.indices.tolist(),
             values=emb.values.tolist(),
         )
         for emb in embeddings
     ]
+    release_memory()
+    return result
 
 
 def embed_sparse_query(text: str) -> SparseVector:
     """
-    Embed a query text into a Qdrant SparseVector using BM25.
+    Embed a query text into a Qdrant SparseVector using BM25 with batch_size=1.
     """
     model = get_sparse_model()
-    embeddings = list(model.query_embed(text))
+    embeddings = list(model.query_embed(text, batch_size=1))
     emb = embeddings[0]
     return SparseVector(
         indices=emb.indices.tolist(),

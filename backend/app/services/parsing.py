@@ -48,7 +48,7 @@ _ocr_engine = None
 
 
 def _get_ocr_engine():
-    """Lazy initialize RapidOCR engine singleton."""
+    """Lazy initialize RapidOCR engine singleton on-demand."""
     global _ocr_engine
     if _ocr_engine is None:
         try:
@@ -61,14 +61,39 @@ def _get_ocr_engine():
     return _ocr_engine if _ocr_engine is not False else None
 
 
+def unload_ocr_engine() -> None:
+    """
+    Tear down RapidOCR engine and its underlying ONNX Runtime sessions,
+    releasing all model weights and intermediate C++ arena memory back to the OS.
+    """
+    global _ocr_engine
+    if _ocr_engine is not None and _ocr_engine is not False:
+        try:
+            for sub in (
+                getattr(_ocr_engine, "text_det", None),
+                getattr(_ocr_engine, "text_cls", None),
+                getattr(_ocr_engine, "text_rec", None),
+            ):
+                if sub is not None and hasattr(sub, "infer") and hasattr(sub.infer, "session"):
+                    sub.infer.session = None
+        except Exception as e:
+            logger.debug(f"Error freeing RapidOCR sub-sessions: {e}")
+        _ocr_engine = None
+        logger.info("RapidOCR engine successfully unloaded from memory.")
+        from app.utils.memory import release_memory
+        release_memory()
+
+
 def _ocr_page(page: fitz.Page) -> str:
     """
     Render a PDF page to a high-resolution pixmap image and run RapidOCR.
     Used when native text extraction yields fewer than 50 characters (scanned pages).
+    Eagerly frees pixmaps and numpy buffers to prevent memory leaks.
     """
     ocr = _get_ocr_engine()
     if not ocr:
         return ""
+    pix = None
     try:
         import numpy as np
         # Render at 150 DPI (matrix zoom = 150/72 ~ 2.08) for optimal speed and accuracy
@@ -78,6 +103,7 @@ def _ocr_page(page: fitz.Page) -> str:
 
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
         result, _ = ocr(img)
+        del img
         if not result:
             return ""
 
@@ -91,6 +117,9 @@ def _ocr_page(page: fitz.Page) -> str:
     except Exception as e:
         logger.warning(f"OCR failed for page {page.number + 1}: {e}")
         return ""
+    finally:
+        if pix is not None:
+            del pix
 
 
 def parse_pdf(file_bytes: bytes) -> list[PageText]:
@@ -103,67 +132,79 @@ def parse_pdf(file_bytes: bytes) -> list[PageText]:
     4. If a page has < 50 characters of native text, falls back to embedded RapidOCR on that page.
     5. If a page is purely an illustration/blank, produces a clean metadata placeholder.
     6. Catches page-level errors individually so a corrupt page never aborts the document.
+    7. In the finally block, closes PyMuPDF handles and purges RapidOCR from RAM.
     """
     if not file_bytes or len(file_bytes) == 0:
         raise ValueError("The uploaded PDF file is completely empty (0 bytes).")
 
+    doc = None
     try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-    except Exception as e:
-        # Fallback repair attempt
         try:
-            doc = fitz.open(stream=file_bytes)
-        except Exception:
-            raise ValueError(f"Could not open or parse PDF file: {e}")
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+        except Exception as e:
+            # Fallback repair attempt
+            try:
+                doc = fitz.open(stream=file_bytes)
+            except Exception:
+                raise ValueError(f"Could not open or parse PDF file: {e}")
 
-    # Handle encryption/password protection
-    if doc.is_encrypted:
-        authenticated = False
-        for pwd in ["", " ", "123456", "1234"]:
-            if doc.authenticate(pwd):
-                authenticated = True
-                break
-        if not authenticated:
+        # Handle encryption/password protection
+        if doc.is_encrypted:
+            authenticated = False
+            for pwd in ["", " ", "123456", "1234"]:
+                if doc.authenticate(pwd):
+                    authenticated = True
+                    break
+            if not authenticated:
+                doc.close()
+                doc = None
+                raise ValueError(
+                    "This PDF is password-protected and encrypted. "
+                    "Please upload an unlocked/decrypted version of the document."
+                )
+
+        pages: list[PageText] = []
+        total_pages = len(doc)
+
+        if total_pages == 0:
             doc.close()
-            raise ValueError(
-                "This PDF is password-protected and encrypted. "
-                "Please upload an unlocked/decrypted version of the document."
-            )
+            doc = None
+            raise ValueError("The uploaded PDF file contains 0 pages.")
 
-    pages: list[PageText] = []
-    total_pages = len(doc)
+        for page_num in range(total_pages):
+            try:
+                page = doc[page_num]
+                # 1. Native text extraction with layout sorting (preserves column reading order)
+                text = page.get_text("text", sort=True).strip()
 
-    if total_pages == 0:
-        doc.close()
-        raise ValueError("The uploaded PDF file contains 0 pages.")
+                # 2. If page has little to no selectable text (scanned page, form, image), run OCR fallback
+                if len(text) < 50:
+                    ocr_text = _ocr_page(page).strip()
+                    if ocr_text:
+                        if text:
+                            text = f"{text}\n\n{ocr_text}"
+                        else:
+                            text = ocr_text
 
-    for page_num in range(total_pages):
-        try:
-            page = doc[page_num]
-            # 1. Native text extraction with layout sorting (preserves column reading order)
-            text = page.get_text("text", sort=True).strip()
+                # 3. If still empty (e.g. blank page, drawing, or unreadable diagram), use safe placeholder
+                if not text:
+                    text = f"[Page {page_num + 1}: Non-text graphic, illustration, or blank page]"
 
-            # 2. If page has little to no selectable text (scanned page, form, image), run OCR fallback
-            if len(text) < 50:
-                ocr_text = _ocr_page(page).strip()
-                if ocr_text:
-                    if text:
-                        text = f"{text}\n\n{ocr_text}"
-                    else:
-                        text = ocr_text
+                pages.append(PageText(page_number=page_num + 1, text=text))
 
-            # 3. If still empty (e.g. blank page, drawing, or unreadable diagram), use safe placeholder
-            if not text:
-                text = f"[Page {page_num + 1}: Non-text graphic, illustration, or blank page]"
+            except Exception as page_err:
+                logger.warning(f"Error extracting page {page_num + 1}: {page_err}. Emitting placeholder.")
+                pages.append(PageText(page_number=page_num + 1, text=f"[Page {page_num + 1}: Content could not be rendered]"))
 
-            pages.append(PageText(page_number=page_num + 1, text=text))
-
-        except Exception as page_err:
-            logger.warning(f"Error extracting page {page_num + 1}: {page_err}. Emitting placeholder.")
-            pages.append(PageText(page_number=page_num + 1, text=f"[Page {page_num + 1}: Content could not be rendered]"))
-
-    doc.close()
-    return pages
+        return pages
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+        # Unload RapidOCR so it never coexists with retrieval/embedding models in RAM
+        unload_ocr_engine()
 
 
 # ── TXT parser ────────────────────────────────────────────────────────────

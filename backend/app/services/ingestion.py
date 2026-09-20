@@ -32,6 +32,7 @@ from app.services.chunking import (
     chunk_text_from_string,
 )
 from app.services import tabular_store
+from app.utils.memory import release_memory
 
 logger = logging.getLogger(__name__)
 
@@ -386,3 +387,5 @@ async def _run_ingestion_pipeline(
                 )
             except Exception:
                 logger.exception(f"[{doc_id}] Failed to record failure status")
+        finally:
+            release_memory()
