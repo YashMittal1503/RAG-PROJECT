@@ -233,3 +233,79 @@ async def delete_document(
         await db.commit()
         logfire.info("Deleted document {doc_id} ('{filename}') for user {user_id}", doc_id=str(doc_id), filename=doc.filename, user_id=user_id)
         return None
+
+
+@router.post("/{doc_id}/retry", response_model=DocumentResponse)
+async def retry_document(
+    doc_id: uuid.UUID,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Retry processing a failed document.
+
+    Re-uses the original file already stored in Supabase Storage,
+    resets the document status to QUEUED, and re-triggers ingestion.
+    """
+    with logfire.span("🔄 Retry Document | {doc_id}", doc_id=str(doc_id), user_id=user_id):
+        # Verify document exists and belongs to user
+        result = await db.execute(
+            select(Document).where(
+                Document.id == doc_id,
+                Document.user_id == uuid.UUID(user_id),
+            )
+        )
+        doc = result.scalar_one_or_none()
+
+        if not doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Document not found.",
+            )
+
+        if doc.status != DocumentStatus.FAILED.value and doc.status != "failed":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Only failed documents can be retried. Current status: {doc.status}",
+            )
+
+        # Clean up any partial data from the previous attempt
+        try:
+            await vector_store.delete_by_document(user_id, str(doc_id))
+        except Exception as e:
+            logger.warning(f"Could not clear previous vectors for retry of {doc_id}: {e}")
+
+        try:
+            await db.execute(
+                sa_delete(Chunk).where(Chunk.document_id == doc_id)
+            )
+            await db.commit()
+        except Exception as e:
+            logger.warning(f"Could not clear previous chunks for retry of {doc_id}: {e}")
+
+        # Reset document status to QUEUED
+        doc.status = DocumentStatus.QUEUED
+        doc.failure_reason = None
+        doc.chunk_count = None
+        doc.updated_at = datetime.now(timezone.utc)
+        await db.commit()
+        await db.refresh(doc)
+
+        # Re-trigger background ingestion
+        asyncio.create_task(
+            ingest_document(
+                doc_id=doc.id,
+                user_id=user_id,
+                filename=doc.filename,
+                file_type=doc.file_type,
+                storage_path=doc.storage_path,
+            )
+        )
+
+        logfire.info(
+            "Retrying document {doc_id} ('{filename}')",
+            doc_id=str(doc_id),
+            filename=doc.filename,
+            user_id=user_id,
+        )
+        return DocumentResponse.model_validate(doc)

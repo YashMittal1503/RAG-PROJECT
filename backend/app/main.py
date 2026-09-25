@@ -71,7 +71,7 @@ async def recover_stale_documents() -> None:
                 )
                 .values(
                     status=DocumentStatus.FAILED,
-                    failure_reason="Processing interrupted by server restart. Please re-upload.",
+                    failure_reason="Processing interrupted by server restart. Click retry to re-process.",
                 )
             )
             result = await session.execute(stmt)

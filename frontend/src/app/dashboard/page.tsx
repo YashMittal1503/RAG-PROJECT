@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import {
   getDocuments,
   deleteDocument,
+  retryDocument,
   uploadFiles,
   getDocumentStatus,
 } from "@/lib/api";
@@ -20,6 +21,7 @@ import {
   Clock,
   AlertTriangle,
   X,
+  RotateCcw,
 } from "lucide-react";
 
 type Document = {
@@ -212,6 +214,20 @@ export default function DashboardPage() {
     }
   };
 
+  const handleRetry = async (docId: string) => {
+    try {
+      const retried = await retryDocument(docId);
+      // Update the document in the list to show it's re-queued
+      setDocuments((prev) =>
+        prev.map((d) =>
+          d.id === docId ? { ...d, status: "queued", failure_reason: undefined } : d
+        )
+      );
+    } catch {
+      // Show error toast in production
+    }
+  };
+
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
@@ -379,6 +395,17 @@ export default function DashboardPage() {
                     >
                       {doc.failure_reason}
                     </span>
+                  )}
+
+                  {/* Retry button for failed documents */}
+                  {doc.status === "failed" && (
+                    <button
+                      onClick={() => handleRetry(doc.id)}
+                      className="p-1.5 rounded-lg text-[var(--muted-foreground)] hover:text-amber-400 hover:bg-amber-400/10 transition-colors"
+                      title="Retry processing"
+                    >
+                      <RotateCcw className="w-4 h-4" />
+                    </button>
                   )}
 
                   {/* Delete button */}

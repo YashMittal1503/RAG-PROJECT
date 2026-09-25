@@ -173,6 +173,17 @@ export async function deleteDocument(docId: string): Promise<void> {
 }
 
 /**
+ * Retry processing a failed document (re-uses file already in storage).
+ */
+export async function retryDocument(docId: string): Promise<any> {
+  const response = await apiRequest(`/api/documents/${docId}/retry`, {
+    method: "POST",
+  });
+  if (!response.ok) throw new Error("Failed to retry document");
+  return response.json();
+}
+
+/**
  * Create a new chat session.
  */
 export async function createChatSession(
