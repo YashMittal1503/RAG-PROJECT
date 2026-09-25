@@ -903,12 +903,12 @@ async def retrieve_chunks(
         query_vector = embedding.embed_query(question)
         query_sparse = embedding.embed_sparse_query(question)
 
-        # Hybrid candidate retrieval (Dense + BM25 via server-side RRF) — top 10 candidates
+        # Hybrid candidate retrieval (Dense + BM25 via server-side RRF) — top 15 candidates
         candidates = await vector_store.search(
             user_id=user_id,
             query_vector=query_vector,
             query_sparse_vector=query_sparse,
-            limit=10,
+            limit=15,
             doc_id_filter=doc_id_filter,
             filename_filter=filename_filter,
         )
@@ -919,7 +919,7 @@ async def retrieve_chunks(
         results = reranker.rerank_chunks(
             query=question,
             chunks=candidates,
-            top_k=5,
+            top_k=7,
         )
         span.set_attribute("reranked_count", len(results))
         if results:
@@ -1042,25 +1042,32 @@ COMPRESSION_STOP_WORDS = {
 def compress_chunk_content(
     content: str,
     query: str,
-    max_sentences: int = 3,
-    window_size: int = 1,
+    max_sentences: int = 5,
+    window_size: int = 2,
 ) -> str:
     """
     Extractively compresses a text chunk by retaining only sentences relevant to the query,
-    expanded with adjacent sentence context (±1) to ensure grammatical and narrative continuity.
+    expanded with adjacent sentence context (±2) to ensure grammatical and narrative continuity.
 
     Returns the original content unmodified if:
-    - The chunk is already concise (<= 4 sentences).
+    - The chunk is already concise (<= 6 sentences).
+    - The query is too short (<= 4 meaningful words) for reliable keyword matching.
     - No significant query term matches are found (failsafe to prevent accidental data loss).
     """
     if not content or not query:
+        return content
+
+    # Short queries (e.g. "narrator's name?") have too few keywords for reliable
+    # extractive compression — keyword matching would strip out the actual answer.
+    q_words = [w for w in re.findall(r"\b\w+\b", query) if len(w) > 1 and w.lower() not in COMPRESSION_STOP_WORDS]
+    if len(q_words) <= 4:
         return content
 
     from app.services.chunking import _split_into_sentences
     sentences = _split_into_sentences(content)
 
     # Do not compress already compact chunks
-    if len(sentences) <= 4:
+    if len(sentences) <= 6:
         return content
 
     # Extract meaningful query keywords (alphanumeric, length > 1, not stop words)
