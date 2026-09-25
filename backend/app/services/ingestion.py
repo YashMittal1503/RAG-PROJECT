@@ -22,6 +22,7 @@ import logfire
 from sqlalchemy import update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import AsyncSessionLocal
 from app.models import Chunk, Document, DocumentStatus
 from app.services import storage, embedding, vector_store
@@ -36,13 +37,9 @@ from app.utils.memory import release_memory
 
 logger = logging.getLogger(__name__)
 
-# Render's free tier has 512 MB RAM. Only one CPU/memory-heavy ingestion
-# pipeline is allowed to run at a time within a backend instance.
+# Serialize heavy CPU/memory ingestion pipelines within a backend instance
 _INGESTION_SEMAPHORE = asyncio.Semaphore(1)
 
-# Smaller batches reduce peak memory during dense + sparse embedding and
-# avoid keeping an entire document's vector set in Python memory.
-EMBED_BATCH_SIZE = 32
 DB_BATCH_SIZE = 100
 
 
@@ -246,7 +243,7 @@ async def _run_ingestion_pipeline(
             await _update_status(doc_id, DocumentStatus.EMBEDDING)
             logger.info(
                 f"[{doc_id}] Embedding {len(all_chunks)} chunks "
-                f"(Dense + BM25) in batches of {EMBED_BATCH_SIZE}"
+                f"(Dense + BM25) in batches of {settings.embed_batch_size}"
             )
 
             with logfire.span(
@@ -262,8 +259,8 @@ async def _run_ingestion_pipeline(
                 except Exception as del_err:
                     logger.warning(f"[{doc_id}] Could not clear previous vectors: {del_err}")
 
-                for start in range(0, len(all_chunks), EMBED_BATCH_SIZE):
-                    batch_chunks = all_chunks[start : start + EMBED_BATCH_SIZE]
+                for start in range(0, len(all_chunks), settings.embed_batch_size):
+                    batch_chunks = all_chunks[start : start + settings.embed_batch_size]
                     batch_texts = [chunk.content for chunk in batch_chunks]
 
                     sub_vectors = await asyncio.to_thread(
@@ -300,11 +297,8 @@ async def _run_ingestion_pipeline(
 
                     await vector_store.upsert_chunks(user_id, qdrant_points)
 
-                    # Explicitly release the current batch before preparing the
-                    # next one. This prevents vectors from every batch from
-                    # accumulating in the Python process.
+                    # Explicitly release references to the processed batch
                     del batch_texts, sub_vectors, sub_sparse, qdrant_points, batch_chunks
-                    gc.collect()
 
             # ── Step 4: Save chunk metadata to Postgres ───────────────
             with logfire.span(

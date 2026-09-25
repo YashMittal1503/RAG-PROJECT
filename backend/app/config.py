@@ -39,7 +39,14 @@ class Settings(BaseSettings):
     # ── Embedding & Reranker ──────────────────────────────────────────────
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_dim: int = 384
-    enable_reranker: bool = False  # False for 512MB hosts (Render free tier); Qdrant Cloud handles Hybrid RRF natively
+    enable_reranker: bool = True
+    embedding_threads: int = 2
+    enable_onnx_arena: bool = True
+    embed_batch_size: int = 64
+
+    # ── Tabular Data Store (DuckDB) ───────────────────────────────────────
+    duckdb_memory_limit: str = "256MB"
+    duckdb_threads: int = 2
 
     # ── Upload limits ─────────────────────────────────────────────────────
     max_file_size_mb: int = 20

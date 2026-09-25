@@ -19,10 +19,9 @@ from qdrant_client.models import SparseVector
 from app.config import settings
 from app.utils.memory import release_memory
 
-# ── FastEmbed ONNX Runtime Session Tuning for 512 MB Containers ───────────
-# ONNX Runtime default enables cpu_mem_arena, which permanently retains all
-# tensor evaluation buffers in C++ heap. Setting enable_cpu_mem_arena=False
-# forces immediate buffer deallocation back to system allocator on inference completion.
+# ── FastEmbed ONNX Runtime Session Tuning ─────────────────────────────────
+# On 1GB+ RAM instances, enable_cpu_mem_arena=True re-uses tensor allocation buffers,
+# yielding a 3x-5x speedup over dynamic OS malloc/free calls.
 from fastembed.common.onnx_model import OnnxModel
 
 _orig_load_onnx_model = OnnxModel.load_onnx_model
@@ -42,9 +41,9 @@ def _bounded_load_onnx_model(
 
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    so.enable_cpu_mem_arena = False
-    so.intra_op_num_threads = 1
-    so.inter_op_num_threads = 1
+    so.enable_cpu_mem_arena = settings.enable_onnx_arena
+    so.intra_op_num_threads = settings.embedding_threads
+    so.inter_op_num_threads = settings.embedding_threads
 
     self.model = ort.InferenceSession(
         str(model_path), providers=onnx_providers, sess_options=so
@@ -68,12 +67,11 @@ SPARSE_MODEL_NAME = "Qdrant/bm25"
 
 def init_model() -> TextEmbedding:
     """
-    Load the FastEmbed dense model with threads=1 to prevent OpenMP
-    thread stack inflation in memory-constrained containers (512MB RAM).
+    Load the FastEmbed dense model using configured thread settings.
     """
     global _model
-    logger.info(f"Loading dense embedding model: {settings.embedding_model} (threads=1)")
-    _model = TextEmbedding(model_name=settings.embedding_model, threads=1)
+    logger.info(f"Loading dense embedding model: {settings.embedding_model} (threads={settings.embedding_threads})")
+    _model = TextEmbedding(model_name=settings.embedding_model, threads=settings.embedding_threads)
     logger.info("Dense embedding model loaded successfully")
     return _model
 
@@ -95,15 +93,13 @@ def is_model_loaded() -> bool:
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     """
-    Embed a list of document texts into dense vectors with bounded batch size.
+    Embed a list of document texts into dense vectors with configured batch size.
     """
     if not texts:
         return []
     model = get_model()
-    embeddings = list(model.embed(texts, batch_size=32, parallel=None))
-    result = [emb.tolist() for emb in embeddings]
-    release_memory()
-    return result
+    embeddings = list(model.embed(texts, batch_size=settings.embed_batch_size, parallel=None))
+    return [emb.tolist() for emb in embeddings]
 
 
 def embed_query(text: str) -> list[float]:
@@ -112,20 +108,18 @@ def embed_query(text: str) -> list[float]:
     """
     model = get_model()
     embeddings = list(model.query_embed(text, batch_size=1))
-    result = embeddings[0].tolist()
-    release_memory()
-    return result
+    return embeddings[0].tolist()
 
 
 # ── Sparse Embeddings (BM25) ──────────────────────────────────────────────
 
 def init_sparse_model() -> SparseTextEmbedding:
     """
-    Load the FastEmbed BM25 sparse model with threads=1.
+    Load the FastEmbed BM25 sparse model using configured thread settings.
     """
     global _sparse_model
-    logger.info(f"Loading sparse BM25 embedding model: {SPARSE_MODEL_NAME} (threads=1)")
-    _sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL_NAME, threads=1)
+    logger.info(f"Loading sparse BM25 embedding model: {SPARSE_MODEL_NAME} (threads={settings.embedding_threads})")
+    _sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL_NAME, threads=settings.embedding_threads)
     logger.info("Sparse BM25 embedding model loaded successfully")
     return _sparse_model
 
@@ -147,21 +141,19 @@ def is_sparse_model_loaded() -> bool:
 
 def embed_sparse_texts(texts: list[str]) -> list[SparseVector]:
     """
-    Embed document texts into Qdrant SparseVector objects using BM25 with bounded batch size.
+    Embed document texts into Qdrant SparseVector objects using BM25 with configured batch size.
     """
     if not texts:
         return []
     model = get_sparse_model()
-    embeddings = list(model.embed(texts, batch_size=32, parallel=None))
-    result = [
+    embeddings = list(model.embed(texts, batch_size=settings.embed_batch_size, parallel=None))
+    return [
         SparseVector(
             indices=emb.indices.tolist(),
             values=emb.values.tolist(),
         )
         for emb in embeddings
     ]
-    release_memory()
-    return result
 
 
 def embed_sparse_query(text: str) -> SparseVector:
@@ -171,9 +163,8 @@ def embed_sparse_query(text: str) -> SparseVector:
     model = get_sparse_model()
     embeddings = list(model.query_embed(text, batch_size=1))
     emb = embeddings[0]
-    result = SparseVector(
+    return SparseVector(
         indices=emb.indices.tolist(),
         values=emb.values.tolist(),
     )
-    release_memory()
-    return result
+

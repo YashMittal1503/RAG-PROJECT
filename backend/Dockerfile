@@ -5,17 +5,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 && rm
 
 WORKDIR /app
 
-# ── Memory optimizations for 512 MB Render free-tier ─────────────────────
-# Keep common numerical/native backends single-threaded. Multiple independent
-# thread pools can otherwise add avoidable stack and working-memory overhead.
-ENV OMP_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1 \
-    OPENBLAS_NUM_THREADS=1 \
-    NUMEXPR_NUM_THREADS=1 \
-    ORT_MAX_THREADS=1 \
-    ENABLE_RERANKER=false \
+# ── Performance & resource configuration for 1 GB RAM / 2 vCPU instances ──
+ENV OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=2 \
+    NUMEXPR_NUM_THREADS=2 \
+    ORT_MAX_THREADS=2 \
+    ENABLE_RERANKER=true \
     TOKENIZERS_PARALLELISM=false \
-    MALLOC_TRIM_THRESHOLD_=65536
+    MALLOC_TRIM_THRESHOLD_=131072
 
 # Install dependencies first (layer caching)
 COPY requirements.txt .

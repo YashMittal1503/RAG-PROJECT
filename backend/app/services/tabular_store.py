@@ -23,6 +23,8 @@ from typing import Any
 import duckdb
 import pandas as pd
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
 # ── Storage root ──────────────────────────────────────────────────────────
@@ -61,11 +63,14 @@ def _table_name(doc_id: uuid.UUID, sheet_name: str) -> str:
 
 
 def _connect(db_file: str, read_only: bool = False) -> duckdb.DuckDBPyConnection:
-    """Open DuckDB connection with strict memory limits (64MB) and single-threaded execution."""
+    """Open DuckDB connection with configured memory limits and thread allocation."""
     return duckdb.connect(
         db_file,
         read_only=read_only,
-        config={"memory_limit": "64MB", "threads": "1"},
+        config={
+            "memory_limit": settings.duckdb_memory_limit,
+            "threads": str(settings.duckdb_threads),
+        },
     )
 
 

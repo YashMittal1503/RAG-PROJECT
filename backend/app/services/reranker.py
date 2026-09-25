@@ -23,16 +23,15 @@ _ranker_lock = threading.Lock()
 
 def init_ranker(model_name: str = "ms-marco-TinyBERT-L-2-v2") -> Ranker:
     """
-    Initialize and cache the FlashRank model with bounded ONNX session options.
-    Enforces enable_cpu_mem_arena=False and threads=1 to fit 512MB containers.
+    Initialize and cache the FlashRank model with tuned ONNX session options.
     """
     global _ranker
     if _ranker is None:
-        logger.info(f"Loading FlashRank reranker model: {model_name} (bounded session)")
+        logger.info(f"Loading FlashRank reranker model: {model_name}")
         t0 = time.time()
         ranker = Ranker(model_name=model_name)
 
-        # Optimize the underlying ONNX Runtime session to prevent memory hoarding
+        # Optimize the underlying ONNX Runtime session
         try:
             import onnxruntime as ort
             from flashrank.Config import model_file_map
@@ -40,16 +39,16 @@ def init_ranker(model_name: str = "ms-marco-TinyBERT-L-2-v2") -> Ranker:
             if model_name in model_file_map and hasattr(ranker, "model_dir"):
                 so = ort.SessionOptions()
                 so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                so.enable_cpu_mem_arena = False
-                so.intra_op_num_threads = 1
-                so.inter_op_num_threads = 1
+                so.enable_cpu_mem_arena = settings.enable_onnx_arena
+                so.intra_op_num_threads = settings.embedding_threads
+                so.inter_op_num_threads = settings.embedding_threads
                 model_path = str(ranker.model_dir / model_file_map[model_name])
                 ranker.session = ort.InferenceSession(
                     model_path,
                     sess_options=so,
                     providers=["CPUExecutionProvider"],
                 )
-                logger.info("FlashRank ONNX session tuned (arena=False, threads=1)")
+                logger.info(f"FlashRank ONNX session tuned (arena={settings.enable_onnx_arena}, threads={settings.embedding_threads})")
         except Exception as opt_err:
             logger.warning(f"Could not apply ONNX session tuning to FlashRank: {opt_err}")
 
