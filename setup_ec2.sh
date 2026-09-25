@@ -59,12 +59,27 @@ mkdir -p "$DATA_DIR"
 echo "📂 Using env file: $ENV_FILE"
 echo "📂 Using data dir: $DATA_DIR"
 
-# 3. Stop and remove old container (if exists)
-echo "🔄 Stopping old container..."
+# 3. Stop and remove old containers (free up ports 8000 and 10000)
+echo "🔄 Stopping old containers..."
+docker compose -f "$HOME/RAG-PROJECT/docker-compose.yml" down 2>/dev/null || true
+docker-compose -f "$HOME/RAG-PROJECT/docker-compose.yml" down 2>/dev/null || true
 docker stop doctalk-backend 2>/dev/null || true
 docker rm doctalk-backend 2>/dev/null || true
 docker stop watchtower 2>/dev/null || true
 docker rm watchtower 2>/dev/null || true
+
+# Stop any remaining container that has port 8000 or 10000 mapped
+for c in $(docker ps -q); do
+  if docker port "$c" 2>/dev/null | grep -q -E "8000|10000"; then
+    echo "Stopping container $c occupying port 8000/10000..."
+    docker stop "$c" 2>/dev/null || true
+    docker rm "$c" 2>/dev/null || true
+  fi
+done
+
+# Kill any lingering host process on port 8000/10000 if not docker
+sudo fuser -k 8000/tcp 2>/dev/null || true
+sudo fuser -k 10000/tcp 2>/dev/null || true
 
 # 4. Pull the latest image
 echo "📥 Pulling latest DocTalk image..."
