@@ -3,12 +3,17 @@ name: Deploy Backend to AWS EC2
 on:
   push:
     branches: [main]
+    paths:
+      - 'backend/**'
+      - 'docker-compose.yml'
+      - '.github/workflows/deploy.yml'
   workflow_dispatch:
 
 jobs:
   deploy:
     name: Deploy to EC2 via SSH
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Deploy to EC2
@@ -17,67 +22,89 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          port: ${{ secrets.EC2_PORT || 22 }}
+          port: 22
+          command_timeout: 12m
           script_stop: true
           script: |
+            set -e
             echo "=========================================="
             echo "🚀 Starting DocTalk Automated EC2 Deploy"
             echo "=========================================="
 
             # 1. Locate repository directory
-            if [ -d "$HOME/rag-project" ]; then
-              cd "$HOME/rag-project"
-            elif [ -d "$HOME/RAG-PROJECT" ]; then
-              cd "$HOME/RAG-PROJECT"
-            else
-              REPO_DIR=$(find "$HOME" -maxdepth 2 -type d \( -name "rag-project" -o -name "RAG-PROJECT" \) 2>/dev/null | head -n 1)
-              if [ -n "$REPO_DIR" ]; then
-                cd "$REPO_DIR"
-              else
-                echo "❌ Could not find repository folder in $HOME"
-                exit 1
+            REPO_DIR=""
+            for dir in "$HOME/RAG-PROJECT" "$HOME/rag-project" "$HOME/RAG PROJECT"; do
+              if [ -d "$dir" ]; then
+                REPO_DIR="$dir"
+                break
               fi
+            done
+
+            if [ -z "$REPO_DIR" ]; then
+              REPO_DIR=$(find "$HOME" -maxdepth 2 -type d \( -name "rag-project" -o -name "RAG-PROJECT" \) 2>/dev/null | head -n 1)
             fi
 
+            if [ -z "$REPO_DIR" ]; then
+              echo "❌ Could not find repository folder in $HOME"
+              echo "Contents of home directory:"
+              ls -la "$HOME"
+              exit 1
+            fi
+
+            cd "$REPO_DIR"
             echo "📂 Working directory: $(pwd)"
 
-            # 2. Avoid git safe directory warnings and sync with main
-            git config --global --add safe.directory "$(pwd)" || true
+            # 2. Sync with latest code from GitHub
+            git config --global --add safe.directory "$(pwd)" 2>/dev/null || true
+            echo "📥 Fetching latest code..."
             git fetch origin main
             git reset --hard origin/main
+            echo "✅ Code synced to: $(git log --oneline -1)"
 
             # 3. Detect docker command (with or without sudo)
             if docker info >/dev/null 2>&1; then
-              DOCKER_BIN="docker"
+              DOCKER_CMD="docker"
+            elif sudo docker info >/dev/null 2>&1; then
+              DOCKER_CMD="sudo docker"
             else
-              DOCKER_BIN="sudo docker"
+              echo "❌ Docker is not available or not running!"
+              exit 1
             fi
 
-            echo "🐳 Using Docker command: $DOCKER_BIN"
+            echo "🐳 Using Docker command: $DOCKER_CMD"
 
-            # 4. Build and restart container using docker compose
-            if [ -f "docker-compose.yml" ]; then
-              echo "📦 Rebuilding and starting container with docker compose..."
-              $DOCKER_BIN compose down || true
-              $DOCKER_BIN compose build --no-cache
-              $DOCKER_BIN compose up -d
+            # 4. Build and restart container
+            cd backend
+            echo "📦 Building Docker image..."
+            $DOCKER_CMD build -t doctalk-backend .
+
+            echo "🔄 Stopping old container..."
+            $DOCKER_CMD stop doctalk-backend 2>/dev/null || true
+            $DOCKER_CMD rm doctalk-backend 2>/dev/null || true
+
+            echo "🚀 Starting new container..."
+            $DOCKER_CMD run -d \
+              --name doctalk-backend \
+              --restart unless-stopped \
+              -p 8000:10000 \
+              -p 10000:10000 \
+              --env-file .env \
+              -v "$(pwd)/data:/app/data" \
+              doctalk-backend
+
+            # 5. Verify container is running
+            sleep 3
+            if $DOCKER_CMD ps | grep -q doctalk-backend; then
+              echo "✅ Container is running!"
+              $DOCKER_CMD logs --tail 5 doctalk-backend
             else
-              echo "📦 Rebuilding standalone Docker container..."
-              $DOCKER_BIN build -t doctalk-backend ./backend
-              $DOCKER_BIN stop doctalk-backend 2>/dev/null || true
-              $DOCKER_BIN rm doctalk-backend 2>/dev/null || true
-              $DOCKER_BIN run -d \
-                --name doctalk-backend \
-                --restart unless-stopped \
-                -p 8000:10000 \
-                -p 10000:10000 \
-                --env-file ./backend/.env \
-                -v "$(pwd)/backend/data:/app/data" \
-                doctalk-backend
+              echo "❌ Container failed to start! Showing logs:"
+              $DOCKER_CMD logs doctalk-backend
+              exit 1
             fi
 
-            # 5. Clean up old unused dangling images to preserve 1 GB EC2 disk space
-            $DOCKER_BIN image prune -f || true
+            # 6. Clean up old images to preserve disk space
+            $DOCKER_CMD image prune -f 2>/dev/null || true
 
             echo "=========================================="
             echo "✅ DocTalk Backend Deployed Successfully!"
