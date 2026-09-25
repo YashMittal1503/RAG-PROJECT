@@ -1,0 +1,84 @@
+name: Deploy Backend to AWS EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to EC2 via SSH
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT || 22 }}
+          script_stop: true
+          script: |
+            echo "=========================================="
+            echo "🚀 Starting DocTalk Automated EC2 Deploy"
+            echo "=========================================="
+
+            # 1. Locate repository directory
+            if [ -d "$HOME/rag-project" ]; then
+              cd "$HOME/rag-project"
+            elif [ -d "$HOME/RAG-PROJECT" ]; then
+              cd "$HOME/RAG-PROJECT"
+            else
+              REPO_DIR=$(find "$HOME" -maxdepth 2 -type d \( -name "rag-project" -o -name "RAG-PROJECT" \) 2>/dev/null | head -n 1)
+              if [ -n "$REPO_DIR" ]; then
+                cd "$REPO_DIR"
+              else
+                echo "❌ Could not find repository folder in $HOME"
+                exit 1
+              fi
+            fi
+
+            echo "📂 Working directory: $(pwd)"
+
+            # 2. Avoid git safe directory warnings and sync with main
+            git config --global --add safe.directory "$(pwd)" || true
+            git fetch origin main
+            git reset --hard origin/main
+
+            # 3. Detect docker command (with or without sudo)
+            if docker info >/dev/null 2>&1; then
+              DOCKER_BIN="docker"
+            else
+              DOCKER_BIN="sudo docker"
+            fi
+
+            echo "🐳 Using Docker command: $DOCKER_BIN"
+
+            # 4. Build and restart container using docker compose
+            if [ -f "docker-compose.yml" ]; then
+              echo "📦 Rebuilding and starting container with docker compose..."
+              $DOCKER_BIN compose down || true
+              $DOCKER_BIN compose build --no-cache
+              $DOCKER_BIN compose up -d
+            else
+              echo "📦 Rebuilding standalone Docker container..."
+              $DOCKER_BIN build -t doctalk-backend ./backend
+              $DOCKER_BIN stop doctalk-backend 2>/dev/null || true
+              $DOCKER_BIN rm doctalk-backend 2>/dev/null || true
+              $DOCKER_BIN run -d \
+                --name doctalk-backend \
+                --restart unless-stopped \
+                -p 8000:10000 \
+                -p 10000:10000 \
+                --env-file ./backend/.env \
+                -v "$(pwd)/backend/data:/app/data" \
+                doctalk-backend
+            fi
+
+            # 5. Clean up old unused dangling images to preserve 1 GB EC2 disk space
+            $DOCKER_BIN image prune -f || true
+
+            echo "=========================================="
+            echo "✅ DocTalk Backend Deployed Successfully!"
+            echo "=========================================="
