@@ -36,7 +36,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 from app.auth import warm_up_auth
 from app.config import settings
-from app.database import engine, warm_up_db, db_heartbeat_task
+from app.database import engine, warm_up_db, db_heartbeat_task, AsyncSessionLocal
 from app.routers import chat, documents, health
 from app.services import embedding, vector_store, reranker
 
@@ -48,16 +48,49 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def recover_stale_documents() -> None:
+    """
+    On backend startup, reset any documents stuck in non-terminal states
+    (queued, parsing, chunking, embedding) to 'failed'. In-memory background
+    tasks do not survive server restarts or redeployments.
+    """
+    try:
+        from sqlalchemy import update
+        from app.models import Document, DocumentStatus
+
+        async with AsyncSessionLocal() as session:
+            stmt = (
+                update(Document)
+                .where(
+                    Document.status.in_([
+                        DocumentStatus.QUEUED,
+                        DocumentStatus.PARSING,
+                        DocumentStatus.CHUNKING,
+                        DocumentStatus.EMBEDDING,
+                    ])
+                )
+                .values(
+                    status=DocumentStatus.FAILED,
+                    failure_reason="Processing interrupted by server restart. Please re-upload.",
+                )
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            if result.rowcount > 0:
+                logger.info(f"Recovered {result.rowcount} interrupted/stuck document(s) on startup.")
+    except Exception as e:
+        logger.warning(f"Could not recover stale documents on startup: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Lifespan context manager — runs on startup and shutdown.
 
     Startup:
-    - Loads the FastEmbed embedding model into memory (once).
-    - Loads the FlashRank cross-encoder reranker model (once).
     - Pre-warms database connection pool (eliminates 7s cold start).
     - Pre-warms Supabase Auth JWKS keys.
+    - Recovers any documents interrupted by previous server restart.
     - Starts background DB heartbeat task to keep connections hot.
 
     Shutdown:
@@ -65,12 +98,10 @@ async def lifespan(app: FastAPI):
     - Closes Qdrant client connection and SQLAlchemy engine.
     """
     # ── Startup ───────────────────────────────────────────────────────
-    # ML models (BGE embeddings, BM25, FlashRank) are NOT loaded here.
-    # They initialize lazily on first use via get_model()/get_sparse_model()/get_ranker()
-    # to keep startup RSS under Render's 512 MB memory limit.
     logger.info("Starting up — pre-warming services (models load on first use)...")
     warm_up_auth()
     await warm_up_db()
+    await recover_stale_documents()
     heartbeat_task = asyncio.create_task(db_heartbeat_task())
     logger.info("Startup complete — DB & Auth warmed, models will load on first use.")
 
