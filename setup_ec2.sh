@@ -33,6 +33,21 @@ echo "=========================================="
 echo "🚀 DocTalk EC2 One-Time Setup"
 echo "=========================================="
 
+# 0. Configure 2GB Swap (Crucial for 1GB RAM EC2 to prevent OOM crashes on large PDFs)
+if [ $(swapon --show | wc -l) -le 1 ]; then
+  echo "💾 Creating 2GB swap space to prevent memory crashes on large files..."
+  sudo fallocate -l 2G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile
+  sudo swapon /swapfile
+  if ! grep -q '/swapfile' /etc/fstab; then
+    echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+  fi
+  echo "✅ 2GB swap space enabled!"
+else
+  echo "💾 Swap space already active."
+fi
+
 # 1. Login to GitHub Container Registry
 echo "📦 Logging in to GitHub Container Registry..."
 echo "$PAT" | docker login ghcr.io -u YashMittal1503 --password-stdin
