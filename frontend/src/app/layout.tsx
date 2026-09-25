@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "DocuChat — AI Document Q&A",
+  title: "DocTalk — AI Document Q&A",
   description:
     "Upload PDF, TXT, CSV, or XLSX files and ask questions about them. Get streamed AI answers with source citations.",
 };

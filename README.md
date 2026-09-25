@@ -1,4 +1,4 @@
-# DocuChat — Enterprise-Grade Dual-Engine AI Document & Tabular RAG System
+# DocTalk — Enterprise-Grade Dual-Engine AI Document & Tabular RAG System
 
 [![CI](https://github.com/YashMittal1503/RAG-PROJECT/actions/workflows/ci.yml/badge.svg)](https://github.com/YashMittal1503/RAG-PROJECT/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -20,7 +20,7 @@ An enterprise-grade, full-stack Retrieval-Augmented Generation (RAG) and Text-to
 
 In production RAG systems, relying on a single LLM API key or a single provider guarantees frequent outages: token-per-minute (TPM) limits get exhausted, provider outages happen, and streaming connections drop.
 
-**DocuChat's primary architectural differentiator is an autonomous 4-Tier Cross-Provider Fallback Orchestrator (`app.services.llm_provider`) with per-tier multi-key rotation and intelligent rate-limit quarantine:**
+**DocTalk's primary architectural differentiator is an autonomous 4-Tier Cross-Provider Fallback Orchestrator (`app.services.llm_provider`) with per-tier multi-key rotation and intelligent rate-limit quarantine:**
 
 ```
 [ Incoming Generation Prompt ]

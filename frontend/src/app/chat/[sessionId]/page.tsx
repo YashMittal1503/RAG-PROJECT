@@ -1032,7 +1032,7 @@ export default function ChatPage() {
 
           {/* Bottom Footer Metadata */}
           <div className="mt-2 px-2 flex items-center justify-between text-[11px] text-[var(--muted-foreground)]/70">
-            <p>DocuChat is AI and can make mistakes. Please double-check responses.</p>
+            <p>DocTalk is AI and can make mistakes. Please double-check responses.</p>
             <div className="flex items-center gap-1 font-mono text-[10px] bg-[var(--secondary)]/60 px-2 py-0.5 rounded-full border border-[var(--border)]/60">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
               <span>Hybrid RAG • High</span>

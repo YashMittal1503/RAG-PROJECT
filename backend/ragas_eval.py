@@ -1,5 +1,5 @@
 """
-RAGAS Evaluation Script for the DocuChat RAG Project.
+RAGAS Evaluation Script for the DocTalk RAG Project.
 
 Runs the full RAG pipeline end-to-end on a curated test dataset,
 collects retrieved contexts and generated answers, then evaluates
@@ -719,7 +719,7 @@ def print_results(eval_results: dict, raw_results: list[dict]):
 async def main():
     """Main entry point with timing benchmarks."""
     t_global_start = time.time()
-    logger.info("Starting High-Performance RAGAS Evaluation of DocuChat RAG Pipeline")
+    logger.info("Starting High-Performance RAGAS Evaluation of DocTalk RAG Pipeline")
     logger.info(f"   User ID: {USER_ID}")
     logger.info(f"   Timestamp: {datetime.now().isoformat()}")
 

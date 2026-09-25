@@ -58,7 +58,7 @@ export default function SignupPage() {
           </div>
           <h1 className="text-3xl font-bold tracking-tight">Create Account</h1>
           <p className="text-[var(--muted-foreground)] mt-2">
-            Get started with DocuChat
+            Get started with DocTalk
           </p>
         </div>
 

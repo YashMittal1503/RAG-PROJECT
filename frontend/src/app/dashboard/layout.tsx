@@ -417,7 +417,7 @@ export default function DashboardLayout({
             className="flex items-center gap-2 px-1.5 py-1 rounded-lg hover:bg-[var(--secondary)] transition-colors text-left"
           >
             <span className="font-serif text-lg font-medium tracking-tight text-[var(--foreground)]">
-              DocuChat
+              DocTalk
             </span>
           </button>
 
@@ -621,7 +621,7 @@ export default function DashboardLayout({
               className="p-2 rounded-xl bg-[var(--card)] border border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)] hover:bg-[var(--secondary)] shadow-md transition-all cursor-pointer flex items-center gap-1.5"
             >
               <PanelLeftOpen className="w-4 h-4" />
-              <span className="text-xs font-serif font-medium pr-1">DocuChat</span>
+              <span className="text-xs font-serif font-medium pr-1">DocTalk</span>
             </button>
           </div>
         )}

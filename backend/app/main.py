@@ -8,12 +8,13 @@ Assembles the app with:
 """
 
 import os
-# Restrict OpenMP / BLAS / ONNX runtime to single-thread pools for low-memory container safety
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
+# Configure OpenMP / BLAS / ONNX thread pools (defaults to 2 for 1GB RAM / 2-vCPU instances)
+num_threads = os.getenv("APP_NUM_THREADS", "2")
+os.environ.setdefault("OMP_NUM_THREADS", num_threads)
+os.environ.setdefault("OPENBLAS_NUM_THREADS", num_threads)
+os.environ.setdefault("MKL_NUM_THREADS", num_threads)
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", num_threads)
+os.environ.setdefault("NUMEXPR_NUM_THREADS", num_threads)
 
 import logging
 from contextlib import asynccontextmanager
@@ -107,17 +108,17 @@ def _logfire_scrub_callback(match: logfire.ScrubMatch):
 if settings.logfire_token:
     logfire.configure(
         token=settings.logfire_token,
-        service_name="docuchat-api",
+        service_name="doctalk-api",
         service_version="1.0.0",
         environment="development" if "localhost" in settings.frontend_url else "production",
         inspect_arguments=True,
         scrubbing=logfire.ScrubbingOptions(callback=_logfire_scrub_callback),
     )
-    logger.info("Logfire cloud observability enabled (service=docuchat-api).")
+    logger.info("Logfire cloud observability enabled (service=doctalk-api).")
 else:
     logfire.configure(
         send_to_logfire=False,
-        service_name="docuchat-api",
+        service_name="doctalk-api",
         service_version="1.0.0",
         inspect_arguments=True,
         scrubbing=logfire.ScrubbingOptions(callback=_logfire_scrub_callback),
@@ -140,7 +141,7 @@ except Exception as inst_err:
     logger.warning(f"Could not initialize Logfire sub-instrumentations: {inst_err}")
 
 app = FastAPI(
-    title="RAG Chatbot API",
+    title="DocTalk RAG API",
     description="Document Q&A with streaming answers and source citations",
     version="1.0.0",
     lifespan=lifespan,

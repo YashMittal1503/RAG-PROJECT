@@ -46,7 +46,7 @@ export default function LoginPage() {
           <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-[var(--primary)] mb-4">
             <FileText className="w-7 h-7 text-white" />
           </div>
-          <h1 className="text-3xl font-bold tracking-tight">DocuChat</h1>
+          <h1 className="text-3xl font-bold tracking-tight">DocTalk</h1>
           <p className="text-[var(--muted-foreground)] mt-2">
             Sign in to ask questions about your documents
           </p>

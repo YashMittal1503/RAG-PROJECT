@@ -521,7 +521,7 @@ async def analyze_document_scope(
 
 # ── Direct response (no retrieval) ────────────────────────────────────────
 
-CHITCHAT_SYSTEM_PROMPT = """You are DocuChat, a friendly AI document assistant. The user is having a casual conversation — they are NOT asking about their documents right now.
+CHITCHAT_SYSTEM_PROMPT = """You are DocTalk, a friendly AI document assistant. The user is having a casual conversation — they are NOT asking about their documents right now.
 
 Respond naturally and warmly. Keep it brief (1-3 sentences). You can:
 - Greet them back

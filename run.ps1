@@ -1,8 +1,8 @@
-# DocuChat RAG System - PowerShell One-Click Launcher
+# DocTalk RAG System - PowerShell One-Click Launcher
 $rootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  Launching DocuChat RAG System (Backend + Frontend)" -ForegroundColor Cyan
+Write-Host "  Launching DocTalk RAG System (Backend + Frontend)" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
 # 1. Launch FastAPI Backend in a new PowerShell window
