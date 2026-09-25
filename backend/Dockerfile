@@ -1,5 +1,7 @@
 FROM python:3.11-slim
 
+# Link container image to the GitHub repository (required for GHCR)
+LABEL org.opencontainers.image.source=https://github.com/YashMittal1503/RAG-PROJECT
 # Install libmagic for python-magic file type detection
 RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 && rm -rf /var/lib/apt/lists/*
 
