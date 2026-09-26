@@ -24,6 +24,7 @@ flashrank==0.2.10
 pytest>=8.0.0
 logfire[fastapi,asyncpg,sqlalchemy,httpx]>=5.0.0
 openai>=1.50.0
+opencv-python-headless>=4.8.0
 rapidocr_onnxruntime>=1.4.0
 pymupdf4llm>=0.0.17
 pyspellchecker>=0.8.0
