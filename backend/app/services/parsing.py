@@ -13,6 +13,7 @@ PDF parsing strategy:
 
 import io
 import logging
+import re
 from dataclasses import dataclass, field
 
 import chardet
@@ -174,19 +175,35 @@ def _extract_with_pymupdf4llm(file_bytes: bytes) -> list[PageText] | None:
             page_num = metadata.get("page_number") or metadata.get("page") or (i + 1)
             page_num = int(page_num)
 
-            text = chunk.get("text", "").strip()
+            raw_text = chunk.get("text", "").strip()
+            # Strip trailing markdown horizontal rule page dividers if any
+            if raw_text.endswith("-----"):
+                text = raw_text[:-5].strip()
+            else:
+                text = raw_text
 
-            # If pymupdf4llm produced no text, check if native OCR can find text on this page
-            if not text:
+            clean_text = re.sub(r'[\s\-_]', '', text)
+
+            # If pymupdf4llm produced no real text (empty or only dashes),
+            # or if text is very sparse (< 50 chars) and page has images, run OCR fallback
+            if not clean_text or (len(clean_text) < 50 and page_num <= total_pages):
                 try:
                     page = doc[page_num - 1]
-                    ocr_text = _ocr_page(page).strip()
-                    if ocr_text:
-                        text = ocr_text
-                    else:
-                        text = f"[Page {page_num}: Non-text graphic, illustration, or blank page]"
-                except Exception:
-                    text = f"[Page {page_num}: Non-text graphic, illustration, or blank page]"
+                    has_images = len(page.get_images()) > 0 or len(page.get_drawings()) > 0
+                    if not clean_text or has_images:
+                        ocr_text = _ocr_page(page).strip()
+                        if ocr_text:
+                            if clean_text:
+                                if ocr_text.lower() not in text.lower():
+                                    text = f"{text}\n\n{ocr_text}"
+                            else:
+                                text = ocr_text
+                                clean_text = re.sub(r'[\s\-_]', '', text)
+                except Exception as ocr_err:
+                    logger.debug(f"OCR check for page {page_num} bypassed: {ocr_err}")
+
+            if not clean_text:
+                text = f"[Page {page_num}: Non-text graphic, illustration, or blank page]"
 
             pages.append(PageText(page_number=page_num, text=text))
 
