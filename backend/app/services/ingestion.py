@@ -299,6 +299,7 @@ async def _run_ingestion_pipeline(
 
                     # Explicitly release references to the processed batch
                     del batch_texts, sub_vectors, sub_sparse, qdrant_points, batch_chunks
+                    gc.collect()
 
             # ── Step 4: Save chunk metadata to Postgres ───────────────
             with logfire.span(

@@ -18,7 +18,8 @@ ENV OMP_NUM_THREADS=2 \
     NUMEXPR_NUM_THREADS=2 \
     ORT_MAX_THREADS=2 \
     ENABLE_RERANKER=true \
-    ENABLE_ONNX_ARENA=true \
+    ENABLE_ONNX_ARENA=false \
+    EMBED_BATCH_SIZE=8 \
     TOKENIZERS_PARALLELISM=false
 
 # Install dependencies first (layer caching)
