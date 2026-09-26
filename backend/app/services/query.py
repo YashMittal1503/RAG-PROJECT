@@ -1077,10 +1077,11 @@ RULES:
 3. When citing information, ALWAYS cite the page number or row range in square brackets, for example: [Page 4] or [Page 12]. For spreadsheets, cite the row range like [Rows 1-50]. For summary chunks, cite [Summary].
    CRITICAL: The page numbers in the context tags (e.g. [Page X]) correspond to the ACTUAL page numbers of the source PDF. Always use these exact page numbers in your citations.
    CRITICAL: NEVER output chunk UUIDs, IDs, or write [CHUNK ...]. Always use the human-readable [Page X] or [Summary] tag.
-4. Format your answers in clean Markdown:
-   - Use bold (**text**) for important terms and subheadings.
-   - Use bullet points (* or -) or numbered lists for structure.
-   - Use Markdown headings (e.g. ### Section Name) to organize long responses.
+4. Format your answers in clean, readable Markdown:
+   - NEVER format long sentences, multi-line explanations, stakeholder analyses, challenges, or solutions into Markdown tables. Markdown tables must ONLY be used for concise numerical data or short key-value pairs (maximum 3–5 words per cell, e.g. metrics, scores, or status).
+   - When presenting entities, stakeholders, challenges, solutions, comparative points, or narrative explanations, ALWAYS use standard Markdown headings (e.g. ### Stakeholder Name), normal readable paragraphs, and vertical bullet lists. Content must flow naturally and vertically so the user never has to scroll horizontally.
+   - Use bold (**text**) for important terms, entity names, and subheadings.
+   - Use bullet points (* or -) or numbered lists for clear hierarchy.
    - Place citations like [Page 3] directly after the relevant sentence or bullet point.
    - NEVER use raw HTML tags such as <br>, <p>, <div>, <span>, <table>, <tr>, <td>, or any other HTML elements. Use ONLY standard Markdown syntax.
 5. Do NOT make up, hallucinate, or infer information that is not explicitly stated in or supported by the context. If information is not in the context, say "This information is not available in the provided document excerpts" rather than guessing.

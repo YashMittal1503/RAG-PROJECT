@@ -197,12 +197,12 @@ const markdownComponents = {
     </tr>
   ),
   th: ({ children }: any) => (
-    <th className="px-3.5 py-2.5 font-semibold text-[var(--foreground)] whitespace-nowrap text-left border-b border-[var(--border)]">
+    <th className="px-3.5 py-2.5 font-semibold text-[var(--foreground)] text-left border-b border-[var(--border)] align-top whitespace-normal break-words">
       {children}
     </th>
   ),
   td: ({ children }: any) => (
-    <td className="px-3.5 py-2 text-[var(--foreground)]/90 whitespace-nowrap text-left">
+    <td className="px-3.5 py-2 text-[var(--foreground)]/90 text-left align-top whitespace-normal break-words">
       {children}
     </td>
   ),

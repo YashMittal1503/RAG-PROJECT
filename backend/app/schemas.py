@@ -116,3 +116,5 @@ class HealthResponse(BaseModel):
 
     status: str
     model_loaded: bool
+    version: str = "2.1.0"
+    max_chunk_tokens: int = 512

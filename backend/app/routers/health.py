@@ -24,4 +24,6 @@ async def health_check():
     return HealthResponse(
         status="ok",
         model_loaded=is_model_loaded(),
+        version="2.1.0",
+        max_chunk_tokens=512,
     )
