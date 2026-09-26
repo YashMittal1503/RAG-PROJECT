@@ -113,12 +113,13 @@ docker run -d \
 
 # 6. Start Watchtower (auto-updates container when new image is pushed)
 echo "👀 Starting Watchtower (auto-update agent)..."
+docker pull containrrr/watchtower:latest
 docker run -d \
   --name watchtower \
   --restart unless-stopped \
+  -e DOCKER_API_VERSION=1.44 \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v "$HOME/.docker/config.json:/config.json:ro" \
-  containrrr/watchtower \
+  containrrr/watchtower:latest \
   --interval 180 \
   --cleanup \
   doctalk-backend
