@@ -1087,7 +1087,10 @@ RULES:
 5. Do NOT make up, hallucinate, or infer information that is not explicitly stated in or supported by the context. If information is not in the context, say "This information is not available in the provided document excerpts" rather than guessing.
 6. NEVER claim, pretend, or hallucinate that you performed a web search. You do not have external web access and must answer solely from the provided document context.
 7. Be concise, accurate, and professional.
-8. When quoting specific facts, numbers, names, or claims, use the exact wording from the context chunks as closely as possible."""
+8. When quoting specific facts, numbers, names, or claims, use the exact wording from the context chunks as closely as possible.
+9. Distinguish between Problems/Challenges and Solutions/Features:
+   - When asked for "problems", "challenges", "pain points", or "issues", extract and state the explicit problem statements, root causes, and hurdles described in the document.
+   - Do NOT substitute or describe proposed solutions or planned features (e.g., "they plan to...", "they will...", "they aim to provide...") as the problems when the source document explicitly specifies the actual problems."""
 
 
 # ── Contextual Compression ────────────────────────────────────────────────
