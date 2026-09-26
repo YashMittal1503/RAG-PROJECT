@@ -167,11 +167,11 @@ def _extract_with_pymupdf4llm(file_bytes: bytes) -> list[PageText] | None:
 
         pages: list[PageText] = []
         for i, chunk in enumerate(page_chunks):
-            # pymupdf4llm returns dicts with 'metadata' and 'text' keys
+            # pymupdf4llm returns dicts with 'metadata' and 'text' keys.
+            # Both metadata['page_number'] (layout engine) and metadata['page'] (rag engine)
+            # are ALREADY 1-indexed (1, 2, ...).
             metadata = chunk.get("metadata", {})
-            page_num = metadata.get("page_number")
-            if page_num is None:
-                page_num = (metadata.get("page") + 1) if metadata.get("page") is not None else (i + 1)
+            page_num = metadata.get("page_number") or metadata.get("page") or (i + 1)
             page_num = int(page_num)
 
             text = chunk.get("text", "").strip()
