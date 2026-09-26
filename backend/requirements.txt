@@ -8,6 +8,7 @@ pydantic-settings==2.5.2
 PyJWT[crypto]==2.9.0
 cryptography>=43.0.0
 python-magic==0.4.27
+python-magic-bin==0.4.14; sys_platform == 'win32'
 PyMuPDF==1.24.11
 pandas==2.2.3
 openpyxl==3.1.5
@@ -24,3 +25,5 @@ pytest>=8.0.0
 logfire[fastapi,asyncpg,sqlalchemy,httpx]>=5.0.0
 openai>=1.50.0
 rapidocr_onnxruntime>=1.4.0
+pymupdf4llm>=0.0.17
+pyspellchecker>=0.8.0

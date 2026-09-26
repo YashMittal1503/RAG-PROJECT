@@ -55,6 +55,8 @@ desktop.ini
 
 # Agent / Temp test files
 .agents/
+scratch/
+backend/scratch/
 sample_titan_report.txt
 *.log
 npm-debug.log*

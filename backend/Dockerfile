@@ -14,8 +14,8 @@ ENV OMP_NUM_THREADS=2 \
     NUMEXPR_NUM_THREADS=2 \
     ORT_MAX_THREADS=2 \
     ENABLE_RERANKER=true \
-    TOKENIZERS_PARALLELISM=false \
-    MALLOC_TRIM_THRESHOLD_=131072
+    ENABLE_ONNX_ARENA=true \
+    TOKENIZERS_PARALLELISM=false
 
 # Install dependencies first (layer caching)
 COPY requirements.txt .

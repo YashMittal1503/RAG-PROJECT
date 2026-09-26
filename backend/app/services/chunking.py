@@ -2,7 +2,9 @@
 Text and spreadsheet chunking logic.
 
 Two main strategies:
-1. Text chunking (PDF/TXT): paragraph-aware splitting with token-based sizing
+1. Text chunking (PDF/TXT): page-boundary-aware splitting with token-based sizing.
+   Each PDF page produces its own chunk(s) — content is NEVER merged across pages.
+   This ensures accurate page citations and respects the embedding model's context window.
 2. Spreadsheet chunking (XLSX/CSV): row-batch chunks + one summary chunk per sheet
 
 Every chunk is a ChunkData object that carries its content and metadata.
@@ -24,10 +26,13 @@ logger = logging.getLogger(__name__)
 _tokenizer = tiktoken.get_encoding("cl100k_base")
 
 # ── Chunk size parameters ─────────────────────────────────────────────────
-MIN_CHUNK_TOKENS = 200
-TARGET_CHUNK_TOKENS = 500
-MAX_CHUNK_TOKENS = 800
-OVERLAP_FRACTION = 0.10        # ~10% overlap between consecutive chunks
+# MAX_CHUNK_TOKENS = 512 matches the context window of BAAI/bge-small-en-v1.5.
+# Tokens beyond 512 are silently truncated by the embedding model, so this
+# ensures every token in a chunk is actually embedded and searchable.
+MIN_CHUNK_TOKENS = 100
+TARGET_CHUNK_TOKENS = 400
+MAX_CHUNK_TOKENS = 512
+OVERLAP_FRACTION = 0.10        # ~10% overlap between consecutive chunks within a page
 SPREADSHEET_ROWS_PER_CHUNK = 20  # Default rows per chunk for spreadsheets
 
 
@@ -80,7 +85,7 @@ def _split_into_sentences(text: str) -> list[str]:
                     w_buf: list[str] = []
                     for w in words:
                         w_buf.append(w)
-                        if len(w_buf) >= 300:  # ~380-450 tokens
+                        if len(w_buf) >= 200:  # ~250-300 tokens, safely under 512
                             sentences.append(" ".join(w_buf))
                             w_buf = []
                     if w_buf:
@@ -92,44 +97,55 @@ def _split_into_sentences(text: str) -> list[str]:
     return sentences
 
 
-def chunk_text(pages: list[PageText], filename: str = "") -> list[ChunkData]:
+def _chunk_single_page(
+    sentences: list[str],
+    page_number: int,
+    chunk_index_start: int,
+) -> list[ChunkData]:
     """
-    Chunk text content (from PDF or TXT) into overlapping chunks.
+    Chunk the sentences of a single page into one or more chunks.
 
-    Strategy:
-    1. Split all pages into sentences (with oversized sentence protection).
-    2. Pre-compute token counts to prevent redundant encoding.
-    3. Accumulate sentences into bounded chunks with smooth overlap.
-    4. Deterministic forward progress via for-loop (guaranteed no infinite loops).
+    Rules:
+    - If the page's total tokens fit within MAX_CHUNK_TOKENS, produce ONE chunk.
+    - If the page exceeds MAX_CHUNK_TOKENS, split within the page using
+      sentence-accumulation with overlap.
+    - Each chunk gets exactly this page's page_number.
+    - Overlap only happens within the same page, never across pages.
     """
+    if not sentences:
+        return []
+
+    # Fast path: check if the entire page fits in one chunk
+    total_tokens = sum(count_tokens(s) for s in sentences)
+    if total_tokens <= MAX_CHUNK_TOKENS:
+        content = " ".join(sentences)
+        return [ChunkData(
+            content=content,
+            chunk_index=chunk_index_start,
+            chunk_type="text",
+            page_number=page_number,
+            token_count=total_tokens,
+        )]
+
+    # Slow path: split the page into multiple chunks
     chunks: list[ChunkData] = []
-    chunk_index = 0
-
-    # Build list of (sentence, page_number, token_count) tuples
-    sentence_pages: list[tuple[str, int, int]] = []
-    for page in pages:
-        sentences = _split_into_sentences(page.text)
-        for sent in sentences:
-            sentence_pages.append((sent, page.page_number, count_tokens(sent)))
-
-    if not sentence_pages:
-        return chunks
-
+    chunk_index = chunk_index_start
     overlap_tokens = int(TARGET_CHUNK_TOKENS * OVERLAP_FRACTION)
+
     current_sentences: list[str] = []
     current_tokens = 0
-    current_pages: set[int] = set()
 
-    for sent, page_num, sent_tokens in sentence_pages:
+    for sent in sentences:
+        sent_tokens = count_tokens(sent)
+
         # If adding this sentence exceeds MAX_CHUNK_TOKENS and we already have content:
         if current_tokens + sent_tokens > MAX_CHUNK_TOKENS and current_sentences:
             chunk_text_content = " ".join(current_sentences)
-            primary_page = min(current_pages) if current_pages else None
             chunks.append(ChunkData(
                 content=chunk_text_content,
                 chunk_index=chunk_index,
                 chunk_type="text",
-                page_number=primary_page,
+                page_number=page_number,
                 token_count=current_tokens,
             ))
             chunk_index += 1
@@ -147,24 +163,52 @@ def chunk_text(pages: list[PageText], filename: str = "") -> list[ChunkData]:
 
             current_sentences = overlap_sents
             current_tokens = overlap_tok
-            current_pages = {page_num} if overlap_sents else set()
 
         # Add current sentence
         current_sentences.append(sent)
         current_tokens += sent_tokens
-        current_pages.add(page_num)
 
-    # Finalize remaining chunk
+    # Finalize remaining chunk for this page
     if current_sentences:
         chunk_text_content = " ".join(current_sentences)
-        primary_page = min(current_pages) if current_pages else None
         chunks.append(ChunkData(
             content=chunk_text_content,
             chunk_index=chunk_index,
             chunk_type="text",
-            page_number=primary_page,
+            page_number=page_number,
             token_count=current_tokens,
         ))
+
+    return chunks
+
+
+def chunk_text(pages: list[PageText], filename: str = "") -> list[ChunkData]:
+    """
+    Chunk text content (from PDF or TXT) into page-boundary-aware chunks.
+
+    Strategy:
+    1. Process each page independently — content NEVER crosses page boundaries.
+    2. Each page produces one or more chunks, each tagged with exact page_number.
+    3. If a page fits within MAX_CHUNK_TOKENS (512), it becomes a single chunk.
+    4. If a page exceeds MAX_CHUNK_TOKENS, it's split into multiple chunks
+       with intra-page overlap (no cross-page overlap).
+    5. This ensures citation accuracy: every chunk maps to exactly one page.
+    """
+    chunks: list[ChunkData] = []
+    chunk_index = 0
+
+    for page in pages:
+        text = page.text.strip()
+        if not text:
+            continue
+
+        sentences = _split_into_sentences(text)
+        if not sentences:
+            continue
+
+        page_chunks = _chunk_single_page(sentences, page.page_number, chunk_index)
+        chunks.extend(page_chunks)
+        chunk_index += len(page_chunks)
 
     return chunks
 

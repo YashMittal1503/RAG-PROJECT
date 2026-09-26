@@ -22,6 +22,15 @@ from app.utils.memory import release_memory
 
 logger = logging.getLogger(__name__)
 
+# ── Spell correction for typo-tolerant retrieval (Gap 5) ─────────────────
+try:
+    from spellchecker import SpellChecker
+    _spellchecker = SpellChecker()
+    _HAS_SPELLCHECKER = True
+except ImportError:
+    _spellchecker = None
+    _HAS_SPELLCHECKER = False
+
 from app.services.llm_provider import (
     call_llm_with_cross_provider_fallback as call_llm_with_fallback,
     stream_llm_with_cross_provider_fallback as stream_llm_with_fallback,
@@ -882,6 +891,58 @@ async def rewrite_query(
         return question
 
 
+# ── Spell Correction for Typo-Tolerant Retrieval ────────────────────────
+
+def correct_query_spelling(query: str) -> str:
+    """
+    Correct common misspellings in user queries for better BM25 and embedding retrieval.
+
+    Uses pyspellchecker's frequency-based correction (based on a large English word corpus).
+    Only corrects words that:
+    - Are not found in the dictionary
+    - Are purely alphabetic (preserves acronyms, codes like REQ-101, numbers)
+    - Have a reasonable correction candidate (edit distance ≤ 2)
+
+    Examples: "stalkholders" → "stakeholders", "managment" → "management"
+    """
+    if not _HAS_SPELLCHECKER or not query:
+        return query
+
+    words = query.split()
+    corrected_words = []
+    any_corrected = False
+
+    for word in words:
+        # Skip non-alphabetic words (numbers, codes, acronyms, mixed-case identifiers)
+        stripped = word.strip(".,!?;:'\"()[]{}/-")
+        if not stripped.isalpha() or len(stripped) <= 2:
+            corrected_words.append(word)
+            continue
+
+        # Check if the word is misspelled
+        if stripped.lower() in _spellchecker:
+            corrected_words.append(word)
+            continue
+
+        # Get the best correction candidate
+        correction = _spellchecker.correction(stripped.lower())
+        if correction and correction != stripped.lower():
+            # Preserve original casing pattern
+            if stripped[0].isupper():
+                correction = correction.capitalize()
+            # Replace only the stripped part, preserving surrounding punctuation
+            prefix = word[:word.find(stripped)]
+            suffix = word[word.find(stripped) + len(stripped):]
+            corrected_words.append(f"{prefix}{correction}{suffix}")
+            any_corrected = True
+        else:
+            corrected_words.append(word)
+
+    if any_corrected:
+        return " ".join(corrected_words)
+    return query
+
+
 # ── Retrieve chunks ───────────────────────────────────────────────────────
 
 async def retrieve_chunks(
@@ -893,15 +954,25 @@ async def retrieve_chunks(
 ) -> list[dict]:
     """
     Retrieve relevant chunks for answering the question.
+    Applies spell correction before embedding/BM25 for typo tolerance.
 
     1. Embed the query
     2. Search Qdrant for top-K similar chunks (optionally scoped to a specific document)
     3. If aggregation detected, also fetch summary chunks and prepend them
     """
     with logfire.span("🔍 Hybrid Retrieval | '{q_short}'", q_short=question[:50], question=question, is_aggregation=is_aggregation, doc_id_filter=doc_id_filter) as span:
+        # Apply spell correction for typo-tolerant BM25 and embedding retrieval
+        corrected_question = correct_query_spelling(question)
+        if corrected_question != question:
+            logger.info(f"Spell-corrected query: '{question}' → '{corrected_question}'")
+            span.set_attribute("spell_corrected", True)
+            span.set_attribute("original_question", question)
+        else:
+            span.set_attribute("spell_corrected", False)
+
         # Embed the query with dense vector (semantic) and sparse BM25 vector (keyword)
-        query_vector = embedding.embed_query(question)
-        query_sparse = embedding.embed_sparse_query(question)
+        query_vector = embedding.embed_query(corrected_question)
+        query_sparse = embedding.embed_sparse_query(corrected_question)
 
         # Hybrid candidate retrieval (Dense + BM25 via server-side RRF) — top 15 candidates
         candidates = await vector_store.search(
@@ -982,7 +1053,8 @@ async def retrieve_chunks(
                             new_leads = [c for c in lead_chunks if c["id"] not in result_ids]
                             # Prepend lead chunks so document title/author/intro context comes first
                             results = new_leads + results
-                            results = results[:5]
+                            # Keep generous results — reranker already scored them
+                            results = results[:10]
                             span.set_attribute("lead_chunks_added", len(new_leads))
                             logger.info(f"Added {len(new_leads)} lead chunks for document {doc_id_filter}")
                 except Exception as e:
@@ -997,21 +1069,24 @@ async def retrieve_chunks(
 SYSTEM_PROMPT = """You are a helpful document Q&A assistant. Your job is to answer questions based ONLY on the provided context chunks from the user's uploaded documents.
 
 RULES:
-1. Answer ONLY using information from the provided context chunks.
+1. Answer ONLY using information explicitly stated in the provided context chunks. Do NOT infer, speculate, synthesize, or add information beyond what is directly supported by the context.
 2. If asked about a document (e.g. "Tell me about [book/doc]", "What is this file/paper about?", "Summarize [doc]"):
-   - Synthesize a comprehensive, well-structured overview using all available details from the provided context chunks (title, author, premise, key characters, main topics, themes, and visible excerpts).
-   - Be transparent and helpful about what is described in the uploaded document excerpts.
-   - ONLY say: "I don't have enough information in the uploaded documents to answer this question." if the context chunks are completely empty, unreadable, or completely unrelated to the question.
+   - Provide a well-structured overview using ONLY the details explicitly present in the provided context chunks.
+   - Be transparent about what the context chunks contain.
+   - If the context chunks do not contain enough information to fully answer, clearly state what information IS available and what is missing, rather than filling gaps with assumptions.
 3. When citing information, ALWAYS cite the page number or row range in square brackets, for example: [Page 4] or [Page 12]. For spreadsheets, cite the row range like [Rows 1-50]. For summary chunks, cite [Summary].
+   CRITICAL: The page numbers in the context tags (e.g. [Page X]) correspond to the ACTUAL page numbers of the source PDF. Always use these exact page numbers in your citations.
    CRITICAL: NEVER output chunk UUIDs, IDs, or write [CHUNK ...]. Always use the human-readable [Page X] or [Summary] tag.
-4. Format your answers in clean, beautiful Markdown:
+4. Format your answers in clean Markdown:
    - Use bold (**text**) for important terms and subheadings.
    - Use bullet points (* or -) or numbered lists for structure.
    - Use Markdown headings (e.g. ### Section Name) to organize long responses.
    - Place citations like [Page 3] directly after the relevant sentence or bullet point.
-5. Do NOT make up, hallucinate, or infer information that is not explicitly stated in or supported by the context.
+   - NEVER use raw HTML tags such as <br>, <p>, <div>, <span>, <table>, <tr>, <td>, or any other HTML elements. Use ONLY standard Markdown syntax.
+5. Do NOT make up, hallucinate, or infer information that is not explicitly stated in or supported by the context. If information is not in the context, say "This information is not available in the provided document excerpts" rather than guessing.
 6. NEVER claim, pretend, or hallucinate that you performed a web search. You do not have external web access and must answer solely from the provided document context.
-7. Be concise, accurate, and professional."""
+7. Be concise, accurate, and professional.
+8. When quoting specific facts, numbers, names, or claims, use the exact wording from the context chunks as closely as possible."""
 
 
 # ── Contextual Compression ────────────────────────────────────────────────
@@ -1143,7 +1218,7 @@ def compress_chunk_content(
 def _build_context(
     chunks: list[dict],
     query: str = "",
-    max_context_tokens: int = 4000,
+    max_context_tokens: int = 6000,
     enable_compression: bool = True,
 ) -> str:
     """

@@ -81,9 +81,8 @@ def rerank_chunks(
     """
     Rerank a list of retrieved chunks using FlashRank cross-encoder.
 
-    When settings.enable_reranker is False (default for 512MB memory environments),
-    gracefully passes through Qdrant Cloud's server-side Hybrid RRF ranking,
-    consuming 0 MB of container RAM.
+    When settings.enable_reranker is False, gracefully passes through
+    Qdrant Cloud's server-side Hybrid RRF ranking.
 
     Each chunk dict must have 'content' or 'text'.
     Returns the top_k reranked chunks with updated 'rerank_score' and re-sorted.
@@ -92,7 +91,7 @@ def rerank_chunks(
     if not chunks or len(chunks) <= 1:
         return chunks
 
-    # Zero-memory path for 512MB RAM containers: rely directly on Qdrant's Hybrid RRF
+    # Passthrough path: rely directly on Qdrant's Hybrid RRF ranking
     if not settings.enable_reranker:
         logger.debug(
             f"Reranking skipped (settings.enable_reranker=False). "
@@ -103,16 +102,16 @@ def rerank_chunks(
     try:
         ranker = get_ranker()
 
-        # Bound candidates to top_k * 2 (max 6) to avoid multi-chunk BERT cross-encoder spikes
-        eval_chunks = chunks[: min(len(chunks), top_k * 2, 6)]
+        # Evaluate ALL candidates from vector search — no artificial cap.
+        # With 512-token chunks, FlashRank handles the full content efficiently.
+        eval_chunks = chunks
 
         passages = []
         chunk_map = {}
         for i, chunk in enumerate(eval_chunks):
             chunk_id = chunk.get("id") or str(i)
-            # Truncate text to 350 chars (~70 words). Drastically minimizes BERT quadratic
-            # attention memory overhead while preserving the core topical relevance.
-            text = (chunk.get("content") or chunk.get("text") or "")[:350]
+            # Pass full chunk text to the cross-encoder for accurate relevance scoring
+            text = chunk.get("content") or chunk.get("text") or ""
             passages.append({"id": str(chunk_id), "text": text})
             chunk_map[str(chunk_id)] = chunk
 

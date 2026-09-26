@@ -41,8 +41,8 @@ class Settings(BaseSettings):
     embedding_dim: int = 384
     enable_reranker: bool = True
     embedding_threads: int = 2
-    enable_onnx_arena: bool = False
-    embed_batch_size: int = 16
+    enable_onnx_arena: bool = True
+    embed_batch_size: int = 32
 
     # ── Tabular Data Store (DuckDB) ───────────────────────────────────────
     duckdb_memory_limit: str = "256MB"

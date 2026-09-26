@@ -3,6 +3,12 @@ Document parsers for PDF, TXT, and spreadsheet (XLSX/CSV) files.
 
 Each parser takes raw file bytes and returns structured content
 ready for the chunking step.
+
+PDF parsing strategy:
+1. Primary: pymupdf4llm.to_markdown() for layout-aware extraction that
+   preserves multi-column reading order and converts tables to Markdown.
+2. Fallback: PyMuPDF native text extraction if pymupdf4llm fails.
+3. OCR fallback: RapidOCR for scanned/image-only pages.
 """
 
 import io
@@ -122,21 +128,110 @@ def _ocr_page(page: fitz.Page) -> str:
             del pix
 
 
+def _extract_with_pymupdf4llm(file_bytes: bytes) -> list[PageText] | None:
+    """
+    Extract PDF text using pymupdf4llm for layout-aware, structure-preserving extraction.
+
+    Returns a list of PageText objects (one per page) with Markdown-formatted text
+    that preserves:
+    - Multi-column reading order
+    - Tables as Markdown tables
+    - Headers and document structure
+
+    Returns None if pymupdf4llm is not available or fails entirely.
+    """
+    try:
+        import pymupdf4llm
+    except ImportError:
+        logger.warning("pymupdf4llm not installed — falling back to PyMuPDF native extraction")
+        return None
+
+    doc = None
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        if doc.is_encrypted:
+            # Let native handler manage encrypted docs/passwords
+            doc.close()
+            return None
+
+        total_pages = len(doc)
+        if total_pages == 0:
+            doc.close()
+            return None
+
+        # Use page_chunks=True to get per-page extraction with metadata
+        page_chunks = pymupdf4llm.to_markdown(doc, page_chunks=True)
+        if not page_chunks:
+            doc.close()
+            return None
+
+        pages: list[PageText] = []
+        for i, chunk in enumerate(page_chunks):
+            # pymupdf4llm returns dicts with 'metadata' and 'text' keys
+            metadata = chunk.get("metadata", {})
+            page_num = metadata.get("page_number")
+            if page_num is None:
+                page_num = (metadata.get("page") + 1) if metadata.get("page") is not None else (i + 1)
+            page_num = int(page_num)
+
+            text = chunk.get("text", "").strip()
+
+            # If pymupdf4llm produced no text, check if native OCR can find text on this page
+            if not text:
+                try:
+                    page = doc[page_num - 1]
+                    ocr_text = _ocr_page(page).strip()
+                    if ocr_text:
+                        text = ocr_text
+                    else:
+                        text = f"[Page {page_num}: Non-text graphic, illustration, or blank page]"
+                except Exception:
+                    text = f"[Page {page_num}: Non-text graphic, illustration, or blank page]"
+
+            pages.append(PageText(page_number=page_num, text=text))
+
+        doc.close()
+        doc = None
+
+        if len(pages) == total_pages:
+            logger.info(f"pymupdf4llm extracted {len(pages)} pages with layout-aware Markdown")
+            return pages
+
+        return None
+
+    except Exception as e:
+        logger.warning(f"pymupdf4llm extraction failed: {e} — falling back to PyMuPDF native")
+        return None
+    finally:
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+        unload_ocr_engine()
+
+
 def parse_pdf(file_bytes: bytes) -> list[PageText]:
     """
-    Extract text from a PDF page by page with multi-tier layout and OCR fallback.
+    Extract text from a PDF page by page with multi-tier extraction strategy.
 
-    1. Checks for empty byte streams.
-    2. Opens with PyMuPDF; attempts decryption with blank passwords if encrypted.
-    3. Extracts text using layout-aware reading order (sort=True) to preserve multi-column formatting.
-    4. If a page has < 50 characters of native text, falls back to embedded RapidOCR on that page.
-    5. If a page is purely an illustration/blank, produces a clean metadata placeholder.
-    6. Catches page-level errors individually so a corrupt page never aborts the document.
-    7. In the finally block, closes PyMuPDF handles and purges RapidOCR from RAM.
+    Strategy (in priority order):
+    1. pymupdf4llm: Layout-aware extraction that preserves tables, multi-column
+       reading order, and document structure as clean Markdown.
+    2. PyMuPDF native: Standard text extraction with sort=True for reading order.
+    3. RapidOCR: For scanned/image-only pages with < 50 characters of native text.
+
+    Catches page-level errors individually so a corrupt page never aborts the document.
     """
     if not file_bytes or len(file_bytes) == 0:
         raise ValueError("The uploaded PDF file is completely empty (0 bytes).")
 
+    # ── Strategy 1: Try pymupdf4llm for structured extraction ─────────
+    pymupdf4llm_pages = _extract_with_pymupdf4llm(file_bytes)
+    if pymupdf4llm_pages:
+        return pymupdf4llm_pages
+
+    # ── Strategy 2: PyMuPDF native extraction (fallback) ──────────────
     doc = None
     try:
         try:

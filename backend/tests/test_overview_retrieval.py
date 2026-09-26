@@ -42,6 +42,7 @@ class TestRerankerCandidateRetention:
 
         mock_ranker = MagicMock()
         # Mock cross-encoder returning tiny scores (< 0.001) as often happens for prose
+        # With the cap removed, all 10 candidates are now evaluated by the reranker
         mock_ranker.rerank.return_value = [
             {"id": f"chunk-{i}", "score": 0.0005 - (i * 0.00004)}
             for i in range(10)

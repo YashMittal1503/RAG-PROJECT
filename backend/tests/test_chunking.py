@@ -2,8 +2,9 @@
 Tests for text and spreadsheet chunking logic.
 
 Validates:
-- Chunk size bounds (token count within target range)
-- Overlap between consecutive chunks
+- Page-boundary-aware chunking (each page produces its own chunks)
+- Chunk size bounds (token count within 512-token limit)
+- No cross-page content merging
 - Spreadsheet summary chunk generation with correct aggregates
 - Column headers present in every row-level chunk
 """
@@ -40,7 +41,7 @@ class TestCountTokens:
 
 
 class TestChunkText:
-    """Tests for text chunking (PDF/TXT)."""
+    """Tests for text chunking (PDF/TXT) with page-boundary awareness."""
 
     def test_short_text_single_chunk(self):
         """Short text should produce exactly one chunk."""
@@ -51,8 +52,8 @@ class TestChunkText:
         assert chunks[0].page_number == 1
 
     def test_long_text_multiple_chunks(self):
-        """Long text should be split into multiple chunks."""
-        # Generate text that's definitely longer than MAX_CHUNK_TOKENS
+        """Long text on a single page should be split into multiple chunks."""
+        # Generate text that's definitely longer than MAX_CHUNK_TOKENS (512)
         long_text = " ".join(["This is a sentence for testing purposes."] * 200)
         pages = [PageText(page_number=1, text=long_text)]
         chunks = chunk_text(pages)
@@ -80,6 +81,41 @@ class TestChunkText:
         chunks = chunk_text(pages)
         assert all(c.page_number is not None for c in chunks)
 
+    def test_page_boundary_no_cross_page_merging(self):
+        """Each page should produce its own chunk(s) — never merged across pages."""
+        pages = [
+            PageText(page_number=1, text="Short content on page one."),
+            PageText(page_number=2, text="Short content on page two."),
+            PageText(page_number=3, text="Short content on page three."),
+        ]
+        chunks = chunk_text(pages)
+
+        # Each short page should produce exactly one chunk
+        assert len(chunks) == 3
+
+        # Each chunk should have exactly the page number it came from
+        assert chunks[0].page_number == 1
+        assert chunks[1].page_number == 2
+        assert chunks[2].page_number == 3
+
+        # Content should NOT leak across pages
+        assert "page one" in chunks[0].content
+        assert "page two" in chunks[1].content
+        assert "page three" in chunks[2].content
+        assert "page two" not in chunks[0].content
+        assert "page one" not in chunks[1].content
+
+    def test_long_page_splits_within_page(self):
+        """A page exceeding MAX_CHUNK_TOKENS should be split, but all chunks keep the same page_number."""
+        long_text = " ".join(["This is a test sentence with several words in it."] * 200)
+        pages = [PageText(page_number=5, text=long_text)]
+        chunks = chunk_text(pages)
+
+        assert len(chunks) > 1
+        # ALL chunks from this page should have page_number=5
+        for chunk in chunks:
+            assert chunk.page_number == 5
+
     def test_chunk_text_from_string(self):
         """The string convenience wrapper should work for TXT files."""
         text = "A simple text file content."
@@ -100,6 +136,21 @@ class TestChunkText:
         assert len(chunks) > 1
         for chunk in chunks:
             assert chunk.token_count <= MAX_CHUNK_TOKENS + 50
+
+    def test_max_chunk_tokens_is_512(self):
+        """MAX_CHUNK_TOKENS should be 512 to match BGE-small-en-v1.5 context window."""
+        assert MAX_CHUNK_TOKENS == 512
+
+    def test_chunk_indices_sequential(self):
+        """Chunk indices should be sequential across all pages."""
+        pages = [
+            PageText(page_number=1, text="Content on page one."),
+            PageText(page_number=2, text="Content on page two."),
+            PageText(page_number=3, text="Content on page three."),
+        ]
+        chunks = chunk_text(pages)
+        for i, chunk in enumerate(chunks):
+            assert chunk.chunk_index == i
 
 
 class TestChunkSpreadsheet:
