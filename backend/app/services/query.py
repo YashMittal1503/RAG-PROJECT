@@ -1089,8 +1089,12 @@ RULES:
 7. Be concise, accurate, and professional.
 8. When quoting specific facts, numbers, names, or claims, use the exact wording from the context chunks as closely as possible.
 9. Distinguish between Problems/Challenges and Solutions/Features:
-   - When asked for "problems", "challenges", "pain points", or "issues", extract and state the explicit problem statements, root causes, and hurdles described in the document.
-   - Do NOT substitute or describe proposed solutions or planned features (e.g., "they plan to...", "they will...", "they aim to provide...") as the problems when the source document explicitly specifies the actual problems."""
+   - When asked for "problems", "challenges", "pain points", or "issues", you MUST extract and state ONLY the explicit problem statements, root causes, and hurdles as described in the document.
+   - Problems are negative conditions that exist BEFORE a solution is proposed. Look for language like: "lack of", "no access to", "students struggle with", "X is unavailable", "gap in", "insufficient", "difficulty in", "barrier to", "absence of", "limited", "rising rates of", "unable to".
+   - Do NOT describe proposed solutions, planned features, or future goals (e.g., "they plan to...", "they will...", "they aim to provide...", "the platform offers...") as problem statements.
+   - Example of WRONG answer to "what are the problems?": "They aim to provide accessible mental health resources" — this describes a SOLUTION, not a problem.
+   - Example of CORRECT answer to "what are the problems?": "Students lack accessible mental health resources" or "Rising anxiety and isolation among students" — these describe actual PROBLEMS.
+   - When the document contains both problems and solutions, ALWAYS present the actual problems first, clearly labeled, before mentioning any solutions."""
 
 
 # ── Contextual Compression ────────────────────────────────────────────────
@@ -1117,19 +1121,69 @@ COMPRESSION_STOP_WORDS = {
     "yourself", "yourselves",
 }
 
+# Semantic synonym expansion map — when the query mentions a concept (key),
+# also match sentences containing any of the synonym words (values).
+# This prevents compression from stripping out problem-description sentences
+# that use domain vocabulary instead of the literal query keyword.
+_SEMANTIC_SYNONYMS: dict[str, set[str]] = {
+    "problem": {"challenge", "issue", "difficulty", "struggle", "barrier",
+                "obstacle", "hurdle", "gap", "lack", "shortage", "crisis",
+                "concern", "risk", "threat", "limitation", "weakness",
+                "pain", "frustration", "anxiety", "isolation", "stress",
+                "burden", "deficit", "failure", "bottleneck", "drawback"},
+    "problems": {"challenges", "issues", "difficulties", "struggles", "barriers",
+                 "obstacles", "hurdles", "gaps", "lacks", "shortages", "crises",
+                 "concerns", "risks", "threats", "limitations", "weaknesses",
+                 "pains", "frustrations", "anxieties", "deficits", "failures",
+                 "bottlenecks", "drawbacks"},
+    "challenge": {"problem", "issue", "difficulty", "struggle", "barrier",
+                  "obstacle", "hurdle", "gap", "lack", "limitation"},
+    "challenges": {"problems", "issues", "difficulties", "struggles", "barriers",
+                   "obstacles", "hurdles", "gaps", "limitations"},
+    "issue": {"problem", "challenge", "difficulty", "concern", "bug", "defect",
+              "flaw", "gap", "risk"},
+    "issues": {"problems", "challenges", "difficulties", "concerns", "bugs",
+               "defects", "flaws", "gaps", "risks"},
+    "solution": {"approach", "strategy", "method", "fix", "remedy", "resolution",
+                 "mitigation", "plan", "proposal", "recommendation", "intervention"},
+    "solutions": {"approaches", "strategies", "methods", "fixes", "remedies",
+                  "resolutions", "mitigations", "plans", "proposals",
+                  "recommendations", "interventions"},
+    "feature": {"capability", "functionality", "module", "component", "tool",
+                "service", "offering"},
+    "features": {"capabilities", "functionalities", "modules", "components",
+                 "tools", "services", "offerings"},
+    "goal": {"objective", "aim", "target", "mission", "purpose", "vision"},
+    "goals": {"objectives", "aims", "targets", "missions", "purposes"},
+    "benefit": {"advantage", "strength", "gain", "improvement", "value", "impact"},
+    "benefits": {"advantages", "strengths", "gains", "improvements", "values", "impacts"},
+}
+
+
+def _expand_query_with_synonyms(q_set: set[str]) -> set[str]:
+    """Expand query keywords with semantic synonyms for better compression matching."""
+    expanded = set(q_set)
+    for word in q_set:
+        if word in _SEMANTIC_SYNONYMS:
+            expanded |= _SEMANTIC_SYNONYMS[word]
+    return expanded
+
 
 def compress_chunk_content(
     content: str,
     query: str,
-    max_sentences: int = 5,
+    max_sentences: int = 8,
     window_size: int = 2,
 ) -> str:
     """
     Extractively compresses a text chunk by retaining only sentences relevant to the query,
     expanded with adjacent sentence context (±2) to ensure grammatical and narrative continuity.
 
+    Uses semantic synonym expansion so queries about "problems" also match sentences
+    describing challenges, barriers, struggles, etc.
+
     Returns the original content unmodified if:
-    - The chunk is already concise (<= 6 sentences).
+    - The chunk is already concise (<= 10 sentences).
     - The query is too short (<= 4 meaningful words) for reliable keyword matching.
     - No significant query term matches are found (failsafe to prevent accidental data loss).
     """
@@ -1145,8 +1199,8 @@ def compress_chunk_content(
     from app.services.chunking import _split_into_sentences
     sentences = _split_into_sentences(content)
 
-    # Do not compress already compact chunks
-    if len(sentences) <= 6:
+    # Do not compress already compact chunks (raised from 6 → 10 to reduce data loss)
+    if len(sentences) <= 10:
         return content
 
     # Extract meaningful query keywords (alphanumeric, length > 1, not stop words)
@@ -1159,6 +1213,9 @@ def compress_chunk_content(
 
     q_set = set(q_tokens)
 
+    # Expand query keywords with semantic synonyms for better recall
+    q_set_expanded = _expand_query_with_synonyms(q_set)
+
     # Score each sentence
     scored: list[tuple[float, int]] = []
     for i, s in enumerate(sentences):
@@ -1168,15 +1225,22 @@ def compress_chunk_content(
             continue
         s_set = set(s_tokens)
 
-        # 1. Exact query keyword overlap count
-        overlap = len(q_set & s_set)
-        if overlap == 0:
+        # 1. Exact query keyword overlap (original keywords)
+        exact_overlap = len(q_set & s_set)
+
+        # 2. Expanded synonym overlap (lower weight than exact match)
+        synonym_overlap = len((q_set_expanded - q_set) & s_set)
+
+        # Combined overlap: exact matches worth full weight, synonym matches worth 0.6x
+        combined_overlap = exact_overlap + (synonym_overlap * 0.6)
+
+        if combined_overlap == 0:
             continue
 
-        # 2. Density bonus: higher score if matching words form a bigger fraction of the sentence
-        density = overlap / len(s_set)
+        # 3. Density bonus: higher score if matching words form a bigger fraction of the sentence
+        density = combined_overlap / len(s_set)
 
-        # 3. Exact phrase match bonus (if 2+ consecutive query words appear verbatim in sentence)
+        # 4. Exact phrase match bonus (if 2+ consecutive query words appear verbatim in sentence)
         phrase_bonus = 0.0
         if len(q_tokens) >= 2:
             for j in range(len(q_tokens) - 1):
@@ -1184,7 +1248,7 @@ def compress_chunk_content(
                 if bigram in s_lower:
                     phrase_bonus += 1.5
 
-        total_score = overlap + (density * 2.0) + phrase_bonus
+        total_score = combined_overlap + (density * 2.0) + phrase_bonus
         scored.append((total_score, i))
 
     # If no sentences matched, return full content safely (zero data loss)
