@@ -1,4 +1,4 @@
-# DocTalk — Enterprise-Grade Dual-Engine AI Document & Tabular RAG System
+# DocTalk — Enterprise-Grade Dual-Engine Document & Tabular RAG System
 
 [![CI](https://github.com/YashMittal1503/RAG-PROJECT/actions/workflows/ci.yml/badge.svg)](https://github.com/YashMittal1503/RAG-PROJECT/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
