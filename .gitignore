@@ -71,3 +71,8 @@ backend/data/
 # Evaluation raw dumps (scores are summarized in README.md)
 backend/ragas_raw_results.json
 backend/ragas_results.json
+
+# Eval harness outputs and downloaded corpora
+backend/eval/runs/
+backend/eval/data/corpus/
+backend/eval/data/corpus.yaml

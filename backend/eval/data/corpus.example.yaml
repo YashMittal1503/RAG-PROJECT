@@ -1,0 +1,22 @@
+# Example manifest for the real golden corpus. Copy to corpus.yaml and fill in.
+# Paths are relative to this file. Files with a `url` are downloaded on first use;
+# add `sha256` after the first download so the corpus can't change silently.
+# Large or downloaded files under eval/data/corpus/ are gitignored.
+documents:
+  - id: gatsby
+    title: The Great Gatsby
+    path: corpus/the_great_gatsby.txt
+    url: https://www.gutenberg.org/cache/epub/64317/pg64317.txt
+    # sha256: <fill in after first download>
+    doc_type: novel
+
+  - id: wuthering
+    title: Wuthering Heights
+    path: corpus/wuthering_heights.txt
+    url: https://www.gutenberg.org/cache/epub/768/pg768.txt
+    doc_type: novel
+
+  - id: example_paper
+    title: An arXiv paper (CC-BY)
+    path: corpus/example_paper.pdf
+    doc_type: paper

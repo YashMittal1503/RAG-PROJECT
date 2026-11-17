@@ -318,7 +318,18 @@ backend/tests/test_parsing.py ..                                         [100%]
 
 ---
 
-## Running Dynamic RAGAS Evaluation
+## Evaluation Harness
+
+Architecture comparisons and regression checks use the evaluation harness in [`backend/eval/`](backend/eval/README.md). It runs on a hand-verified golden dataset with an isolated eval tenant, and reports per-category metrics (judge correctness, evidence recall, MRR, citations, abstention, routing, latency) with confidence intervals and paired run-vs-run comparison.
+
+```bash
+cd backend
+python -m eval run --system vanilla
+```
+
+## Running Dynamic RAGAS Evaluation (legacy)
+
+> **Legacy:** superseded by `backend/eval/`. `ragas_eval.py` generates single-chunk synthetic questions with a 3B model and grades them with the same model, so its scores aren't comparable across architectures.
 
 The project includes an autonomous RAGAS evaluation harness (`ragas_eval.py`):
 

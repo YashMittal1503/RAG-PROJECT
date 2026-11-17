@@ -1,0 +1,11 @@
+# Smoke-test corpus: two short original texts written for this harness (no copyright concerns).
+# It exists to prove the harness works end to end, not to measure quality.
+documents:
+  - id: lighthouse
+    title: The Lighthouse at Gull Point
+    path: smoke_corpus/lighthouse_keeper.txt
+    doc_type: fiction
+  - id: rules
+    title: Harbour Board Regulations for Lighthouse Keepers
+    path: smoke_corpus/harbour_board_rules.txt
+    doc_type: regulation
