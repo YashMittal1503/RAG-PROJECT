@@ -3,29 +3,42 @@ Adapter for the current production pipeline (app/services/query.py), run against
 the isolated eval tenant. It calls the same functions the chat endpoint
 (app/routers/chat.py) calls, in the same order, without the database or SSE layer:
 
-  classify_intent → analyze_document_scope → rewrite_query
-    → detect_aggregation → retrieve_chunks → generate_answer_stream → validate_citations
+  classify_query → analyze_document_scope → rewrite_query
+    → [spreadsheet in scope] tabular_qa.plan_tabular_answer → stream_tabular_answer
+    → retrieve_chunks(is_overview) → generate_answer_stream → validate_citations
 
-Known gaps vs. production:
-- The lead-chunk lookup inside retrieve_chunks reads Postgres. Without a DB it
-  logs a warning and continues, so overview questions get slightly less context
-  than in production.
-- Spreadsheet / Text-to-SQL routing is not exercised yet (the eval corpus is PDF/TXT only).
+The query classification (intent, scope, aggregation) is recorded on the prediction
+so the harness can score it against an item's expected_scope / expected_aggregation.
+
+Retrieval reads only Qdrant (and DuckDB for spreadsheets), so the eval tenant sees
+exactly what production sees; nothing in the query path touches Postgres.
 """
 
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Any
 
 from eval.corpus import CorpusDoc, eval_user_id, index_corpus
-from eval.schema import Citation, GoldItem, Prediction, RetrievedContext
+from eval.schema import Citation, GoldItem, Prediction, RetrievedContext, SQLResult
 from eval.systems.base import RAGSystem
 
 NO_CHUNKS_MESSAGE = (
     "I searched through your uploaded documents, but couldn't find any relevant sections "
     "answering your question."
 )
+
+
+def _json_safe(v: Any) -> Any:
+    """DuckDB returns Decimal, date and similar types; keep numbers numeric and stringify the rest."""
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    from decimal import Decimal
+
+    if isinstance(v, Decimal):
+        return float(v)
+    return str(v)
 
 
 class VanillaRAG(RAGSystem):
@@ -53,7 +66,7 @@ class VanillaRAG(RAGSystem):
 
     def _library(self) -> list[dict]:
         return [
-            {"id": d.uuid, "filename": d.filename, "file_type": d.file_type, "is_tabular": False, "chunk_count": None}
+            {"id": d.uuid, "filename": d.filename, "file_type": d.file_type, "is_tabular": d.is_tabular, "chunk_count": None}
             for d in self.docs
         ]
 
@@ -76,9 +89,10 @@ class VanillaRAG(RAGSystem):
 
         try:
             t0 = time.perf_counter()
-            intent = await q.classify_intent(item.question, history)
+            qc = await q.classify_query(item.question, history)
             _tick("intent", t0)
-            if intent == "chitchat":
+            pred.intent, pred.query_scope, pred.aggregation = qc.intent, qc.scope, qc.aggregation
+            if qc.intent == "chitchat":
                 t0 = time.perf_counter()
                 text = "".join([tok async for tok in q.generate_direct_response(item.question, history)])
                 _tick("generate", t0)
@@ -86,7 +100,13 @@ class VanillaRAG(RAGSystem):
                 return pred
 
             t0 = time.perf_counter()
-            scope = await q.analyze_document_scope(item.question, history, self._library())
+            from app.services.tabular_qa import attach_tabular_profiles
+
+            from app.services.doc_profiles import attach_document_profiles
+
+            library = await attach_tabular_profiles(self.user_id, self._library())
+            library = await attach_document_profiles(self.user_id, library)
+            scope = await q.analyze_document_scope(item.question, history, library)
             _tick("scope", t0)
             if scope.status in ("no_documents", "needs_clarification"):
                 pred.route = "no_documents" if scope.status == "no_documents" else "clarify"
@@ -103,12 +123,20 @@ class VanillaRAG(RAGSystem):
             rewritten = await q.rewrite_query(effective_q, history)
             _tick("rewrite", t0)
 
+            # Text-to-SQL, exactly as chat.py: only when scope resolved to a spreadsheet,
+            # and never falling through to vector retrieval for a spreadsheet.
+            from app.services import tabular_qa as tq
+
+            if scope.is_tabular and await tq.check_tabular_data(self.user_id):
+                if await self._answer_tabular(tq, pred, scope, rewritten, history, qc, timings):
+                    return pred
+
             pred.route = "rag"
             t0 = time.perf_counter()
             chunks = await q.retrieve_chunks(
                 user_id=self.user_id,
                 question=rewritten,
-                is_aggregation=q.detect_aggregation(rewritten),
+                is_overview=qc.is_overview,
                 doc_id_filter=doc_filter,
                 filename_filter=filename_filter,
             )
@@ -144,3 +172,27 @@ class VanillaRAG(RAGSystem):
         finally:
             pred.timings_ms = timings
         return pred
+
+    async def _answer_tabular(self, tq, pred: Prediction, scope, rewritten: str, history: list[dict], qc,
+                              timings: dict[str, float]) -> bool:
+        """The production spreadsheet path. False means no schema: fall through to RAG, as chat.py does."""
+        doc_uuid = uuid.UUID(scope.target_doc_id) if scope.target_doc_id else None
+        plan = await tq.plan_tabular_answer(self.user_id, rewritten, doc_uuid, qc, history)
+        if plan is None:
+            return False
+        timings.update(plan.timings_ms)
+        pred.route, pred.sql, pred.sql_error = plan.route, plan.sql, plan.sql_error
+        if plan.route == "sql" and plan.result is not None:
+            pred.sql_result = SQLResult(
+                columns=[str(c) for c in plan.result.get("columns", [])],
+                rows=[[_json_safe(v) for v in r] for r in plan.result.get("rows", [])],
+                truncated=bool(plan.result.get("truncated")),
+            )
+            context = f"SQL: {plan.sql}\n\nResult:\n{tq.format_sql_result(plan.result)}"
+        else:
+            context = plan.schema_info
+        pred.contexts = [RetrievedContext(text=context, doc=pred.chosen_doc)]
+        t0 = time.perf_counter()
+        pred.answer = "".join([tok async for tok in tq.stream_tabular_answer(plan, rewritten, scope.target_filename or "")])
+        timings["generate"] = round((time.perf_counter() - t0) * 1000, 1)
+        return True

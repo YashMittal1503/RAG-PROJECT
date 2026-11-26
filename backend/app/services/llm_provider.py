@@ -2,16 +2,23 @@
 Resilient Multi-Key & Cross-Provider LLM Orchestration Service.
 
 Features:
-- Multi-tier provider failover: Groq (Tier 1) -> Google Gemini (Tier 2) -> OpenRouter (Tier 3)
+- Multi-tier provider failover: Groq -> NVIDIA NIM -> Mistral -> Google Gemini -> OpenRouter
 - Multi-key rotation per tier: Supports at least 3 API keys per provider tier
 - Round-robin load distribution across healthy keys
-- 429 / TPM / RPM rate-limit quarantine with automatic cooldown
+- 429 / TPM / RPM rate-limit quarantine with automatic cooldown, per (key, model): free tiers
+  such as Groq limit each model separately, so a limit on one model doesn't block the others
+- Models that no longer exist (404 / decommissioned) are skipped without quarantining the key
+- Keys that are not cooling down are tried across every tier before any cooling key is retried
 - Automatic intra-tier key rotation before escalating across providers
 - Standardized streaming and non-streaming responses with Logfire telemetry and key masking
 """
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import json
 import logging
+import os
+import re
 import time
 from typing import Any, AsyncGenerator, Callable, List, Optional
 
@@ -34,14 +41,161 @@ def mask_key(key: str) -> str:
     return f"{key[:4]}...{key[-4:]}"
 
 
+# ── Provider quirks and error classification (ported from the llm-key-pool router) ────────────────
+
+# max_request_tokens: largest request one call may carry (Groq free tier: 8K tokens/minute per model, so a
+# bigger request can never succeed and must not cool keys). daily_reset: when daily quotas reset.
+PROVIDER_LIMITS: dict = {
+    "groq": {"max_request_tokens": 8000},
+    "gemini": {"daily_reset": "America/Los_Angeles"},   # Gemini daily quotas reset at midnight Pacific
+    "openrouter": {"daily_reset": "UTC"},
+}
+DAILY_FALLBACK_SECONDS = 3600.0   # daily limit, no reset time known: look again in an hour
+DAILY_MIN_SECONDS = 60.0
+RATE_FALLBACK_SECONDS = 60.0      # per-minute limit, no hint given
+LAST_RESORT_MAX_WAIT = 120.0      # a key cooling longer than this is not worth a "last resort" call
+
+_TRUE = {"1", "true", "yes", "on"}
+# "(?<![\w/.-])tpm(?![\w/-])", not "\btpm\b": a hyphen is a word boundary, so "\brpm\b" matches ".../rpm-docs".
+_RATE_RE = re.compile(r"rate[ _-]?limit|too many requests|per[ _-]?minute|(?<![\w/.-])[rt]pm(?![\w/-])")
+_DAILY_RE = re.compile(r"per[ _-]?day|(?<![\w/.-])[rt]pd(?![\w/-])|daily")
+_MINUTE_RE = re.compile(r"per[ _-]?minute|(?<![\w/.-])[rt]pm(?![\w/-])")
+# Gemini says "exceeded your current quota" for per-minute *and* per-day limits; the retry hint tells them apart.
+_QUOTA_TERMS = ("quota exceeded", "resource_exhausted", "exceeded your current quota")
+_TOO_LARGE_TERMS = ("request too large", "too large", "context length", "context_length_exceeded", "maximum context")
+_LIMIT_RE = re.compile(r"\blimit[:\s]+(\d{3,})", re.IGNORECASE)
+_ACCOUNT_RE = re.compile(r"organization\s+[`'\"]?(org_[A-Za-z0-9]+)")
+_DURATION_RE = re.compile(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m(?!s))?(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?$")
+_TRY_AGAIN_RE = re.compile(r"(?:try again in|retry after|retry in|please retry in)\s+([\d\.hms]+)", re.IGNORECASE)
+_RETRY_DELAY_RE = re.compile(r"retrydelay['\"]?\s*[:=]\s*['\"]?([\d\.]+)s", re.IGNORECASE)
+
+
+def _shared_quota_setting(provider: str) -> bool:
+    """<PROVIDER>_SHARED_QUOTA=true from the environment or .env: all of that provider's keys share one quota."""
+    name = f"{provider}_shared_quota"
+    value = os.environ.get(name.upper()) or (settings.model_extra or {}).get(name) or ""
+    return str(value).strip().lower() in _TRUE
+
+
+def _status(err: BaseException) -> Optional[int]:
+    code = getattr(err, "status_code", None)
+    if code is None:
+        code = getattr(getattr(err, "response", None), "status_code", None)
+    return code if isinstance(code, int) else None
+
+
+def parse_duration(text: str) -> Optional[float]:
+    """Seconds in "1h2m3.5s" / "7m4.2s" / "500ms" / "31" (plain seconds)."""
+    text = text.strip().lower().rstrip(".")
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    m = _DURATION_RE.match(text)
+    if not m or not any(m.groups()):
+        return None
+    h, mi, sec, ms = (float(g) if g else 0.0 for g in m.groups())
+    return h * 3600 + mi * 60 + sec + ms / 1000
+
+
+def retry_after_seconds(err: BaseException) -> Optional[float]:
+    """Wait time the provider gave: Retry-After / x-ratelimit-reset-* headers (smallest), else the
+    "try again in 7m4s" / retryDelay text in the message. None when nothing is given."""
+    headers = getattr(getattr(err, "response", None), "headers", None) or {}
+    found = []
+    for name in ("retry-after", "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
+        try:
+            value = headers.get(name)
+        except Exception:
+            value = None
+        if value:
+            seconds = parse_duration(str(value))
+            if seconds is not None:
+                found.append(seconds)
+    if found:
+        return min(found)
+    msg = str(err)
+    for rx in (_TRY_AGAIN_RE, _RETRY_DELAY_RE):
+        m = rx.search(msg)
+        if m:
+            seconds = parse_duration(m.group(1))
+            if seconds is not None:
+                return seconds
+    return None
+
+
+def account_of(err: BaseException) -> Optional[str]:
+    """The provider account an error names, e.g. Groq's "in organization `org_01...`"."""
+    m = _ACCOUNT_RE.search(str(err))
+    return m.group(1) if m else None
+
+
+def token_limit_of(err: BaseException) -> Optional[int]:
+    """The token ceiling a too-large error names, e.g. Groq's "(TPM): Limit 8000, Requested 14210"."""
+    m = _LIMIT_RE.search(str(err))
+    return int(m.group(1)) if m else None
+
+
+def classify_limit_error(err: BaseException) -> Optional[str]:
+    """ "too_large" | "daily" | "rate" for quota-style failures, else None (handled by the older checks).
+
+    413 is checked before 429: Groq's 413 says "Request too large ... tokens per minute (TPM)" and no key can
+    serve that request, so it must skip the model rather than cool every key down. rpm/tpm/rpd/tpd match as
+    whole words only (a 404 linking to ".../rpm-docs" is not a rate limit).
+    """
+    status = _status(err)
+    msg = str(err).lower()
+    if status == 413 or (status != 429 and any(t in msg for t in _TOO_LARGE_TERMS)):
+        return "too_large"
+    names = {c.__name__ for c in type(err).__mro__}
+    if status == 429 or "RateLimitError" in names or _RATE_RE.search(msg) or any(t in msg for t in _QUOTA_TERMS):
+        if _DAILY_RE.search(msg):
+            return "daily"
+        if _MINUTE_RE.search(msg):
+            return "rate"
+        if any(t in msg for t in _QUOTA_TERMS):
+            wait = retry_after_seconds(err)
+            return "rate" if wait is not None and wait <= 120 else "daily"
+        return "rate"
+    return None
+
+
+def seconds_until_reset(tz_name: str, now: datetime | None = None) -> float:
+    """Seconds until the next midnight in `tz_name` ("UTC", "America/Los_Angeles")."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = timezone.utc if tz_name.upper() == "UTC" else ZoneInfo(tz_name)
+    except Exception:  # no tz database on this machine: Pacific standard time is the only non-UTC reset
+        tz = timezone(timedelta(hours=-8)) if "los_angeles" in tz_name.lower() else timezone.utc
+    local = (now or datetime.now(timezone.utc)).astimezone(tz)
+    midnight = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (midnight - local).total_seconds()
+
+
+def estimate_tokens(messages: Any) -> int:
+    """Rough prompt size (~4 characters per token)."""
+    return len(json.dumps(messages, default=str, ensure_ascii=False)) // 4
+
+
 @dataclass
 class KeySlot:
     """Represents a single API key, its client, and its health status."""
     key: str
     masked_key: str
     client: Any  # AsyncGroq or AsyncOpenAI
-    cooldown_until: float = 0.0
+    cooldown_until: float = 0.0          # key-wide cooldown
     failure_count: int = 0
+    model_cooldowns: dict = None         # model -> cooldown_until, for per-model limits
+    account: Optional[str] = None        # provider account the key belongs to (Groq names its org in 429s)
+
+    def __post_init__(self):
+        if self.model_cooldowns is None:
+            self.model_cooldowns = {}
+
+    def ready_at(self, model: Optional[str] = None) -> float:
+        """When this key can be used again (for `model`, if given)."""
+        return max(self.cooldown_until, self.model_cooldowns.get(model, 0.0) if model else 0.0)
 
 
 class ProviderKeyPool:
@@ -62,6 +216,43 @@ class ProviderKeyPool:
             for k in keys if k
         ]
         self._index: int = 0
+        spec = PROVIDER_LIMITS.get(provider, {})
+        self.shared_quota: bool = _shared_quota_setting(provider)   # all keys draw on ONE account's quota
+        self.daily_reset: Optional[str] = spec.get("daily_reset")   # time zone whose midnight resets daily quotas
+        self.max_request_tokens: Optional[int] = spec.get("max_request_tokens")
+        self.learned_limits: dict = {}   # model -> token ceiling named by a 413 ("Limit 8000")
+
+    def request_limit(self, model: str) -> Optional[int]:
+        """Largest request (prompt + max output tokens) `model` can take on this provider, if known."""
+        return self.learned_limits.get(model) or self.max_request_tokens
+
+    def cool_down_quota(self, key: str, model: Optional[str], seconds: float, reason: str, err: Exception | None = None):
+        """Cool down a quota hit: this key, plus every key on the same account.
+
+        Keys share an account when `shared_quota` is set, or when the provider names the same account for them
+        (Groq: "in organization `org_...`"). Six keys on one Groq org share one 200K tokens/day budget, so
+        finding that out by spending one request per key just burns six 429s every minute.
+        """
+        hit = next((sl for sl in self.slots if sl.key == key), None)
+        if hit is None:
+            return
+        account = account_of(err) if err is not None else None
+        if account:
+            hit.account = account
+        same = [sl for sl in self.slots
+                if sl is hit or self.shared_quota or (hit.account and sl.account == hit.account)]
+        now = time.time()
+        for sl in same:
+            until = now + seconds
+            if model:
+                sl.model_cooldowns[model] = max(sl.model_cooldowns.get(model, 0.0), until)
+            else:
+                sl.cooldown_until = max(sl.cooldown_until, until)
+        hit.failure_count += 1
+        logger.warning(
+            f"Provider [{self.provider.upper()}] key '{hit.masked_key}' {reason}{f' on {model}' if model else ''}. "
+            f"Cooling {len(same)} key(s) for {seconds:.0f}s."
+        )
 
     @property
     def key_count(self) -> int:
@@ -76,10 +267,10 @@ class ProviderKeyPool:
             return None
         return self.slots[0].client
 
-    def get_rotation_candidates(self) -> List[KeySlot]:
+    def get_rotation_candidates(self, model: Optional[str] = None) -> List[KeySlot]:
         """
         Return all key slots ordered by round-robin priority.
-        Active (non-cooling) keys come first.
+        Active (non-cooling) keys come first; cooldowns for `model` count when it's given.
         If all keys are on cooldown, returns them ordered by soonest recovery.
         """
         if not self.slots:
@@ -92,21 +283,25 @@ class ProviderKeyPool:
         ordered = [self.slots[(self._index + i) % n] for i in range(n)]
         self._index = (self._index + 1) % n
 
-        active = [s for s in ordered if s.cooldown_until <= now]
-        cooling = [s for s in ordered if s.cooldown_until > now]
-        cooling.sort(key=lambda s: s.cooldown_until)
+        active = [s for s in ordered if s.ready_at(model) <= now]
+        cooling = [s for s in ordered if s.ready_at(model) > now]
+        cooling.sort(key=lambda s: s.ready_at(model))
 
         return active + cooling
 
-    def mark_rate_limited(self, key: str, cooldown_seconds: float = 60.0):
-        """Quarantine a key that encountered 429 or TPM limits."""
+    def mark_rate_limited(self, key: str, cooldown_seconds: float = 60.0, model: Optional[str] = None):
+        """Quarantine a key that hit 429 / TPM limits: for `model` only when given, else for every model."""
         now = time.time()
         for slot in self.slots:
             if slot.key == key:
                 slot.failure_count += 1
-                slot.cooldown_until = now + cooldown_seconds
+                if model:
+                    slot.model_cooldowns[model] = now + cooldown_seconds
+                else:
+                    slot.cooldown_until = now + cooldown_seconds
                 logger.warning(
-                    f"Provider [{self.provider.upper()}] key '{slot.masked_key}' hit rate limit (429/TPM). "
+                    f"Provider [{self.provider.upper()}] key '{slot.masked_key}' hit rate limit (429/TPM)"
+                    f"{f' on {model}' if model else ''}. "
                     f"Quarantined for {cooldown_seconds:.0f}s (failure count: {slot.failure_count})."
                 )
                 break
@@ -151,11 +346,19 @@ def _make_mistral_client(key: str) -> AsyncOpenAI:
     )
 
 
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+
+
+def _make_nvidia_client(key: str) -> AsyncOpenAI:
+    return AsyncOpenAI(api_key=key, base_url=NVIDIA_BASE_URL, max_retries=0)
+
+
 # Provider singleton pools and legacy test client references
 _groq_pool: Optional[ProviderKeyPool] = None
 _gemini_pool: Optional[ProviderKeyPool] = None
 _openrouter_pool: Optional[ProviderKeyPool] = None
 _mistral_pool: Optional[ProviderKeyPool] = None
+_nvidia_pool: Optional[ProviderKeyPool] = None
 _gemini_client: Optional[AsyncOpenAI] = None
 _openrouter_client: Optional[AsyncOpenAI] = None
 _mistral_client: Optional[AsyncOpenAI] = None
@@ -199,9 +402,19 @@ def get_mistral_pool() -> ProviderKeyPool:
     return _mistral_pool
 
 
+def get_nvidia_pool() -> ProviderKeyPool:
+    global _nvidia_pool
+    keys = settings.get_nvidia_keys()
+    if _nvidia_pool is None or [s.key for s in _nvidia_pool.slots] != keys:
+        _nvidia_pool = ProviderKeyPool("nvidia", keys, _make_nvidia_client)
+    return _nvidia_pool
+
+
 def reset_pools():
     """Reset singleton pools (primarily used in tests)."""
-    global _groq_pool, _gemini_pool, _openrouter_pool, _mistral_pool, _gemini_client, _openrouter_client, _mistral_client
+    global _groq_pool, _gemini_pool, _openrouter_pool, _mistral_pool, _nvidia_pool
+    global _gemini_client, _openrouter_client, _mistral_client
+    _nvidia_pool = None
     _groq_pool = None
     _gemini_pool = None
     _openrouter_pool = None
@@ -241,30 +454,44 @@ class LLMTarget:
     pool: Optional[ProviderKeyPool] = None
 
 
+# Groq free-plan limits are per model (30 RPM, 1,000 RPD, 8K TPM, 200K TPD each), so every
+# model here adds capacity. groq/compound-mini was shut down on 2026-09-21; gpt-oss-20b was
+# removed earlier because it stalled streams for ~6s.
+GROQ_GENERATION_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
+GROQ_FAST_MODELS = ["qwen/qwen3.8-27b", "openai/gpt-oss-120b"]
+GROQ_EXCLUDED_MODELS = ("groq/compound", "groq/compound-mini", "openai/gpt-oss-20b")
+
+
+def _nvidia_targets(pool: ProviderKeyPool, fast: bool) -> List[LLMTarget]:
+    """NVIDIA NIM models (configured model first, then the backup), if keys are configured."""
+    if not pool.is_available():
+        return []
+    first = settings.nvidia_fast_model if fast else settings.nvidia_model
+    models = [m for m in dict.fromkeys([first, settings.nvidia_model, settings.nvidia_backup_model]) if m]
+    return [LLMTarget(provider="nvidia", model=m, client=pool.get_primary_client(), pool=pool) for m in models]
+
+
 def get_generation_targets() -> List[LLMTarget]:
     """
     Build the ordered fallback chain for answer generation:
-    1. Groq configured model + alternatives (LPUs)
-    2. Mistral AI (e.g. ministral-3b-2512 - 500,000 TPM)
-    3. Google Gemini (e.g. gemini-flash-latest)
-    4. OpenRouter (e.g. meta-llama/llama-3.3-70b-instruct)
+    1. Groq configured model + alternatives (LPUs; limits are per model)
+    2. NVIDIA NIM (free, ~40 RPM, large open models)
+    3. Mistral AI (e.g. ministral-3b-2512)
+    4. Google Gemini (e.g. gemini-flash-latest)
+    5. OpenRouter (e.g. meta-llama/llama-3.3-70b-instruct)
     """
     targets: List[LLMTarget] = []
     groq_pool = get_groq_pool()
+    nvidia_pool = get_nvidia_pool()
     mistral_pool = get_mistral_pool()
     gemini_pool = get_gemini_pool()
     openrouter_pool = get_openrouter_pool()
 
     # Tier 1: Groq models
     if groq_pool.is_available():
-        candidates = [
-            settings.groq_model,
-            "openai/gpt-oss-120b",
-            "qwen/qwen3.8-27b",
-            "groq/compound-mini",
-        ]
+        candidates = [settings.groq_model, *GROQ_GENERATION_MODELS]
         # Exclude known non-chat or malformed models
-        groq_models = [m for m in candidates if m and m not in ("groq/compound", "openai/gpt-oss-20b")]
+        groq_models = [m for m in candidates if m and m not in GROQ_EXCLUDED_MODELS]
         seen_groq = set()
         for m in groq_models:
             if m not in seen_groq:
@@ -276,7 +503,10 @@ def get_generation_targets() -> List[LLMTarget]:
                     pool=groq_pool,
                 ))
 
-    # Tier 2: Mistral AI (if configured - 500,000 TPM limit)
+    # Tier 2: NVIDIA NIM (if configured)
+    targets += _nvidia_targets(nvidia_pool, fast=False)
+
+    # Tier 3: Mistral AI (if configured)
     if mistral_pool.is_available():
         targets.append(LLMTarget(
             provider="mistral",
@@ -323,18 +553,14 @@ def get_fast_targets() -> List[LLMTarget]:
     """
     targets: List[LLMTarget] = []
     groq_pool = get_groq_pool()
+    nvidia_pool = get_nvidia_pool()
     mistral_pool = get_mistral_pool()
     gemini_pool = get_gemini_pool()
     openrouter_pool = get_openrouter_pool()
 
     # Tier 1: Groq fast models
     if groq_pool.is_available():
-        fast_groq = [
-            "qwen/qwen3.8-27b",
-            "openai/gpt-oss-120b",
-            "groq/compound-mini",
-        ]
-        for m in fast_groq:
+        for m in GROQ_FAST_MODELS:
             targets.append(LLMTarget(
                 provider="groq",
                 model=m,
@@ -342,7 +568,10 @@ def get_fast_targets() -> List[LLMTarget]:
                 pool=groq_pool,
             ))
 
-    # Tier 2: Mistral AI fast models
+    # Tier 2: NVIDIA NIM
+    targets += _nvidia_targets(nvidia_pool, fast=True)
+
+    # Tier 3: Mistral AI fast models
     if mistral_pool.is_available():
         targets.append(LLMTarget(
             provider="mistral",
@@ -376,6 +605,33 @@ def get_fast_targets() -> List[LLMTarget]:
 
 
 
+def is_model_unavailable(err: Exception) -> bool:
+    """The model doesn't exist (any more) on this provider: skip it, but the key is fine."""
+    if getattr(err, "status_code", None) in (404, 410):   # 410 Gone: model reached end of life
+        return True
+    msg = str(err).lower()
+    return any(t in msg for t in ("model_not_found", "decommissioned", "does not exist", "no longer supported", "unknown model", "end of life"))
+
+
+def _attempt_plan(targets: List[LLMTarget]) -> List[tuple]:
+    """
+    Ordered (target_index, target, slot) attempts: every ready key of every tier first, in
+    tier order, then keys still cooling down (soonest recovery first) as a last resort.
+    Trying a cooling key before a healthy key on the next tier only burns another 429.
+    """
+    ready, cooling = [], []
+    now = time.time()
+    for i, target in enumerate(targets):
+        if target.pool and target.pool.is_available():
+            for slot in target.pool.get_rotation_candidates(target.model):
+                (ready if slot.ready_at(target.model) <= now else cooling).append((i, target, slot))
+        else:
+            key = getattr(target, "key", "")
+            ready.append((i, target, KeySlot(key=key, masked_key=mask_key(key), client=target.client)))
+    cooling.sort(key=lambda a: a[2].ready_at(a[1].model))
+    return ready + cooling
+
+
 def is_recoverable_error(err: Exception) -> bool:
     """
     Determine if an error is transient, rate-limited, or provider-side recoverable.
@@ -404,6 +660,86 @@ def is_recoverable_error(err: Exception) -> bool:
     return False
 
 
+# Reasoning models spend completion tokens thinking before they answer. A caller asking for 60 tokens
+# (a routing label, a rewritten query) gets an empty reply from them, which callers then read as
+# "no decision" and silently fall back. Give these models enough room; short-reply models are unaffected.
+REASONING_MODEL_MARKERS = ("gpt-oss", "nemotron", "minimax", "deepseek-r1", "-thinking", "qwq")
+REASONING_MIN_TOKENS = 1024
+
+
+def effective_max_tokens(model: str, max_tokens: int) -> int:
+    """max_tokens to send to `model`: raised to REASONING_MIN_TOKENS for reasoning models."""
+    m = model.lower()
+    if any(k in m for k in REASONING_MODEL_MARKERS):
+        return max(max_tokens, REASONING_MIN_TOKENS)
+    return max_tokens
+
+
+def _too_big(target: LLMTarget, est_tokens: int) -> bool:
+    """The request can't fit this model on this provider (e.g. over Groq's 8K tokens/minute)."""
+    limit = target.pool.request_limit(target.model) if target.pool else None
+    return bool(limit and est_tokens > limit)
+
+
+def _skip_attempt(i: int, target: LLMTarget, slot: KeySlot, skip: set, ready_at_plan: set) -> bool:
+    """Whether to pass over this planned attempt without a call.
+
+    A key that was ready when the plan was made but got cooled since (a shared-quota 429 earlier in this
+    same call) is skipped; so is a "last resort" cooling key that won't recover for minutes.
+    """
+    if i in skip:
+        return True
+    remaining = slot.ready_at(target.model) - time.time()
+    if remaining <= 0:
+        return False
+    return (i, slot.key) in ready_at_plan or remaining > LAST_RESORT_MAX_WAIT
+
+
+def _plan_with_ready(targets: List[LLMTarget]) -> tuple:
+    plan = _attempt_plan(targets)
+    now = time.time()
+    ready = {(i, sl.key) for i, t, sl in plan if sl.ready_at(t.model) <= now}
+    return plan, ready
+
+
+def _handle_failure(i: int, target: LLMTarget, slot: KeySlot, err: Exception, skip: set) -> bool:
+    """React to a failed attempt. True: try the next attempt. False: unrecoverable, re-raise."""
+    kind = classify_limit_error(err)
+    pool = target.pool
+    where = f"[{target.provider.upper()}] '{target.model}' (key {slot.masked_key})"
+    if kind == "too_large":
+        skip.add(i)   # no key can serve this request on this model; remember the ceiling it named
+        limit = token_limit_of(err)
+        if pool and limit and limit < (pool.request_limit(target.model) or 10**9):
+            pool.learned_limits[target.model] = limit
+        logger.warning(f"Request too large for {where}{f' (limit {limit})' if limit else ''}. Skipping that model.")
+        return True
+    if is_model_unavailable(err):
+        skip.add(i)
+        logger.warning(f"Model unavailable on {where} ({err}). Skipping it.")
+        return True
+    if kind in ("rate", "daily"):
+        wait = retry_after_seconds(err)
+        if kind == "daily":
+            if pool and pool.daily_reset:
+                seconds = max(wait or 0.0, seconds_until_reset(pool.daily_reset), DAILY_MIN_SECONDS)
+            else:
+                seconds = max(wait + 1, DAILY_MIN_SECONDS) if wait is not None else DAILY_FALLBACK_SECONDS
+        else:
+            seconds = wait + 1 if wait is not None else RATE_FALLBACK_SECONDS
+        if pool:
+            pool.cool_down_quota(slot.key, target.model, seconds,
+                                 "hit its daily limit" if kind == "daily" else "hit a rate limit", err)
+        return True
+    if is_recoverable_error(err):
+        if pool:
+            pool.mark_rate_limited(slot.key, model=target.model)
+        logger.warning(f"{where} failed ({type(err).__name__}: {err}). Rotating to next key/model...")
+        return True
+    logger.error(f"Unrecoverable error on {where}: {err}")
+    return False
+
+
 async def call_llm_with_cross_provider_fallback(
     messages: list[dict],
     max_tokens: int,
@@ -416,19 +752,14 @@ async def call_llm_with_cross_provider_fallback(
     """
     targets = get_fast_targets() if fast else get_generation_targets()
     last_err = None
+    est = estimate_tokens(messages)
+    # target indexes to pass over: model gone, or the request can't fit it (skipped without a call)
+    skip: set = {i for i, t in enumerate(targets) if _too_big(t, est + effective_max_tokens(t.model, max_tokens))}
+    plan, ready_at_plan = _plan_with_ready(targets)
 
-    for i, target in enumerate(targets):
-        # Resolve key candidates: if a pool is attached, rotate through its keys
-        if target.pool and target.pool.is_available():
-            slots = target.pool.get_rotation_candidates()
-        else:
-            slots = [KeySlot(
-                key=getattr(target, "key", ""),
-                masked_key=mask_key(getattr(target, "key", "")),
-                client=target.client,
-            )]
-
-        for slot in slots:
+    for i, target, slot in plan:
+            if _skip_attempt(i, target, slot, skip, ready_at_plan):
+                continue
             try:
                 logger.info(
                     f"Invoking LLM [{target.provider.upper()}] (Key: {slot.masked_key}) "
@@ -446,7 +777,7 @@ async def call_llm_with_cross_provider_fallback(
                     response = await slot.client.chat.completions.create(
                         model=target.model,
                         messages=messages,
-                        max_tokens=max_tokens,
+                        max_tokens=effective_max_tokens(target.model, max_tokens),
                         temperature=temperature,
                     )
                     usage = getattr(response, "usage", None)
@@ -461,20 +792,9 @@ async def call_llm_with_cross_provider_fallback(
 
             except Exception as err:
                 last_err = err
-                if is_recoverable_error(err):
-                    if target.pool:
-                        target.pool.mark_rate_limited(slot.key)
-                    logger.warning(
-                        f"Provider [{target.provider.upper()}] key '{slot.masked_key}' failed on '{target.model}' "
-                        f"({type(err).__name__}: {err}). Rotating to next key/model..."
-                    )
+                if _handle_failure(i, target, slot, err, skip):
                     continue
-                else:
-                    logger.error(
-                        f"Unrecoverable error on [{target.provider.upper()}] '{target.model}' "
-                        f"(key: {slot.masked_key}): {err}"
-                    )
-                    raise
+                raise
 
     logger.error("All fallback targets across all providers and keys exhausted for non-streaming call.")
     if last_err:
@@ -495,18 +815,13 @@ async def stream_llm_with_cross_provider_fallback(
     """
     targets = get_fast_targets() if fast else get_generation_targets()
     last_err = None
+    est = estimate_tokens(messages)
+    skip: set = {i for i, t in enumerate(targets) if _too_big(t, est + effective_max_tokens(t.model, max_tokens))}
+    plan, ready_at_plan = _plan_with_ready(targets)
 
-    for i, target in enumerate(targets):
-        if target.pool and target.pool.is_available():
-            slots = target.pool.get_rotation_candidates()
-        else:
-            slots = [KeySlot(
-                key=getattr(target, "key", ""),
-                masked_key=mask_key(getattr(target, "key", "")),
-                client=target.client,
-            )]
-
-        for slot in slots:
+    for i, target, slot in plan:
+            if _skip_attempt(i, target, slot, skip, ready_at_plan):
+                continue
             started = False
             try:
                 logger.info(
@@ -525,7 +840,7 @@ async def stream_llm_with_cross_provider_fallback(
                     stream = await slot.client.chat.completions.create(
                         model=target.model,
                         messages=messages,
-                        max_tokens=max_tokens,
+                        max_tokens=effective_max_tokens(target.model, max_tokens),
                         temperature=temperature,
                         stream=True,
                     )
@@ -546,21 +861,11 @@ async def stream_llm_with_cross_provider_fallback(
 
             except Exception as err:
                 last_err = err
-                # If stream failed before emitting tokens, rotate to next key/model
-                if is_recoverable_error(err) and not started:
-                    if target.pool:
-                        target.pool.mark_rate_limited(slot.key)
-                    logger.warning(
-                        f"Provider [{target.provider.upper()}] key '{slot.masked_key}' stream failed before start "
-                        f"({type(err).__name__}: {err}). Rotating to next key/model..."
-                    )
+                # Once tokens have reached the caller, switching models would splice two answers: re-raise.
+                if not started and _handle_failure(i, target, slot, err, skip):
                     continue
-                else:
-                    logger.error(
-                        f"Error during stream on [{target.provider.upper()}] '{target.model}' "
-                        f"(key: {slot.masked_key}): {err}"
-                    )
-                    raise
+                logger.error(f"Error during stream on [{target.provider.upper()}] '{target.model}' (key: {slot.masked_key}): {err}")
+                raise
 
     logger.error("All fallback targets across all providers and keys exhausted for streaming.")
     if last_err:

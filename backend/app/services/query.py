@@ -10,26 +10,15 @@ import json
 import logging
 import re
 from typing import Any, AsyncGenerator
-from uuid import UUID
 
 import logfire
 
 from app.config import settings
 from app.services import embedding, vector_store, reranker
 from app.services.chunking import count_tokens
-from app.services import tabular_store
 from app.utils.memory import release_memory
 
 logger = logging.getLogger(__name__)
-
-# ── Spell correction for typo-tolerant retrieval (Gap 5) ─────────────────
-try:
-    from spellchecker import SpellChecker
-    _spellchecker = SpellChecker()
-    _HAS_SPELLCHECKER = True
-except ImportError:
-    _spellchecker = None
-    _HAS_SPELLCHECKER = False
 
 from app.services.llm_provider import (
     call_llm_with_cross_provider_fallback as call_llm_with_fallback,
@@ -41,23 +30,12 @@ from app.services.llm_provider import (
 )
 
 # ── Resilient Multi-Provider Fallback Chain ──────────────────────────────
-# When one model/provider hits rate limits (429/TPM) or context limits (413),
-# the system automatically and transparently switches to the next available
-# model across Groq, Google Gemini, and OpenRouter.
-DEFAULT_MODEL_FALLBACKS = [
-    "openai/gpt-oss-120b",
-    "qwen/qwen3.8-27b",
-    "openai/gpt-oss-20b",
-    "groq/compound-mini",
-    "qwen/qwen3.6-27b",
-]
-FAST_MODEL_CHAIN = [
-    "qwen/qwen3.8-27b",
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "qwen/qwen3.6-27b",
-    "groq/compound-mini",
-]
+# When one model/provider hits rate limits (429/TPM) or context limits (413), the system automatically and transparently switches to the next available model across Groq, Google Gemini, and OpenRouter.
+from app.services.llm_provider import GROQ_FAST_MODELS, GROQ_GENERATION_MODELS  # noqa: E402
+
+# Single source of truth lives in llm_provider (decommissioned models removed there).
+DEFAULT_MODEL_FALLBACKS = list(GROQ_GENERATION_MODELS)
+FAST_MODEL_CHAIN = list(GROQ_FAST_MODELS)
 
 
 def get_model_chain(fast: bool = False) -> list[str]:
@@ -74,108 +52,121 @@ def get_model_chain(fast: bool = False) -> list[str]:
 
 
 
-# ── Intent classification ─────────────────────────────────────────────────
+# ── Query classification (intent, scope, aggregation) ────────────────────
 
-INTENT_SYSTEM_PROMPT = """You are an intent classifier for a document Q&A assistant where users upload documents and ask questions about them.
+QUERY_SCOPES = ("global", "section", "metadata", "targeted")
 
-Given the user's message, classify it into exactly one category:
+QUERY_CLASSIFIER_PROMPT = """You classify messages sent to a document Q&A assistant. Users upload documents (PDFs, text files, spreadsheets) and ask about them.
 
-- "retrieve": The user is asking ANY question that COULD be answered using uploaded documents. This includes factual questions, analysis requests, summarization, technical questions, questions about specific topics, or anything that might relate to document content. When in doubt, choose "retrieve".
-- "chitchat": The user is making pure social conversation — greetings, thanks, or meta-questions about the assistant itself. Examples: "Hi", "Hello", "Thanks!", "How are you?", "What can you do?", "Who are you?"
+Return three fields:
 
-IMPORTANT: If the user asks about ANY topic (python, finance, science, history, etc.), classify as "retrieve" because their uploaded documents may contain relevant information. Only classify as "chitchat" for obvious greetings and pleasantries.
+1. "intent"
+   - "retrieve": ANY question that could be answered from the user's documents: facts, analysis, summaries, technical questions, any topic. When in doubt, "retrieve".
+   - "chitchat": pure social conversation or questions about the assistant itself: "Hi", "Thanks!", "How are you?", "What can you do?", "Who are you?".
 
-Respond with ONLY the category name — one word, no quotes, no explanation."""
+2. "scope": how much of a document the answer needs
+   - "global": the WHOLE document (or all documents): summarize it, what it is about, its plot, main themes, key findings or takeaways, an overview of the whole file, what the spreadsheet contains. Examples: "Summarize Verity", "what's this pdf about?", "tl;dr of the report", "key takeaways from the paper", "give me an overview of my data".
+   - "section": a broad overview of ONE topic or part inside a document. Examples: "overview of the transport layer chapter", "explain the methodology section".
+   - "metadata": facts about the document itself: author, title, publisher, publication date, page count. Examples: "who wrote this paper?", "when was this book published?".
+   - "targeted": a specific fact, person, event, number or passage. "Tell me about <a person/thing in the document>" is targeted, not global. Examples: "tell me about Ryle", "what is the salary?", "where did they go after the restaurant?".
+
+3. "aggregation": true when the answer requires counting, summing, averaging, finding a minimum/maximum, ranking or comparing totals across MANY records or rows (e.g. "how many customers churned?", "total revenue by region", "which product sold the most?", "average age"). False for questions about a single record or fact, and for summaries of text.
+
+Respond with JSON only: {"intent": "retrieve" | "chitchat", "scope": "global" | "section" | "metadata" | "targeted", "aggregation": true | false}"""
+
+_QUICK_CHITCHAT = {
+    "hi", "hello", "hey", "hola", "howdy",
+    "good morning", "good afternoon", "good evening",
+    "how are you", "how are you doing", "whats up",
+    "who are you", "what can you do", "help",
+    "thanks", "thank you", "thx", "bye", "goodbye",
+}
 
 
-async def classify_intent(
+class QueryClassification:
+    """What the user is asking for: chitchat or retrieval, how much of the document, and
+    whether it needs aggregating over many records. Produced by one fast LLM call."""
+
+    def __init__(self, intent: str = "retrieve", scope: str = "targeted", aggregation: bool = False,
+                 method: str = "llm"):
+        self.intent = intent if intent in ("retrieve", "chitchat") else "retrieve"
+        self.scope = scope if scope in QUERY_SCOPES else "targeted"
+        self.aggregation = bool(aggregation)
+        self.method = method
+
+    @property
+    def is_overview(self) -> bool:
+        """The answer needs the whole document (summary / what is it about / key findings)."""
+        return self.scope == "global"
+
+    def to_dict(self) -> dict:
+        return {"intent": self.intent, "scope": self.scope, "aggregation": self.aggregation, "method": self.method}
+
+    def __repr__(self) -> str:
+        return f"QueryClassification({self.to_dict()})"
+
+
+def parse_query_classification(content: str, reasoning: str = "") -> QueryClassification | None:
+    """Parse the classifier's JSON (tolerant of code fences / prose). None if nothing usable."""
+    for text in (content, reasoning):
+        if not text:
+            continue
+        m = re.search(r"\{.*?\}", text, re.DOTALL)
+        if not m:
+            continue
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            continue
+        intent = str(data.get("intent", "retrieve")).strip().lower()
+        scope = str(data.get("scope", "targeted")).strip().lower()
+        agg = data.get("aggregation", False)
+        if isinstance(agg, str):
+            agg = agg.strip().lower() == "true"
+        return QueryClassification(intent, scope, bool(agg), method="llm")
+    return None
+
+
+async def classify_query(
     question: str,
     chat_history: list[dict] | None = None,
-) -> str:
+) -> QueryClassification:
     """
-    Use a fast LLM call to classify whether the user's message needs
-    document retrieval or is just chitchat/greeting.
+    Classify a message with one fast LLM call: intent (retrieve / chitchat), scope
+    (global / section / metadata / targeted) and whether it needs aggregation.
 
-    Returns: "retrieve" or "chitchat"
+    Exact greetings skip the LLM. If the call fails or returns nothing parseable, the
+    safe default is a targeted, non-aggregating retrieval (normal RAG).
     """
-    with logfire.span("🎯 Classify Intent | '{q_short}'", q_short=question[:50], question=question) as span:
-        # Fast heuristic for obvious greetings / conversational pleasantries
-        cleaned = question.strip().lower()
-        cleaned = re.sub(r"[^\w\s]", "", cleaned)
-        quick_chitchat = {
-            "hi", "hello", "hey", "hola", "howdy",
-            "good morning", "good afternoon", "good evening",
-            "how are you", "how are you doing", "whats up", "what's up",
-            "who are you", "what can you do", "help",
-            "thanks", "thank you", "thx", "bye", "goodbye",
-        }
-        if cleaned in quick_chitchat:
-            logger.info(f"Intent classified (heuristic): '{question}' → chitchat")
-            span.set_attribute("intent", "chitchat")
-            span.set_attribute("method", "heuristic")
-            return "chitchat"
+    with logfire.span("🎯 Classify Query | '{q_short}'", q_short=question[:50], question=question) as span:
+        cleaned = re.sub(r"[^\w\s]", "", question.strip().lower())
+        if cleaned in _QUICK_CHITCHAT:
+            result = QueryClassification("chitchat", "targeted", False, method="greeting")
+            span.set_attributes(result.to_dict())
+            return result
 
-        groq = _get_groq()
-
-        messages: list[dict] = [
-            {"role": "system", "content": INTENT_SYSTEM_PROMPT},
-        ]
-
-        # Include last 2 messages for context (helps with follow-ups like "thanks")
-        if chat_history:
+        messages: list[dict] = [{"role": "system", "content": QUERY_CLASSIFIER_PROMPT}]
+        if chat_history:  # recent turns help with follow-ups like "thanks" or "and the total?"
             for m in chat_history[-2:]:
-                messages.append({
-                    "role": m["role"],
-                    "content": m["content"][:150],
-                })
-
+                messages.append({"role": m["role"], "content": m["content"][:150]})
         messages.append({"role": "user", "content": question})
 
+        result = None
         try:
-            response = await call_llm_with_fallback(
-                messages=messages,
-                max_tokens=150,
-                temperature=0.0,
-                fast=True,
+            response = await call_llm_with_fallback(messages=messages, max_tokens=300, temperature=0.0, fast=True)
+            msg = response.choices[0].message
+            result = parse_query_classification(
+                (msg.content or "").strip(), (getattr(msg, "reasoning", None) or "").strip()
             )
-            content = (response.choices[0].message.content or "").strip().lower()
-            reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip().lower()
-
-            # Check content first
-            if "chitchat" in content:
-                logger.info(f"Intent classified: '{question}' → chitchat")
-                span.set_attribute("intent", "chitchat")
-                span.set_attribute("method", "llm")
-                return "chitchat"
-            if "retrieve" in content:
-                logger.info(f"Intent classified: '{question}' → retrieve")
-                span.set_attribute("intent", "retrieve")
-                span.set_attribute("method", "llm")
-                return "retrieve"
-
-            # Fallback to reasoning if content was in reasoning
-            if "chitchat" in reasoning:
-                logger.info(f"Intent classified (from reasoning): '{question}' → chitchat")
-                span.set_attribute("intent", "chitchat")
-                span.set_attribute("method", "llm_reasoning")
-                return "chitchat"
-            if "retrieve" in reasoning:
-                logger.info(f"Intent classified (from reasoning): '{question}' → retrieve")
-                span.set_attribute("intent", "retrieve")
-                span.set_attribute("method", "llm_reasoning")
-                return "retrieve"
-
-            # If the LLM returns something unexpected, default to retrieve
-            logger.warning(f"Unknown intent '{content}' for '{question}', defaulting to retrieve")
-            span.set_attribute("intent", "retrieve")
-            span.set_attribute("method", "fallback_unknown")
-            return "retrieve"
-
+            if result is None:
+                logger.warning(f"Unparseable query classification for '{question[:80]}': {msg.content!r:.200}")
         except Exception as e:
-            logger.warning(f"Intent classification failed: {e}, defaulting to retrieve")
-            span.set_attribute("intent", "retrieve")
-            span.set_attribute("method", "fallback_error")
-            return "retrieve"
+            logger.warning(f"Query classification failed: {e}")
+        if result is None:
+            result = QueryClassification(method="fallback")
+        logger.info(f"Query classified: '{question[:80]}' → {result.to_dict()}")
+        span.set_attributes(result.to_dict())
+        return result
 
 
 # ── Document Scope & Ambiguity Analysis ──────────────────────────────────
@@ -219,27 +210,7 @@ def format_clarification_message(docs: list[dict], question: str) -> str:
         fname = d.get("filename", "")
         ftype = d.get("file_type", "doc").upper()
         icon = "📊" if d.get("is_tabular") else ("📄" if ftype == "PDF" else "📝")
-        extra = ""
-        f_lower = fname.lower()
-        if "2405.15793" in f_lower or "swe-bench" in f_lower:
-            extra = " *(SWE-bench research paper)*"
-        elif "verity" in f_lower:
-            extra = " *(novel by Colleen Hoover)*"
-        elif "it-ends-with-us" in f_lower or "it ends with us" in f_lower:
-            extra = " *(novel by Colleen Hoover)*"
-        elif "strangers" in f_lower:
-            extra = " *(book / novel)*"
-        elif "titan" in f_lower:
-            extra = " *(Project Titan report)*"
-        elif "churn" in f_lower:
-            extra = " *(Telco customer churn dataset)*"
-        elif "e commerce" in f_lower or "dataset" in f_lower:
-            extra = " *(E-commerce sales dataset)*"
-        elif "python" in f_lower:
-            extra = " *(Python programming handbook)*"
-        elif "offer" in f_lower:
-            extra = " *(Offer letter document)*"
-        lines.append(f"- {icon} **{fname}**{extra}")
+        lines.append(f"- {icon} **{fname}**")
 
     clean_q = question.strip()
     if clean_q.endswith("?"):
@@ -258,9 +229,12 @@ Available documents in the user's workspace:
 
 Decision Categories:
 1. SPECIFIC: The question explicitly mentions a document by name, topic, or distinct keyword, OR recent conversation history already established a focus document and this question is a follow-up inquiry (e.g. asking about another item, code, section, or character from that same document).
+   Spreadsheets (Tabular) are listed with their sheets and columns. A question about records, fields or values that those sheets/columns hold (counts, totals, averages, top-N, rankings, "which X has the most Y", or looking up a row such as one movie, customer or product) is SPECIFIC to that spreadsheet even when its filename is not mentioned. Pick the spreadsheet whose sheets/columns best fit the question.
 2. CROSS_DOC: The user is explicitly asking to compare, summarize, or search across multiple or all documents in their library (e.g., "compare all my documents", "what files do I have?", "search across all files").
 3. GENERAL: The question is a general factual or conceptual inquiry (e.g. "What is machine learning?", "How do Python functions work?") that does not assume a specific proprietary story, paper, or report.
 4. AMBIGUOUS: The user asks an underspecified question that clearly refers to a single document's contents (e.g., "What are the key findings?", "Summarize the document", "Who is the main character?", "What does the contract say?") BUT there are multiple documents and the user never specified which one they mean, and recent chat history does NOT establish a focus document.
+   A question about records or fields that only one spreadsheet's sheets/columns hold (e.g. customers, states, sales, invoices, movies, directors) is NOT ambiguous: it is SPECIFIC to that spreadsheet (rule 1).
+   A question that mentions a name or term listed under exactly one document's "key names/terms" (a character, person, company, product or place) is NOT ambiguous: it is SPECIFIC to that document.
 
 CRITICAL RULES:
 - Output ONLY the category and index in this exact format. Do NOT answer the user's question!
@@ -277,36 +251,39 @@ CRITICAL RULES:
 
 
 def _find_matching_doc_by_keyword(text: str, docs: list[dict]) -> dict | None:
+    """Match user text to a document using keywords derived from the filename itself."""
     text_lower = text.lower().strip()
+
+    # Generic filler words that should NOT be used as matching keywords
+    _FILLER = {
+        "the", "a", "an", "of", "and", "or", "in", "on", "to", "for", "by",
+        "with", "from", "at", "is", "it", "its", "this", "that", "my", "your",
+        "file", "doc", "document", "pdf", "csv", "xlsx", "xls", "txt", "data",
+        "copy", "final", "draft", "new", "old", "v1", "v2", "v3", "updated",
+    }
+
     for d in docs:
         fname = d["filename"].lower()
         base_name = fname.rsplit(".", 1)[0]
+
+        # Direct full-name match
         if base_name in text_lower or fname in text_lower:
             return d
 
-        keywords = []
-        if "2405.15793" in fname or "swe-bench" in fname:
-            keywords.extend(["2405.15793", "swe-bench", "swe bench", "swebench", "research paper", "the paper"])
-        elif "verity" in fname:
-            keywords.extend(["verity", "colleen hoover"])
-        elif "it-ends-with-us" in fname or "it ends with us" in fname:
-            keywords.extend(["it ends with us", "ends with us", "lily bloom"])
-        elif "strangers" in fname:
-            keywords.extend(["strangers again", "can we be strangers"])
-        elif "titan" in fname:
-            keywords.extend(["titan report", "project titan", "titan"])
-        elif "churn" in fname:
-            keywords.extend(["telco", "churn", "customer churn"])
-        elif "e commerce" in fname or "dataset" in fname:
-            keywords.extend(["e-commerce", "ecommerce", "e commerce"])
-        elif "python" in fname:
-            keywords.extend(["python handbook", "ultimate python", "python book"])
-        elif "offer" in fname:
-            keywords.extend(["offer letter", "yash mittal offer", "offer"])
+        # Derive keywords from the filename by splitting on common separators
+        parts = re.split(r"[-_\s.]+", base_name)
+        keywords = [p for p in parts if len(p) > 2 and p not in _FILLER]
 
+        # Match individual keywords (word-boundary match)
         for kw in keywords:
             if re.search(r"\b" + re.escape(kw) + r"\b", text_lower):
                 return d
+
+        # Also try the full base name as a phrase (handles multi-word filenames)
+        clean_base = re.sub(r"[-_]+", " ", base_name).strip()
+        if len(clean_base) > 3 and clean_base in text_lower:
+            return d
+
     return None
 
 
@@ -336,7 +313,7 @@ async def analyze_document_scope(
             cleaned_question=question,
         )
 
-    # 1. Check for @mention tag (e.g. "@verity what happened?" or "@SWE-bench key findings")
+    # 1. Check for @mention tag (e.g. "@myfile what happened?" or "@report key findings")
     at_match = re.search(r"@([A-Za-z0-9_.-]+)", question)
     if at_match:
         tag = at_match.group(1).lower()
@@ -436,7 +413,12 @@ async def analyze_document_scope(
     # 5. Fast LLM Ambiguity / Scope Classification
     catalog_lines = []
     for i, d in enumerate(available_documents, 1):
-        catalog_lines.append(f"[{i}] {d['filename']} ({'Tabular' if d.get('is_tabular') else 'Text Document'})")
+        line = f"[{i}] {d['filename']} ({'Tabular' if d.get('is_tabular') else 'Text Document'})"
+        if d.get("tabular_profile"):
+            line += f" — sheets/columns: {d['tabular_profile']}"
+        elif d.get("key_terms"):
+            line += f" — key names/terms: {', '.join(d['key_terms'])}"
+        catalog_lines.append(line)
     catalog_str = "\n".join(catalog_lines)
 
     scope_user_content = ""
@@ -769,44 +751,6 @@ async def generate_chat_title(
 
 
 
-# ── Aggregation keywords ──────────────────────────────────────────────────
-
-AGGREGATION_KEYWORDS = {
-    "total", "sum", "average", "mean", "how many", "count",
-    "minimum", "maximum", "min", "max", "aggregate", "overall",
-    "combined", "altogether", "in total", "grand total",
-}
-
-
-def detect_aggregation(question: str) -> bool:
-    """
-    Check if a question contains aggregation language.
-    Used to bias retrieval toward including summary chunks.
-    """
-    lower_q = question.lower()
-    return any(kw in lower_q for kw in AGGREGATION_KEYWORDS)
-
-
-OVERVIEW_KEYWORDS = {
-    "tell me about", "what is this book about", "what is this document about",
-    "what is this paper about", "what is this novel about", "what is it about",
-    "what is the book about", "what is the paper about", "what is the novel about",
-    "give me an overview", "overview", "summary", "summarize", "synopsis",
-    "what happens in", "who wrote", "author of", "premise", "plot summary",
-    "plot of", "introduction to", "intro of", "what is the story", "explain the story",
-    "main character", "protagonist", "key findings", "main idea", "main themes",
-}
-
-
-def is_overview_query(question: str) -> bool:
-    """
-    Check if question asks for an overview, summary, or broad description of a document.
-    Used to attach lead/introductory chunks to provide essential framing context.
-    """
-    lower_q = question.lower()
-    return any(kw in lower_q for kw in OVERVIEW_KEYWORDS)
-
-
 # ── Query rewrite ─────────────────────────────────────────────────────────
 
 REWRITE_SYSTEM_PROMPT = """You are a search query rewriter for a document and tabular data assistant.
@@ -891,88 +835,33 @@ async def rewrite_query(
         return question
 
 
-# ── Spell Correction for Typo-Tolerant Retrieval ────────────────────────
-
-def correct_query_spelling(query: str) -> str:
-    """
-    Correct common misspellings in user queries for better BM25 and embedding retrieval.
-
-    Uses pyspellchecker's frequency-based correction (based on a large English word corpus).
-    Only corrects words that:
-    - Are not found in the dictionary
-    - Are purely alphabetic (preserves acronyms, codes like REQ-101, numbers)
-    - Have a reasonable correction candidate (edit distance ≤ 2)
-
-    Examples: "stalkholders" → "stakeholders", "managment" → "management"
-    """
-    if not _HAS_SPELLCHECKER or not query:
-        return query
-
-    words = query.split()
-    corrected_words = []
-    any_corrected = False
-
-    for word in words:
-        # Skip non-alphabetic words (numbers, codes, acronyms, mixed-case identifiers)
-        stripped = word.strip(".,!?;:'\"()[]{}/-")
-        if not stripped.isalpha() or len(stripped) <= 2:
-            corrected_words.append(word)
-            continue
-
-        # Check if the word is misspelled
-        if stripped.lower() in _spellchecker:
-            corrected_words.append(word)
-            continue
-
-        # Get the best correction candidate
-        correction = _spellchecker.correction(stripped.lower())
-        if correction and correction != stripped.lower():
-            # Preserve original casing pattern
-            if stripped[0].isupper():
-                correction = correction.capitalize()
-            # Replace only the stripped part, preserving surrounding punctuation
-            prefix = word[:word.find(stripped)]
-            suffix = word[word.find(stripped) + len(stripped):]
-            corrected_words.append(f"{prefix}{correction}{suffix}")
-            any_corrected = True
-        else:
-            corrected_words.append(word)
-
-    if any_corrected:
-        return " ".join(corrected_words)
-    return query
-
-
 # ── Retrieve chunks ───────────────────────────────────────────────────────
 
 async def retrieve_chunks(
     user_id: str,
     question: str,
-    is_aggregation: bool,
+    is_overview: bool = False,
     doc_id_filter: str | None = None,
     filename_filter: str | None = None,
 ) -> list[dict]:
     """
     Retrieve relevant chunks for answering the question.
-    Applies spell correction before embedding/BM25 for typo tolerance.
+    Misspellings are left to hybrid search: the dense embedding is robust to typos and
+    BM25 still matches every correctly spelled term. (A dictionary spell-checker used to
+    run here; it "corrected" character and place names that aren't English words.)
 
     1. Embed the query
     2. Search Qdrant for top-K similar chunks (optionally scoped to a specific document)
-    3. If aggregation detected, also fetch summary chunks and prepend them
-    """
-    with logfire.span("🔍 Hybrid Retrieval | '{q_short}'", q_short=question[:50], question=question, is_aggregation=is_aggregation, doc_id_filter=doc_id_filter) as span:
-        # Apply spell correction for typo-tolerant BM25 and embedding retrieval
-        corrected_question = correct_query_spelling(question)
-        if corrected_question != question:
-            logger.info(f"Spell-corrected query: '{question}' → '{corrected_question}'")
-            span.set_attribute("spell_corrected", True)
-            span.set_attribute("original_question", question)
-        else:
-            span.set_attribute("spell_corrected", False)
+    3. For whole-document questions (classify_query scope "global"), also prepend the
+       document's summary chunks, when it has any
 
+    Aggregation questions don't get summary chunks: totals over many records are
+    answered by Text-to-SQL on spreadsheets, and a prose summary can't answer them.
+    """
+    with logfire.span("🔍 Hybrid Retrieval | '{q_short}'", q_short=question[:50], question=question, is_overview=is_overview, doc_id_filter=doc_id_filter) as span:
         # Embed the query with dense vector (semantic) and sparse BM25 vector (keyword)
-        query_vector = embedding.embed_query(corrected_question)
-        query_sparse = embedding.embed_sparse_query(corrected_question)
+        query_vector = embedding.embed_query(question)
+        query_sparse = embedding.embed_sparse_query(question)
 
         # Hybrid candidate retrieval (Dense + BM25 via server-side RRF) — top 15 candidates
         candidates = await vector_store.search(
@@ -998,10 +887,7 @@ async def retrieve_chunks(
             span.set_attribute("top_source", results[0].get("filename", "unknown"))
             span.set_attribute("retrieved_sources", list(set(r.get("filename", "unknown") for r in results)))
 
-        # If overview/aggregation detected, fetch and prepend summary chunks and lead chunks
-        is_overview = is_aggregation or is_overview_query(question)
-        span.set_attribute("is_overview_query", is_overview)
-
+        # Whole-document questions: prepend the document's summary chunks (when it has any)
         if is_overview:
             summary_chunks = await vector_store.get_summary_chunks(user_id, doc_id_filter=doc_id_filter)
             if summary_chunks:
@@ -1009,56 +895,7 @@ async def retrieve_chunks(
                 new_summaries = [s for s in summary_chunks if s["id"] not in result_ids][:3]
                 results = new_summaries + results
                 span.set_attribute("summary_chunks_added", len(new_summaries))
-                logger.info(f"Added {len(new_summaries)} summary chunks for overview/aggregation query")
-
-            # For targeted document overview inquiries, anchor with the document's introductory lead chunks
-            if doc_id_filter:
-                try:
-                    from app.database import AsyncSessionLocal
-                    from app.models import Chunk, Document
-                    from sqlalchemy import select
-                    async with AsyncSessionLocal() as db:
-                        lead_doc_name = filename_filter
-                        if not lead_doc_name:
-                            d_res = await db.execute(
-                                select(Document.filename).where(
-                                    Document.id == (UUID(doc_id_filter) if isinstance(doc_id_filter, str) else doc_id_filter)
-                                )
-                            )
-                            lead_doc_name = d_res.scalar_one_or_none() or "document"
-
-                        lead_res = await db.execute(
-                            select(Chunk).where(
-                                Chunk.document_id == (UUID(doc_id_filter) if isinstance(doc_id_filter, str) else doc_id_filter),
-                                Chunk.chunk_index.in_([0, 1]),
-                            ).order_by(Chunk.chunk_index.asc())
-                        )
-                        db_chunks = lead_res.scalars().all()
-                        lead_chunks = [
-                            {
-                                "id": str(c.id),
-                                "document_id": str(c.document_id),
-                                "filename": lead_doc_name,
-                                "page_number": c.page_number,
-                                "row_range_start": c.row_range_start,
-                                "row_range_end": c.row_range_end,
-                                "content": c.content,
-                                "chunk_type": c.chunk_type,
-                                "score": 1.0,
-                            }
-                            for c in db_chunks
-                        ]
-                        if lead_chunks:
-                            result_ids = {r["id"] for r in results}
-                            new_leads = [c for c in lead_chunks if c["id"] not in result_ids]
-                            # Prepend lead chunks so document title/author/intro context comes first
-                            results = new_leads + results
-                            # Keep generous results — reranker already scored them
-                            results = results[:10]
-                            span.set_attribute("lead_chunks_added", len(new_leads))
-                            logger.info(f"Added {len(new_leads)} lead chunks for document {doc_id_filter}")
-                except Exception as e:
-                    logger.warning(f"Failed to fetch lead chunks for doc {doc_id_filter}: {e}")
+                logger.info(f"Added {len(new_summaries)} summary chunks for overview query")
 
         release_memory()
         return results
@@ -1069,7 +906,7 @@ async def retrieve_chunks(
 SYSTEM_PROMPT = """You are a helpful document Q&A assistant. Your job is to answer questions based ONLY on the provided context chunks from the user's uploaded documents.
 
 RULES:
-1. Answer ONLY using information explicitly stated in the provided context chunks. Do NOT infer, speculate, synthesize, or add information beyond what is directly supported by the context.
+1. Answer ONLY using information explicitly stated in the provided context chunks. Do NOT infer, speculate, synthesize, or add information beyond what is directly supported by the context. You may draw conclusions that the context clearly supports, but quote the evidence and say it’s an inference.
 2. If asked about a document (e.g. "Tell me about [book/doc]", "What is this file/paper about?", "Summarize [doc]"):
    - Provide a well-structured overview using ONLY the details explicitly present in the provided context chunks.
    - Be transparent about what the context chunks contain.
@@ -1094,7 +931,12 @@ RULES:
    - Do NOT describe proposed solutions, planned features, or future goals (e.g., "they plan to...", "they will...", "they aim to provide...", "the platform offers...") as problem statements.
    - Example of WRONG answer to "what are the problems?": "They aim to provide accessible mental health resources" — this describes a SOLUTION, not a problem.
    - Example of CORRECT answer to "what are the problems?": "Students lack accessible mental health resources" or "Rising anxiety and isolation among students" — these describe actual PROBLEMS.
-   - When the document contains both problems and solutions, ALWAYS present the actual problems first, clearly labeled, before mentioning any solutions."""
+   - When the document contains both problems and solutions, ALWAYS present the actual problems first, clearly labeled, before mentioning any solutions.
+10. Direct Factual Answers & Focused Scope:
+   - For specific factual questions (e.g. "What is the position?", "What is the salary?", "What is the purpose?"), state the direct answer clearly and concisely in the opening sentence before providing any additional context or details.
+   - Answer only what the user specifically asked for. Do NOT append unsolicited dumps of other unrelated metadata fields (such as start date, duration, or work mode) unless the question explicitly asked for them.
+11. Definitive Phrasing for Negative or Zero Values:
+   - When an attribute, salary, stipend, compensation, fee, or feature is described as unpaid, zero, none, not applicable, or not provided, state this affirmatively and definitively as a complete sentence (e.g., "According to the document, the position is an unpaid internship with no monetary salary or stipend provided [Page X].") rather than a bare fragment or single-word bullet point like "- Unpaid" or "- None"."""
 
 
 # ── Contextual Compression ────────────────────────────────────────────────
@@ -1443,252 +1285,3 @@ def validate_citations(
 
         span.set_attribute("valid_citations_count", len(valid_citations))
         return valid_citations
-
-
-# ── Text-to-SQL pipeline ──────────────────────────────────────────────────
-
-SQL_GENERATION_PROMPT = """You are an expert SQL query generator. Given a database schema and a user question, generate a DuckDB-compatible SQL SELECT query that answers the question.
-
-RULES:
-1. Generate ONLY a single SQL SELECT statement. No INSERT, UPDATE, DELETE, DROP, or any DDL.
-2. Output ONLY the raw SQL — no explanation, no notes, no commentary.
-3. Use the exact table and column names from the schema.
-4. For aggregations (SUM, AVG, COUNT, MIN, MAX), apply them on the correct numeric columns.
-5. If the user asks an open-ended, overview, exploratory, or summary question about the spreadsheet/table data (e.g. "key findings", "summary", "overview", "what are the trends", "tell me about the data", "findings in <filename>"):
-   You MUST generate a meaningful analytical aggregation query on the main data table!
-   - For example: SELECT count(*) AS total_records, round(avg(CashbackAmount), 2) AS avg_cashback, sum(Churn) AS churn_count FROM <table>;
-   - Or group by the primary category or status column with count(*);
-   - Do NOT return CANNOT_ANSWER for exploratory data analysis, summaries, or key findings questions on tabular datasets.
-6. ONLY return CANNOT_ANSWER if the user question has NOTHING to do with any tabular data and is clearly asking about a non-tabular file (such as a literary novel plot, a signed offer letter, or a research paper's methodology).
-7. Always alias aggregated columns with meaningful names (e.g., total_customers, avg_monthly_charges).
-8. Handle NULL or blank values appropriately: for text/varchar columns containing numbers or spaces, ALWAYS use TRY_CAST(TRIM(col) AS DOUBLE) instead of CAST to avoid conversion errors.
-9. If the user asks for "all data" or something very broad, use LIMIT 50.
-10. Use ILIKE for case-insensitive text matching when filtering by text values."""
-
-
-SQL_ANSWER_PROMPT = """You are a helpful data analyst assistant. You have been given the results of a SQL query executed on the user's uploaded spreadsheet data.
-
-RULES:
-1. Present the data in a clear, well-formatted Markdown response.
-2. Use tables for tabular results, bullet points for summaries.
-3. If the result has numeric aggregations, highlight the key numbers in bold.
-4. Add brief interpretive commentary (e.g., "The highest revenue was **$52,000** from the East region.").
-5. If the result is empty, explain that no matching data was found.
-6. Be concise but thorough.
-7. Reference the data source as "your uploaded spreadsheet data".
-8. Do NOT mention SQL queries, databases, or technical details unless the user explicitly asked for the SQL."""
-
-
-def _extract_sql(content: str) -> str | None:
-    """Extract a valid SQL SELECT statement from raw LLM output."""
-    if not content:
-        return None
-    if "CANNOT_ANSWER" in content:
-        return None
-    # 1. Match inside ```sql ... ``` or ``` ... ```
-    m = re.search(r"```(?:sql)?\s*(SELECT\b[\s\S]*?)```", content, re.IGNORECASE)
-    if m:
-        sql = m.group(1).strip().rstrip(";")
-        return sql
-    # 2. Match raw SELECT statement
-    m = re.search(r"\b(SELECT\b[\s\S]*?)(?:;\s*$|\Z)", content, re.IGNORECASE)
-    if m:
-        sql = m.group(1).strip().rstrip(";")
-        sql = re.sub(r"```.*$", "", sql, flags=re.DOTALL).strip().rstrip(";")
-        return sql
-    return None
-
-
-async def generate_sql_query(
-    question: str,
-    schema_info: str,
-    chat_history: list[dict] | None = None,
-) -> str | None:
-    """
-    Ask the LLM to generate a SQL query for the given question and schema.
-
-    Returns the SQL string, or None if the question can't be answered with SQL.
-    """
-    with logfire.span("📝 Generate DuckDB SQL | '{q_short}'", q_short=question[:50], question=question) as span:
-        messages: list[dict] = [
-            {"role": "system", "content": SQL_GENERATION_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Database schema:\n\n{schema_info}\n\n"
-                    f"User question: {question}\n\n"
-                    f"SQL query:"
-                ),
-            },
-        ]
-
-        try:
-            response = await call_llm_with_fallback(
-                messages=messages,
-                max_tokens=400,
-                temperature=0.0,
-                fast=True,
-            )
-            content = (response.choices[0].message.content or "").strip()
-            reasoning = (getattr(response.choices[0].message, "reasoning", None) or "").strip()
-
-            sql = _extract_sql(content) or _extract_sql(reasoning)
-            if not sql:
-                logger.info(f"LLM says question cannot be answered with SQL or gave non-SELECT output: '{question[:80]}'")
-                span.set_attribute("sql_generated", False)
-                return None
-
-            logger.info(f"Generated SQL: {sql}")
-            span.set_attribute("sql_generated", True)
-            span.set_attribute("sql", sql)
-            return sql
-
-        except Exception as e:
-            logger.warning(f"SQL generation failed: {e}")
-            span.set_attribute("sql_generated", False)
-            span.set_attribute("error", str(e))
-            return None
-
-
-def format_sql_result(result: dict) -> str:
-    """
-    Format SQL query results as a readable string for the LLM context.
-    """
-    columns = result["columns"]
-    rows = result["rows"]
-
-    if not rows:
-        return "The query returned no results."
-
-    # Build a simple text table
-    lines = []
-    header = " | ".join(str(c) for c in columns)
-    lines.append(header)
-    lines.append("-" * len(header))
-
-    for row in rows:
-        lines.append(" | ".join(str(v) for v in row))
-
-    if result.get("truncated"):
-        lines.append(f"\n... (showing first {result['row_count']} of many rows)")
-
-    return "\n".join(lines)
-
-
-async def generate_sql_answer_stream(
-    question: str,
-    sql_query: str,
-    sql_result_text: str,
-) -> AsyncGenerator[str, None]:
-    """
-    Stream an LLM answer that interprets the SQL results for the user.
-    """
-    with logfire.span("🦆 Stream SQL Answer | '{q_short}'", q_short=question[:50], question=question, sql_query=sql_query) as span:
-        groq = _get_groq()
-
-        messages = [
-            {"role": "system", "content": SQL_ANSWER_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"SQL query executed:\n{sql_query}\n\n"
-                    f"Query results:\n{sql_result_text}\n\n"
-                    f"User's question: {question}\n\n"
-                    f"Please provide a clear, formatted answer:"
-                ),
-            },
-        ]
-
-        token_count = 0
-        async for token in stream_llm_with_fallback(
-            messages=messages,
-            max_tokens=1000,
-            temperature=0.1,
-        ):
-            token_count += 1
-            yield token
-        span.set_attribute("tokens_generated", token_count)
-
-
-async def check_tabular_data(user_id: str) -> bool:
-    """
-    Check if the user has any tabular data in DuckDB.
-    Runs the check in a thread to avoid blocking the event loop.
-    """
-    import asyncio
-    return await asyncio.to_thread(tabular_store.has_tabular_data, user_id)
-
-
-TABULAR_OVERVIEW_PROMPT = """You are an expert data analyst assistant. The user is asking a question about an uploaded spreadsheet/tabular dataset.
-You have access to the table schema, column names, types, and sample rows from DuckDB.
-
-RULES:
-1. Provide a clear, structured, and insightful response based on the dataset's columns and sample data.
-2. If the user asked for "key findings", "summary", or "overview", analyze the business domain, the variables tracked, key metrics, and highlight notable patterns visible in the schema and sample data.
-3. Suggest specific quantitative questions the user can ask next (e.g. churn rates by customer status, average tenure, correlation between satisfaction score and churn, etc.).
-4. Use clean Markdown formatting with bullet points and bold highlights.
-5. Reference the dataset by its filename if provided, or as "your uploaded spreadsheet data".
-6. Do NOT mention DuckDB, table prefixes (like t_...), or database internals."""
-
-
-async def generate_tabular_overview_stream(
-    question: str,
-    schema_info: str,
-    filename: str = "",
-) -> AsyncGenerator[str, None]:
-    """
-    Stream an overview/insight response for tabular data when SQL cannot be generated or fails.
-    """
-    with logfire.span("📊 Stream Tabular Overview | {filename}", filename=filename or "Spreadsheet", question=question) as span:
-        messages = [
-            {"role": "system", "content": TABULAR_OVERVIEW_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Dataset: {filename}\n\n"
-                    f"Database Schema and Sample Rows:\n{schema_info}\n\n"
-                    f"User question: {question}\n\n"
-                    f"Please provide an insightful, structured response answering the user's question based on this dataset:"
-                ),
-            },
-        ]
-        token_count = 0
-        async for token in stream_llm_with_fallback(
-            messages=messages,
-            max_tokens=1000,
-            temperature=0.2,
-        ):
-            token_count += 1
-            yield token
-        span.set_attribute("tokens_generated", token_count)
-
-
-async def get_schema_for_prompt(user_id: str, doc_id: UUID | None = None) -> str:
-    """
-    Get the DuckDB schema for the user (optionally scoped to a specific doc_id), formatted for the LLM prompt.
-    Runs in a thread to avoid blocking.
-    """
-    import asyncio
-    return await asyncio.to_thread(tabular_store.get_table_schema, user_id, doc_id)
-
-
-async def execute_sql_query(user_id: str, sql: str) -> dict:
-    """
-    Execute a SQL query on the user's DuckDB.
-    Runs in a thread to avoid blocking.
-    """
-    import asyncio
-    with logfire.span("🦆 Execute DuckDB SQL | '{sql_short}'", sql_short=sql[:50], sql=sql) as span:
-        result = await asyncio.to_thread(tabular_store.execute_sql, user_id, sql)
-        span.set_attribute("row_count", result.get("row_count", 0))
-        span.set_attribute("columns", result.get("columns", []))
-        return result
-
-
-async def get_tabular_tables(user_id: str) -> list[str]:
-    """
-    Get list of table names in the user's DuckDB.
-    Runs in a thread to avoid blocking.
-    """
-    import asyncio
-    return await asyncio.to_thread(tabular_store.list_tables, user_id)

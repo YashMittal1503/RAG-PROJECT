@@ -21,6 +21,11 @@ METRICS: dict[str, Metric] = {
     "correctness (judge)": lambda s: s.judge_score,
     "answer match": lambda s: s.exact_match,
     "token F1": lambda s: s.token_f1,
+    "key-point recall": lambda s: s.key_point_recall,
+    "faithfulness (RAGAS)": lambda s: s.ragas.get("faithfulness"),
+    "answer relevancy (RAGAS)": lambda s: s.ragas.get("answer_relevancy"),
+    "context precision@5 (RAGAS)": lambda s: s.ragas.get("context_precision"),
+    "context recall (RAGAS)": lambda s: s.ragas.get("context_recall"),
     "evidence recall@5": lambda s: s.evidence_recall_at_k.get(5),
     "evidence recall@10": lambda s: s.evidence_recall_at_k.get(10),
     "MRR": lambda s: s.mrr,
@@ -31,12 +36,16 @@ METRICS: dict[str, Metric] = {
     "false refusal (answerable)": lambda s: s.false_refusal,
     "route accuracy": lambda s: s.route_correct,
     "doc routing accuracy": lambda s: s.doc_correct,
+    "query scope accuracy": lambda s: s.scope_correct,
+    "aggregation detection accuracy": lambda s: s.aggregation_correct,
+    "SQL executed": lambda s: s.sql_executed,
+    "SQL result match": lambda s: s.sql_result_match,
     "error rate": lambda s: 1.0 if s.error else 0.0,
 }
 # Metrics where lower is better (affects comparison arrows).
 LOWER_IS_BETTER = {"false refusal (answerable)", "error rate"}
-HEADLINE = ["correctness (judge)", "evidence recall@10", "MRR", "citation precision",
-            "correct refusal (unanswerable)", "false refusal (answerable)"]
+HEADLINE = ["correctness (judge)", "faithfulness (RAGAS)", "answer relevancy (RAGAS)", "context recall (RAGAS)",
+            "evidence recall@10", "MRR", "correct refusal (unanswerable)", "SQL result match"]
 
 
 def bootstrap_ci(values: list[float], n: int = 2000, seed: int = 0) -> tuple[float, float]:
@@ -81,9 +90,17 @@ def summarize(scores: list[ItemScore]) -> dict:
             "completion_mean": statistics.mean(s.completion_tokens for s in group),
         }
         out["n_items"] = len(group)
+        out["n_scoring_errors"] = sum(1 for s in group if s.scoring_errors)
         return out
 
-    return {"overall": block(scores), "by_category": {c: block(g) for c, g in sorted(by_cat.items())}}
+    by_doc: dict[str, list[ItemScore]] = defaultdict(list)
+    for s in scores:
+        by_doc[s.doc or "(multiple / none)"].append(s)
+    return {
+        "overall": block(scores),
+        "by_category": {c: block(g) for c, g in sorted(by_cat.items())},
+        "by_document": {d: block(g) for d, g in sorted(by_doc.items())},
+    }
 
 
 def compare(a: list[ItemScore], b: list[ItemScore], n: int = 2000, seed: int = 0) -> dict:
@@ -131,9 +148,13 @@ def render_markdown(summary: dict, meta: dict) -> str:
         "",
         f"- Run: `{meta.get('run_id')}`",
         f"- Dataset: `{meta.get('dataset')}` (hash `{meta.get('dataset_hash')}`), {o['n_items']} items",
-        f"- Corpus hash: `{meta.get('corpus_hash')}` · Judge: `{meta.get('judge_model') or 'disabled'}`",
+        f"- Corpus hash: `{meta.get('corpus_hash')}` · Judge: `{meta.get('judge_model') or 'disabled'}`"
+        + (f" ({meta['judge_provider']})" if meta.get("judge_provider") else "")
+        + (f" · RAGAS {meta['ragas']['ragas_version']}" if meta.get("ragas") else " · RAGAS: off"),
         "",
         "Values are means with bootstrap 95% CIs; n = items the metric applies to.",
+        *([f"", f"**{o['n_scoring_errors']} item(s) not fully scored** (judge/RAGAS call failed, e.g. rate limit). "
+           f"Run `python -m eval rescore <run>` to fill them in; finished calls are cached."] if o.get("n_scoring_errors") else []),
         "",
         "## Overall",
         "",
@@ -148,11 +169,12 @@ def render_markdown(summary: dict, meta: dict) -> str:
         f"| tokens (prompt / completion, mean) | {o['tokens']['prompt_mean']:.0f} / {o['tokens']['completion_mean']:.0f} |"
     )
 
-    lines += ["", "## By category", "", "| Category | n | " + " | ".join(HEADLINE) + " |",
-              "|---|---|" + "---|" * len(HEADLINE)]
-    for cat, blk in summary["by_category"].items():
-        cells = [f"{blk[h]['mean']:.2f}" if blk.get(h) else "—" for h in HEADLINE]
-        lines.append(f"| {cat} | {blk['n_items']} | " + " | ".join(cells) + " |")
+    for title, key, label in (("By category", "by_category", "Category"), ("By document", "by_document", "Document")):
+        lines += ["", f"## {title}", "", f"| {label} | n | " + " | ".join(HEADLINE) + " |",
+                  "|---|---|" + "---|" * len(HEADLINE)]
+        for name, blk in summary.get(key, {}).items():
+            cells = [f"{blk[h]['mean']:.2f}" if blk.get(h) else "—" for h in HEADLINE]
+            lines.append(f"| {name} | {blk['n_items']} | " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"
 
 

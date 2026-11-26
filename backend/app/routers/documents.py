@@ -9,6 +9,7 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 import logfire
@@ -26,6 +27,27 @@ from app.services.ingestion import ingest_document
 from app.utils.file_validation import validate_file_type
 
 logger = logging.getLogger(__name__)
+
+# Retain strong references to running background tasks to prevent premature GC,
+# and log any unhandled exceptions when they complete.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _track_ingestion_task(task: asyncio.Task, doc_id: Any) -> None:
+    _background_tasks.add(task)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if not t.cancelled():
+            exc = t.exception()
+            if exc:
+                logger.error(
+                    f"Background ingestion task for doc {doc_id} failed with unhandled exception: {exc}",
+                    exc_info=exc,
+                )
+
+    task.add_done_callback(_on_done)
+
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
@@ -101,7 +123,7 @@ async def upload_documents(
                 await db.refresh(doc)
 
                 # Start background ingestion (non-blocking) after record is committed
-                asyncio.create_task(
+                ingest_task = asyncio.create_task(
                     ingest_document(
                         doc_id=doc_id,  
                         user_id=user_id,
@@ -110,6 +132,7 @@ async def upload_documents(
                         storage_path=storage_path,
                     )
                 )
+                _track_ingestion_task(ingest_task, doc_id)
 
                 documents.append(DocumentResponse.model_validate(doc))
                 logfire.info(
@@ -292,7 +315,7 @@ async def retry_document(
         await db.refresh(doc)
 
         # Re-trigger background ingestion
-        asyncio.create_task(
+        retry_task = asyncio.create_task(
             ingest_document(
                 doc_id=doc.id,
                 user_id=user_id,
@@ -301,6 +324,7 @@ async def retry_document(
                 storage_path=doc.storage_path,
             )
         )
+        _track_ingestion_task(retry_task, doc.id)
 
         logfire.info(
             "Retrying document {doc_id} ('{filename}')",

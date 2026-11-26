@@ -60,6 +60,22 @@ class _Judge:
         ok = (not item.answerable and "not available" in answer) or (item.answer and item.answer in answer)
         return Verdict("correct" if ok else "wrong", 1.0 if ok else 0.0, "fake")
 
+    async def key_point_recall(self, item, answer):
+        return {"key_point_recall": 1.0, "missed_key_points": []}
+
+
+class _Ragas:
+    """Stands in for RagasScorer: faithful when the answer is the gold answer."""
+
+    def config(self):
+        return {"ragas_version": "fake", "model": "fake-judge", "metrics": ["faithfulness"]}
+
+    async def score(self, item, pred, refused):
+        if refused or not pred.contexts:
+            return {"ragas": {}, "unsupported_claims": []}
+        ok = bool(item.answer) and item.answer in pred.answer
+        return {"ragas": {"faithfulness": 1.0 if ok else 0.0}, "unsupported_claims": [] if ok else ["x"]}
+
 
 @pytest.mark.anyio
 async def test_full_run_rescore_compare_calibrate(tmp_path, monkeypatch):
@@ -72,7 +88,7 @@ async def test_full_run_rescore_compare_calibrate(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner, "get_system", _fake_get_system)
     common = dict(dataset_path=str(DATA / "smoke.jsonl"), corpus_path=str(DATA / "smoke_corpus.yaml"),
-                  out_dir=tmp_path, judge=_Judge())
+                  out_dir=tmp_path, judge=_Judge(), ragas=_Ragas())
 
     good = await runner.run("oracle", **common)
     bad = await runner.run("broken", **common)
@@ -88,9 +104,17 @@ async def test_full_run_rescore_compare_calibrate(tmp_path, monkeypatch):
     assert all(s.correct_refusal == 1.0 for s in scores if not s.answerable)
 
     # Rescore without a judge keeps offline metrics and drops judge labels.
+    faithful = [s for s in scores if s.ragas]
+    assert faithful and all(s.ragas["faithfulness"] == 1.0 for s in faithful)
+    report = (good / "report.md").read_text(encoding="utf-8")
+    assert "## By document" in report and "faithfulness (RAGAS)" in report
+
+    # Rescore without a judge keeps offline metrics and drops judge labels and RAGAS.
     await runner.rescore(good, use_judge=False)
-    assert all(s.judge_score is None for s in load_scores(good))
-    await runner.rescore(good, judge=_Judge())
+    rescored = load_scores(good)
+    assert all(s.judge_score is None and not s.ragas for s in rescored)
+    await runner.rescore(good, judge=_Judge(), ragas=_Ragas())
+    assert load_scores(good)[0].judge_score is not None
 
     cmp = compare(load_scores(bad), load_scores(good))
     assert cmp["metrics"]["correctness (judge)"]["b_better"] is True

@@ -95,7 +95,7 @@ async def main():
             logger.info(f"Point contains BM25 sparse vector: {has_bm25}")
 
         # Test Native Hybrid Search with RRF
-        test_query = "Python programming variables functions Colleen Hoover Verity"
+        test_query = "document summary and key findings"
         q_dense = embedding.embed_query(test_query)
         q_sparse = embedding.embed_sparse_query(test_query)
         logger.info(f"Testing Hybrid Search on {coll_name} with query: '{test_query}'...")

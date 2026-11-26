@@ -5,6 +5,9 @@ Uses Pydantic Settings to validate and type-check all config values at startup.
 If any required env var is missing, the app fails fast with a clear error.
 """
 
+import os
+import re
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,7 +18,19 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="allow",  # numbered keys beyond _3 (GROQ_API_KEY_4, _5, ...) land here; see _numbered_keys
     )
+
+    def _numbered_keys(self, provider: str) -> list[str]:
+        """Any <PROVIDER>_API_KEY_<n> from .env or the environment, in numeric order (no fixed upper limit)."""
+        pat = re.compile(rf"^{provider}_api_key_(\d+)$", re.I)
+        found: dict[int, str] = {}
+        for source in ((self.model_extra or {}), os.environ):
+            for name, value in source.items():
+                m = pat.match(name)
+                if m and isinstance(value, str) and value.strip():
+                    found.setdefault(int(m.group(1)), value)
+        return [found[n] for n in sorted(found)]
 
     # ── Supabase ──────────────────────────────────────────────────────────
     supabase_url: str
@@ -78,12 +93,33 @@ class Settings(BaseSettings):
     mistral_api_keys: str | None = None
     mistral_model: str = "ministral-3b-2512"
 
+    # ── NVIDIA NIM (free, ~40 RPM, OpenAI-compatible: https://build.nvidia.com) ──
+    nvidia_api_key: str | None = None
+    nvidia_api_key_2: str | None = None
+    nvidia_api_key_3: str | None = None
+    nvidia_api_keys: str | None = None
+    nvidia_model: str = "nvidia/nemotron-3-ultra-550b-a55b"   # answer generation
+    nvidia_fast_model: str = "nvidia/nemotron-3-ultra-550b-a55b"  # intent / rewrite / SQL
+    nvidia_backup_model: str = "minimaxai/minimax-m3.1-flash"  # tried if the first is unavailable or limited
+    # (checked 2026-11-23: NVIDIA retired gpt-oss-120b and qwen3.5-397b; several others time out on the free tier)
+
+    def get_nvidia_keys(self) -> list[str]:
+        """Collect all configured NVIDIA NIM API keys."""
+        return _parse_keys(
+            self.nvidia_api_key,
+            self.nvidia_api_key_2,
+            self.nvidia_api_key_3,
+            *self._numbered_keys("nvidia"),
+            comma_separated=self.nvidia_api_keys,
+        )
+
     def get_groq_keys(self) -> list[str]:
         """Collect all configured Groq API keys."""
         return _parse_keys(
             self.groq_api_key,
             self.groq_api_key_2,
             self.groq_api_key_3,
+            *self._numbered_keys("groq"),
             comma_separated=self.groq_api_keys,
         )
 
@@ -93,6 +129,7 @@ class Settings(BaseSettings):
             self.gemini_api_key,
             self.gemini_api_key_2,
             self.gemini_api_key_3,
+            *self._numbered_keys("gemini"),
             comma_separated=self.gemini_api_keys,
         )
 
@@ -102,6 +139,7 @@ class Settings(BaseSettings):
             self.openrouter_api_key,
             self.openrouter_api_key_2,
             self.openrouter_api_key_3,
+            *self._numbered_keys("openrouter"),
             comma_separated=self.openrouter_api_keys,
         )
 
@@ -111,6 +149,7 @@ class Settings(BaseSettings):
             self.mistral_api_key,
             self.mistral_api_key_2,
             self.mistral_api_key_3,
+            *self._numbered_keys("mistral"),
             comma_separated=self.mistral_api_keys,
         )
 

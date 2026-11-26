@@ -9,6 +9,7 @@ import pytest
 import app.services as app_services
 from eval.corpus import load_manifest
 from eval.schema import GoldItem, Turn
+from app.services.query import QueryClassification
 from eval.systems.vanilla import NO_CHUNKS_MESSAGE, VanillaRAG
 
 DATA = Path(__file__).resolve().parents[1] / "eval" / "data"
@@ -24,13 +25,14 @@ class _Scope:
         self.is_tabular = False
 
 
-def _install_fake_query(monkeypatch, *, intent="retrieve", scope=None, chunks=None, answer="Elias [Page 1]"):
+def _install_fake_query(monkeypatch, *, intent="retrieve", scope=None, chunks=None, answer="Elias [Page 1]",
+                        scope_kind="targeted"):
     calls = {}
     q = types.ModuleType("app.services.query")
 
-    async def classify_intent(question, history):
+    async def classify_query(question, history):
         calls["history"] = history
-        return intent
+        return QueryClassification(intent, scope_kind, False)
 
     async def analyze_document_scope(question, history, library):
         calls["library"] = library
@@ -39,19 +41,18 @@ def _install_fake_query(monkeypatch, *, intent="retrieve", scope=None, chunks=No
     async def rewrite_query(question, history):
         return question + " (rewritten)"
 
-    async def retrieve_chunks(user_id, question, is_aggregation, doc_id_filter=None, filename_filter=None):
-        calls["retrieve"] = dict(user_id=user_id, question=question, doc_id_filter=doc_id_filter)
+    async def retrieve_chunks(user_id, question, is_overview=False, doc_id_filter=None, filename_filter=None):
+        calls["retrieve"] = dict(user_id=user_id, question=question, doc_id_filter=doc_id_filter, is_overview=is_overview)
         return chunks or []
 
     async def _gen(*a, **k):
         for tok in answer.split(" "):
             yield tok + " "
 
-    q.classify_intent = classify_intent
+    q.classify_query = classify_query
     q.analyze_document_scope = analyze_document_scope
     q.rewrite_query = rewrite_query
     q.retrieve_chunks = retrieve_chunks
-    q.detect_aggregation = lambda s: False
     q.generate_answer_stream = lambda question, chunks: _gen()
     q.generate_direct_response = lambda question, history: _gen()
     q.SYSTEM_PROMPT = "system"
@@ -91,6 +92,8 @@ async def test_rag_path_maps_docs_contexts_and_citations(monkeypatch, docs):
     assert pred.citations[0].doc == "lighthouse"
     assert calls["retrieve"]["user_id"] == "eval-tenant"
     assert calls["retrieve"]["doc_id_filter"] == lighthouse.uuid
+    assert calls["retrieve"]["is_overview"] is False
+    assert (pred.intent, pred.query_scope, pred.aggregation) == ("retrieve", "targeted", False)
     assert calls["history"] == [{"role": "user", "content": "hi", "citations": None}]
     assert {d["filename"] for d in calls["library"]} == {d.filename for d in docs}
     assert {"intent", "scope", "rewrite", "retrieve", "generate"} <= set(pred.timings_ms)
@@ -123,3 +126,13 @@ async def test_errors_are_captured_not_raised(monkeypatch, docs):
     pred = await VanillaRAG(docs).answer(GoldItem(id="x", question="q", answerable=False, category="unanswerable"))
     assert pred.error == "RuntimeError: qdrant down"
     assert "retrieve" not in pred.timings_ms and "intent" in pred.timings_ms
+
+
+@pytest.mark.anyio
+async def test_global_scope_asks_retrieval_for_summary_chunks(monkeypatch, docs):
+    lighthouse = next(d for d in docs if d.id == "lighthouse")
+    chunks = [{"content": "story", "filename": lighthouse.filename, "page_number": 1, "score": 0.9}]
+    calls = _install_fake_query(monkeypatch, scope=_Scope("resolved", lighthouse), chunks=chunks, scope_kind="global")
+    pred = await VanillaRAG(docs).answer(GoldItem(id="g", question="Summarize the story", answer="A story.",
+                                                  evidence=[{"doc": "lighthouse", "quote": "Morning, Elias!"}]))
+    assert calls["retrieve"]["is_overview"] is True and pred.query_scope == "global"

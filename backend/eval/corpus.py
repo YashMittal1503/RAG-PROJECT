@@ -14,7 +14,9 @@ Manifest format (paths are relative to the manifest file):
 
 Ingestion reuses the app's own parsing, chunking and embedding code, writing the
 same Qdrant payload shape as app/services/ingestion.py, but skips Supabase
-Storage and Postgres.
+Storage and Postgres. Spreadsheets (CSV/XLSX) follow the app's Text-to-SQL path:
+each sheet is stored as a DuckDB table in the eval tenant's own DuckDB file
+(data/tabular/<eval user id>.duckdb) and is not chunked or embedded.
 """
 
 from __future__ import annotations
@@ -34,7 +36,9 @@ logger = logging.getLogger(__name__)
 # Fixed namespace so doc uuids are stable across machines and runs.
 _DOC_NAMESPACE = uuid.UUID("6f1c2a4e-3b0d-4c55-9a8e-5d7e0b1f2a33")
 DEFAULT_EVAL_USER_ID = "00000000-0000-4000-8000-0000000e7a11"
-SUPPORTED_TYPES = {"pdf", "txt"}
+TEXT_TYPES = {"pdf", "txt"}
+TABULAR_TYPES = {"csv", "xlsx"}
+SUPPORTED_TYPES = TEXT_TYPES | TABULAR_TYPES
 
 
 def eval_user_id() -> str:
@@ -58,6 +62,10 @@ class CorpusDoc:
     @property
     def file_type(self) -> str:
         return self.path.suffix.lower().lstrip(".")
+
+    @property
+    def is_tabular(self) -> bool:
+        return self.file_type in TABULAR_TYPES
 
     @property
     def uuid(self) -> str:
@@ -107,10 +115,24 @@ def ensure_files(docs: list[CorpusDoc]) -> None:
             raise ValueError(f"{doc.id}: sha256 mismatch for {doc.path} (file changed; update the manifest on purpose)")
 
 
+def read_sheets(doc: CorpusDoc):
+    """Parse a spreadsheet exactly as the app does (list of SheetData: name + DataFrame)."""
+    from app.services.parsing import parse_spreadsheet
+
+    return parse_spreadsheet(doc.path.read_bytes(), doc.file_type)
+
+
 def read_pages(doc: CorpusDoc) -> list[tuple[int, str]]:
-    """Return (page_number, text) pairs exactly as the app's parsers produce them."""
+    """Return (page_number, text) pairs exactly as the app's parsers produce them.
+
+    Spreadsheets are rendered as one CSV-like "page" per sheet, so evidence quotes
+    can still be validated against cell values.
+    """
     from app.services.parsing import parse_pdf, parse_txt
 
+    if doc.is_tabular:
+        sheets = read_sheets(doc)
+        return [(n, f"# {sheet.name}\n{sheet.df.to_csv(index=False)}") for n, sheet in enumerate(sheets, start=1)]
     raw = doc.path.read_bytes()
     if doc.file_type == "pdf":
         return [(p.page_number, p.text) for p in parse_pdf(raw)]
@@ -128,6 +150,25 @@ def corpus_hash(docs: list[CorpusDoc]) -> str:
         h.update(d.id.encode())
         h.update(_sha256(d.path).encode())
     return h.hexdigest()[:12]
+
+
+def _index_tabular(doc: CorpusDoc, user_id: str, tabular_store) -> int:
+    """Store every sheet as a DuckDB table, as app/services/ingestion.py does. Returns rows stored."""
+    tabular_store.delete_tables(user_id, uuid.UUID(doc.uuid))  # drop stale sheets from earlier versions
+    rows = 0
+    for sheet in read_sheets(doc):
+        rows += tabular_store.store_dataframe(user_id, uuid.UUID(doc.uuid), sheet.name, sheet.df)["rows"]
+    logger.info(f"Indexed {doc.id}: {rows} rows into DuckDB")
+    return rows
+
+
+def _drop_table(user_id: str, table: str, tabular_store) -> None:
+    conn = tabular_store._connect(tabular_store._db_path(user_id))
+    try:
+        conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+        conn.execute("CHECKPOINT")
+    finally:
+        conn.close()
 
 
 def _state_file() -> Path:
@@ -166,9 +207,14 @@ async def index_corpus(docs: list[CorpusDoc], user_id: str | None = None, force:
         logger.info(f"Eval corpus already indexed for tenant {user_id} (signature {signature}); skipping.")
         return {"skipped": True, "signature": signature}
 
+    from app.services import tabular_store
+
     await vector_store.ensure_collection(user_id, force_recreate=True)
     totals: dict[str, int] = {}
     for doc in docs:
+        if doc.is_tabular:
+            totals[doc.id] = _index_tabular(doc, user_id, tabular_store)
+            continue
         pages = [PageText(page_number=n, text=t) for n, t in read_pages(doc)]
         chunks = chunk_text(pages, filename=doc.filename)
         if not chunks:
@@ -203,6 +249,12 @@ async def index_corpus(docs: list[CorpusDoc], user_id: str | None = None, force:
             await vector_store.upsert_chunks(user_id, points)
         totals[doc.id] = len(chunks)
         logger.info(f"Indexed {doc.id}: {len(chunks)} chunks")
+
+    # Drop tables of spreadsheets that are no longer in the corpus, so they can't leak into SQL prompts.
+    keep = {f"t_{tabular_store._table_prefix(uuid.UUID(d.uuid))}_" for d in docs if d.is_tabular}
+    for table in tabular_store.list_tables(user_id):
+        if not any(table.startswith(k) for k in keep):
+            _drop_table(user_id, table, tabular_store)
 
     state[user_id] = signature
     state_path.parent.mkdir(parents=True, exist_ok=True)

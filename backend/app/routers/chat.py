@@ -1,8 +1,7 @@
 """
 Chat endpoints: session management and streaming Q&A.
 
-The query endpoint uses SSE (Server-Sent Events) to stream
-the LLM response token-by-token to the frontend.
+The query endpoint uses SSE (Server-Sent Events) to stream the LLM response token-by-token to the frontend.
 """
 
 import asyncio
@@ -30,22 +29,20 @@ from app.schemas import (
 )
 from app.services.query import (
     analyze_document_scope,
-    check_tabular_data,
-    classify_intent,
-    detect_aggregation,
-    execute_sql_query,
-    format_sql_result,
+    classify_query,
     generate_answer_stream,
     generate_chat_title,
     generate_direct_response,
-    generate_sql_answer_stream,
-    generate_sql_query,
-    generate_tabular_overview_stream,
-    get_schema_for_prompt,
-    get_tabular_tables,
     retrieve_chunks,
     rewrite_query,
     validate_citations,
+)
+from app.services.doc_profiles import attach_document_profiles
+from app.services.tabular_qa import (
+    attach_tabular_profiles,
+    check_tabular_data,
+    plan_tabular_answer,
+    stream_tabular_answer,
 )
 
 logger = logging.getLogger(__name__)
@@ -279,6 +276,22 @@ async def query(
                 logger.warning(f"Failed to auto-generate or save session title: {e}")
         return None
 
+    async def _save_assistant_message(
+        content: str,
+        citations: list[dict] | None = None,
+    ) -> None:
+        """Persist an assistant message and optional citations to the database."""
+        async with AsyncSessionLocal() as save_db:
+            assistant_msg = ChatMessage(
+                session_id=session_id,
+                role="assistant",
+                content=content,
+                citations=citations if citations else None,
+                created_at=datetime.now(timezone.utc),
+            )
+            save_db.add(assistant_msg)
+            await save_db.commit()
+
     async def event_stream():
         """SSE event generator."""
         with logfire.span(
@@ -294,11 +307,16 @@ async def query(
                 yield ": ping\n\n"
                 await asyncio.sleep(0)
 
-                # Step 0: Classify intent — does this need document retrieval?
-                intent = await classify_intent(body.question, chat_history)
+                # Step 0: Classify the query — chitchat or retrieval, how much of the
+                # document it needs (scope), and whether it aggregates over many records.
+                query_class = await classify_query(body.question, chat_history)
+                intent = query_class.intent
                 chat_span.set_attribute("intent", intent)
-                logfire.info("🎯 Query Intent: {intent} for '{question}'", intent=intent, question=body.question[:60], session_id=str(session_id))
-                logger.info(f"Query intent: {intent} for '{body.question[:80]}'")
+                chat_span.set_attribute("query_scope", query_class.scope)
+                chat_span.set_attribute("is_aggregation", query_class.aggregation)
+                logfire.info("🎯 Query: {intent} / {scope} / aggregation={agg} for '{question}'", intent=intent,
+                             scope=query_class.scope, agg=query_class.aggregation, question=body.question[:60],
+                             session_id=str(session_id))
 
                 if intent == "chitchat":
                     chat_span.set_attribute("route", "chitchat")
@@ -314,15 +332,7 @@ async def query(
                     yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
 
                     # Save assistant message
-                    async with AsyncSessionLocal() as save_db:
-                        assistant_msg = ChatMessage(
-                            session_id=session_id,
-                            role="assistant",
-                            content=full_response,
-                            created_at=datetime.now(timezone.utc),
-                        )
-                        save_db.add(assistant_msg)
-                        await save_db.commit()
+                    await _save_assistant_message(full_response)
 
                     # Check for title update
                     new_title = await _maybe_update_session_title(full_response)
@@ -352,6 +362,8 @@ async def query(
                         }
                         for d in result.scalars().all()
                     ]
+                await attach_tabular_profiles(user_id, ready_docs)
+                await attach_document_profiles(user_id, ready_docs)
 
                 scope = await analyze_document_scope(
                     question=body.question,
@@ -367,15 +379,8 @@ async def query(
                     no_docs_msg = scope.clarification_text or "You don't have any uploaded documents yet. Please upload a document to get started."
                     yield f"event: token\ndata: {json.dumps({'token': no_docs_msg})}\n\n"
                     yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
-                    async with AsyncSessionLocal() as save_db:
-                        assistant_msg = ChatMessage(
-                            session_id=session_id,
-                            role="assistant",
-                            content=no_docs_msg,
-                            created_at=datetime.now(timezone.utc),
-                        )
-                        save_db.add(assistant_msg)
-                        await save_db.commit()
+                    # Save assistant message
+                    await _save_assistant_message(no_docs_msg)
                     yield f"event: done\ndata: {{}}\n\n"
                     return
 
@@ -387,15 +392,8 @@ async def query(
                     yield f"event: token\ndata: {json.dumps({'token': clarification_msg})}\n\n"
                     yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
 
-                    async with AsyncSessionLocal() as save_db:
-                        assistant_msg = ChatMessage(
-                            session_id=session_id,
-                            role="assistant",
-                            content=clarification_msg,
-                            created_at=datetime.now(timezone.utc),
-                        )
-                        save_db.add(assistant_msg)
-                        await save_db.commit()
+                    # Save assistant message
+                    await _save_assistant_message(clarification_msg)
 
                     new_title = await _maybe_update_session_title(clarification_msg)
                     if new_title:
@@ -409,107 +407,46 @@ async def query(
                 effective_q = scope.cleaned_question if scope.cleaned_question else body.question
                 rewritten = await rewrite_query(effective_q, chat_history)
 
-                # Step 3: SQL pipeline — ONLY for tabular (CSV/XLSX) documents
-                # SQL is never attempted for PDFs, DOCX, or text files, even if
-                # the user also has spreadsheets in their library. The scope
-                # analysis must have explicitly resolved to a tabular document.
-                has_tabular = await check_tabular_data(user_id)
-                should_attempt_sql = has_tabular and scope.is_tabular
+                # Step 3: Text-to-SQL — ONLY when scope analysis resolved to a spreadsheet.
+                # SQL is never attempted for PDFs or text files, even if the user also has
+                # spreadsheets. A spreadsheet never falls through to vector retrieval.
+                if scope.is_tabular and await check_tabular_data(user_id):
+                    target_doc_uuid = uuid.UUID(scope.target_doc_id) if scope.target_doc_id else None
+                    plan = await plan_tabular_answer(
+                        user_id, rewritten, target_doc_uuid, query_class, chat_history
+                    )
+                    if plan is not None:
+                        chat_span.set_attribute("route", plan.route)
+                        chat_span.set_attribute("sql_attempts", plan.attempts)
+                        if plan.sql_error:
+                            chat_span.set_attribute("sql_error", plan.sql_error)
+                        if plan.route == "sql":
+                            logfire.info("🦆 Route: Executed DuckDB SQL: {sql}", sql=plan.sql, session_id=str(session_id))
+                            yield f"event: sql_query\ndata: {json.dumps({'sql': plan.sql})}\n\n"
+                        else:
+                            logfire.info("📊 Route: Tabular overview for '{filename}'", filename=scope.target_filename or "Spreadsheet", session_id=str(session_id))
 
-                if should_attempt_sql:
-                    target_doc_uuid = uuid.UUID(scope.target_doc_id) if (scope.target_doc_id and scope.is_tabular) else None
-                    schema_info = await get_schema_for_prompt(user_id, target_doc_uuid)
+                        full_response = ""
+                        async for token in stream_tabular_answer(plan, rewritten, scope.target_filename or ""):
+                            full_response += token
+                            yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+                            await asyncio.sleep(0)
 
-                    if schema_info:
-                        sql = await generate_sql_query(rewritten, schema_info, chat_history)
+                        # No vector citations for spreadsheet answers
+                        yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
+                        await _save_assistant_message(full_response)
 
-                        if sql:
-                            try:
-                                sql_result = await execute_sql_query(user_id, sql)
-                                sql_result_text = format_sql_result(sql_result)
+                        new_title = await _maybe_update_session_title(full_response)
+                        if new_title:
+                            logfire.info("🏷️ Session Title: '{title}'", title=new_title, session_id=str(session_id))
+                            yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
 
-                                # ONLY emit sql_query event after successful execution
-                                chat_span.set_attribute("route", "sql")
-                                logfire.info("🦆 Route: Executed DuckDB SQL: {sql}", sql=sql, session_id=str(session_id))
-                                yield f"event: sql_query\ndata: {json.dumps({'sql': sql})}\n\n"
+                        logfire.info("✅ Spreadsheet answer completed ({length} chars)", length=len(full_response), session_id=str(session_id))
+                        yield f"event: done\ndata: {{}}\n\n"
+                        return
 
-                                # Stream the LLM interpretation of the results
-                                full_response = ""
-                                async for token in generate_sql_answer_stream(
-                                    rewritten, sql, sql_result_text
-                                ):
-                                    full_response += token
-                                    yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
-                                    await asyncio.sleep(0)
-
-                                # No vector citations for SQL answers
-                                yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
-
-                                # Save assistant message
-                                async with AsyncSessionLocal() as save_db:
-                                    assistant_msg = ChatMessage(
-                                        session_id=session_id,
-                                        role="assistant",
-                                        content=full_response,
-                                        created_at=datetime.now(timezone.utc),
-                                    )
-                                    save_db.add(assistant_msg)
-                                    await save_db.commit()
-
-                                # Check for title update
-                                new_title = await _maybe_update_session_title(full_response)
-                                if new_title:
-                                    logfire.info("🏷️ Session Title: '{title}'", title=new_title, session_id=str(session_id))
-                                    yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
-
-                                logfire.info("✅ SQL query stream completed ({length} chars)", length=len(full_response), session_id=str(session_id))
-                                yield f"event: done\ndata: {{}}\n\n"
-                                return
-
-                            except Exception as sql_err:
-                                logger.warning(f"SQL execution failed: {sql_err}")
-                                if not scope.is_tabular:
-                                    pass # will fall through to vector retrieval for all_docs
-
-                        # If the document is specifically a tabular spreadsheet, NEVER fall through to vector retrieval
-                        if scope.is_tabular:
-                            chat_span.set_attribute("route", "tabular_overview")
-                            logfire.info("📊 Route: Tabular overview stream for '{filename}'", filename=scope.target_filename or "Spreadsheet", session_id=str(session_id))
-                            full_response = ""
-                            async for token in generate_tabular_overview_stream(
-                                question=rewritten,
-                                schema_info=schema_info,
-                                filename=scope.target_filename or "Spreadsheet",
-                            ):
-                                full_response += token
-                                yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
-                                await asyncio.sleep(0)
-
-                            yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
-
-                            async with AsyncSessionLocal() as save_db:
-                                assistant_msg = ChatMessage(
-                                    session_id=session_id,
-                                    role="assistant",
-                                    content=full_response,
-                                    created_at=datetime.now(timezone.utc),
-                                )
-                                save_db.add(assistant_msg)
-                                await save_db.commit()
-
-                            new_title = await _maybe_update_session_title(full_response)
-                            if new_title:
-                                logfire.info("🏷️ Session Title: '{title}'", title=new_title, session_id=str(session_id))
-                                yield f"event: title\ndata: {json.dumps({'title': new_title})}\n\n"
-
-                            logfire.info("✅ Tabular overview stream completed ({length} chars)", length=len(full_response), session_id=str(session_id))
-                            yield f"event: done\ndata: {{}}\n\n"
-                            return
-
-                # Step 4: RAG path — detect aggregation and retrieve chunks
+                # Step 4: RAG path — retrieve chunks (whole-document questions also get summary chunks)
                 chat_span.set_attribute("route", "rag")
-                is_agg = detect_aggregation(rewritten)
-                chat_span.set_attribute("is_aggregation", is_agg)
 
                 # Scope retrieval to specific document if resolved
                 target_doc_filter = scope.target_doc_id if scope.status == "resolved" else None
@@ -517,7 +454,7 @@ async def query(
                 chunks = await retrieve_chunks(
                     user_id=user_id,
                     question=rewritten,
-                    is_aggregation=is_agg,
+                    is_overview=query_class.is_overview,
                     doc_id_filter=target_doc_filter,
                     filename_filter=target_filename,
                 )
@@ -544,15 +481,7 @@ async def query(
                     yield f"event: citations\ndata: {json.dumps({'citations': []})}\n\n"
 
                     # Save assistant message
-                    async with AsyncSessionLocal() as save_db:
-                        assistant_msg = ChatMessage(
-                            session_id=session_id,
-                            role="assistant",
-                            content=no_docs_msg,
-                            created_at=datetime.now(timezone.utc),
-                        )
-                        save_db.add(assistant_msg)
-                        await save_db.commit()
+                    await _save_assistant_message(no_docs_msg)
 
                     yield f"event: done\ndata: {{}}\n\n"
                     return
@@ -573,16 +502,7 @@ async def query(
                 yield f"event: citations\ndata: {json.dumps({'citations': citations})}\n\n"
 
                 # Save assistant message with citations
-                async with AsyncSessionLocal() as save_db:
-                    assistant_msg = ChatMessage(
-                        session_id=session_id,
-                        role="assistant",
-                        content=full_response,
-                        citations=citations if citations else None,
-                        created_at=datetime.now(timezone.utc),
-                    )
-                    save_db.add(assistant_msg)
-                    await save_db.commit()
+                await _save_assistant_message(full_response, citations=citations)
 
                 # Step 7: Auto-name / refine chat title
                 new_title = await _maybe_update_session_title(full_response)

@@ -10,7 +10,7 @@ from app.services.query import (
 )
 
 SAMPLE_DOCS = [
-    {"id": "doc-1", "filename": "2405.15793v3.pdf", "file_type": "pdf", "is_tabular": False},
+    {"id": "doc-1", "filename": "SWE-bench-2405.15793v3.pdf", "file_type": "pdf", "is_tabular": False},
     {"id": "doc-2", "filename": "The Ultimate Python Handbook.pdf", "file_type": "pdf", "is_tabular": False},
     {"id": "doc-3", "filename": "Verity-By-Colleen-Hoover.pdf", "file_type": "pdf", "is_tabular": False},
     {"id": "doc-4", "filename": "sample_titan_report.txt", "file_type": "txt", "is_tabular": False},
@@ -55,7 +55,7 @@ async def test_scope_single_document_workspace():
     )
     assert scope.status == "resolved"
     assert scope.target_doc_id == "doc-1"
-    assert scope.target_filename == "2405.15793v3.pdf"
+    assert scope.target_filename == "SWE-bench-2405.15793v3.pdf"
 
 
 @pytest.mark.anyio
@@ -104,7 +104,7 @@ async def test_scope_answering_clarification():
             "role": "assistant",
             "content": (
                 "I noticed you have several documents in your library:\n"
-                "- 📄 2405.15793v3.pdf *(SWE-bench research paper)*\n"
+                "- 📄 SWE-bench-2405.15793v3.pdf\n"
                 "- 📄 Verity-By-Colleen-Hoover.pdf\n\n"
                 '**Which document would you like me to examine for "What are the key findings?"?**'
             ),
@@ -118,7 +118,7 @@ async def test_scope_answering_clarification():
     )
     assert scope.status == "resolved"
     assert scope.target_doc_id == "doc-1"
-    assert scope.target_filename == "2405.15793v3.pdf"
+    assert scope.target_filename == "SWE-bench-2405.15793v3.pdf"
     assert "key findings" in scope.cleaned_question.lower()
 
 
@@ -132,7 +132,7 @@ async def test_scope_ambiguous_query_triggers_clarification():
     )
     assert scope.status == "needs_clarification"
     assert scope.clarification_text is not None
-    assert "2405.15793v3.pdf" in scope.clarification_text
+    assert "SWE-bench-2405.15793v3.pdf" in scope.clarification_text
     assert "Verity-By-Colleen-Hoover.pdf" in scope.clarification_text
     assert "Which document would you like me to examine" in scope.clarification_text
 

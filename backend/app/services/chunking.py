@@ -1,11 +1,12 @@
 """
-Text and spreadsheet chunking logic.
+Text chunking logic for PDF/TXT.
 
-Two main strategies:
-1. Text chunking (PDF/TXT): page-boundary-aware splitting with token-based sizing.
-   Each PDF page produces its own chunk(s) — content is NEVER merged across pages.
-   This ensures accurate page citations and respects the embedding model's context window.
-2. Spreadsheet chunking (XLSX/CSV): row-batch chunks + one summary chunk per sheet
+Page-boundary-aware splitting with token-based sizing. Each PDF page produces its own
+chunk(s) — content is NEVER merged across pages. This ensures accurate page citations
+and respects the embedding model's context window.
+
+Spreadsheets (XLSX/CSV) are not chunked: they are stored as DuckDB tables and answered
+through Text-to-SQL (see ingestion.py and tabular_store.py).
 
 Every chunk is a ChunkData object that carries its content and metadata.
 """
@@ -17,7 +18,7 @@ from typing import Optional
 
 import tiktoken
 
-from app.services.parsing import PageText, SheetData
+from app.services.parsing import PageText
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,6 @@ MIN_CHUNK_TOKENS = 100
 TARGET_CHUNK_TOKENS = 400
 MAX_CHUNK_TOKENS = 512
 OVERLAP_FRACTION = 0.10        # ~10% overlap between consecutive chunks within a page
-SPREADSHEET_ROWS_PER_CHUNK = 20  # Default rows per chunk for spreadsheets
 
 
 # ── Data class for chunk output ───────────────────────────────────────────
@@ -220,108 +220,3 @@ def chunk_text_from_string(text: str, filename: str = "") -> list[ChunkData]:
     """
     pages = [PageText(page_number=1, text=text)]
     return chunk_text(pages, filename=filename)
-
-
-# ── Spreadsheet chunking ─────────────────────────────────────────────────
-
-def chunk_spreadsheet(
-    sheet: SheetData,
-    filename: str = "",
-    rows_per_chunk: int = SPREADSHEET_ROWS_PER_CHUNK,
-) -> list[ChunkData]:
-    """
-    Chunk a spreadsheet sheet into row-batch chunks + one summary chunk.
-
-    Row-batch chunks:
-    - Each chunk contains a batch of rows with column headers repeated
-      so the chunk is self-describing out of context.
-
-    Summary chunk:
-    - Contains column names, data types, row count, and precomputed
-      aggregates for numeric columns (sum, mean, min, max).
-    - Tagged with chunk_type="summary" for retrieval biasing.
-    """
-    chunks: list[ChunkData] = []
-    chunk_index = 0
-    df = sheet.df
-    n_rows = len(df)
-    num_cols = len(df.columns)
-    col_header = " | ".join(str(c) for c in df.columns)
-
-    # Scale rows per chunk for wide tables so chunks don't exceed token limits
-    effective_rows_per_chunk = rows_per_chunk
-    if num_cols > 10:
-        effective_rows_per_chunk = max(5, min(rows_per_chunk, 300 // num_cols))
-
-    # ── Row-level chunks ──────────────────────────────────────────────
-    for start_row in range(0, n_rows, effective_rows_per_chunk):
-        end_row = min(start_row + effective_rows_per_chunk, n_rows)
-        batch = df.iloc[start_row:end_row]
-
-        # Format each row as pipe-delimited values
-        row_lines = []
-        for _, row in batch.iterrows():
-            row_lines.append(" | ".join(str(v) for v in row.values))
-
-        chunk_content = (
-            f"Source: {filename}, Sheet: {sheet.name}, "
-            f"Rows {start_row + 1}-{end_row}\n"
-            f"Columns: {col_header}\n"
-            f"---\n"
-            + "\n".join(row_lines)
-        )
-
-        token_count = count_tokens(chunk_content)
-
-        chunks.append(ChunkData(
-            content=chunk_content,
-            chunk_index=chunk_index,
-            chunk_type="text",
-            row_range_start=start_row + 1,   # 1-indexed for display
-            row_range_end=end_row,
-            token_count=token_count,
-        ))
-        chunk_index += 1
-
-    # ── Summary chunk ─────────────────────────────────────────────────
-    summary_lines = [
-        f"Summary of {filename}, Sheet: {sheet.name}",
-        f"Total rows: {n_rows}",
-        "",
-        "Columns and data types:",
-    ]
-
-    for col in df.columns:
-        dtype = str(df[col].dtype)
-        summary_lines.append(f"  - {col} ({dtype})")
-
-    # Compute aggregates for numeric columns (cap at 15 columns to prevent oversized summary)
-    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    if numeric_cols:
-        summary_lines.append("")
-        summary_lines.append("Numeric column aggregates:")
-        for col in numeric_cols[:15]:
-            col_data = df[col].dropna()
-            if len(col_data) > 0:
-                summary_lines.append(
-                    f"  - {col}: "
-                    f"sum={col_data.sum():.4g}, "
-                    f"mean={col_data.mean():.4g}, "
-                    f"min={col_data.min():.4g}, "
-                    f"max={col_data.max():.4g}, "
-                    f"count={len(col_data)}"
-                )
-        if len(numeric_cols) > 15:
-            summary_lines.append(f"  ... and {len(numeric_cols) - 15} more numeric columns")
-
-    summary_content = "\n".join(summary_lines)
-    summary_tokens = count_tokens(summary_content)
-
-    chunks.append(ChunkData(
-        content=summary_content,
-        chunk_index=chunk_index,
-        chunk_type="summary",
-        token_count=summary_tokens,
-    ))
-
-    return chunks

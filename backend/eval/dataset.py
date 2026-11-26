@@ -56,12 +56,19 @@ def dataset_hash(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:12]
 
 
-def validate_against_corpus(items: list[GoldItem], doc_texts: dict[str, str]) -> list[str]:
-    """Return problems: unknown doc ids, and evidence quotes not found in their document."""
+def validate_against_corpus(
+    items: list[GoldItem], doc_texts: dict[str, str], tabular_docs: set[str] | None = None
+) -> list[str]:
+    """Return problems: unknown doc ids, evidence quotes not found in their document,
+    and SQL items whose expected document is not a spreadsheet (when `tabular_docs` is given)."""
     from eval.scoring.retrieval import quote_in_context
 
     problems: list[str] = []
     for item in items:
+        if tabular_docs is not None and item.expected_route == "sql":
+            target = item.expected_doc or (item.docs[0] if len(item.docs) == 1 else None)
+            if target and target in doc_texts and target not in tabular_docs:
+                problems.append(f"{item.id}: expected_route 'sql' but '{target}' is not a spreadsheet")
         for d in item.docs + ([item.expected_doc] if item.expected_doc else []):
             if d not in doc_texts:
                 problems.append(f"{item.id}: unknown doc '{d}'")

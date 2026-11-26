@@ -1,0 +1,11 @@
+date,vessel,vessel_type,cargo_tonnes,crew,berth
+2025-03-01,Kestrel,fishing,12.5,6,A
+2025-03-02,Morning Star,cargo,340,14,C
+2025-03-02,Gannet,fishing,9,5,A
+2025-03-04,Northern Lass,ferry,0,9,B
+2025-03-05,Kestrel,fishing,15.5,6,A
+2025-03-07,Iron Duke,cargo,512,18,C
+2025-03-08,Gannet,fishing,11,5,A
+2025-03-09,Northern Lass,ferry,0,9,B
+2025-03-11,Morning Star,cargo,298,14,C
+2025-03-12,Selkie,fishing,7.5,4,A
