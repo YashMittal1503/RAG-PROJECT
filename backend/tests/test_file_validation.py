@@ -53,11 +53,30 @@ class TestValidateFileType:
         with pytest.raises(ValueError, match="Macro-enabled"):
             validate_file_type(fake_content, "report.docm")
 
-    def test_xlsx_identified_as_zip(self):
-        """XLSX files (which are ZIP containers) with .xlsx extension should be accepted."""
-        # Real XLSX starts with PK (ZIP signature)
-        zip_header = b"PK\x03\x04" + b"\x00" * 2048
-        file_type, mime = validate_file_type(zip_header, "data.xlsx")
+    def test_real_xlsx_is_accepted(self):
+        """A real XLSX (an Office Open XML ZIP container) should be accepted as xlsx."""
+        # A real file, not a bare "PK" signature padded with zeros: newer libmagic versions
+        # (e.g. on current GitHub runners) report that padding as application/octet-stream.
+        import io
+
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        wb.active["A1"] = "hello"
+        buf = io.BytesIO()
+        wb.save(buf)
+        file_type, mime = validate_file_type(buf.getvalue(), "data.xlsx")
+        assert file_type == "xlsx"
+
+    def test_generic_zip_named_xlsx_is_accepted(self):
+        """Some libmagic versions report an XLSX as plain application/zip; the .xlsx name decides."""
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("sheet.txt", "a,b\n1,2\n")
+        file_type, mime = validate_file_type(buf.getvalue(), "data.xlsx")
         assert file_type == "xlsx"
 
     def test_empty_filename_handling(self):
