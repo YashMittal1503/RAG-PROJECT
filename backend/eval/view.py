@@ -88,6 +88,35 @@ def write_report(run_dir: str | Path) -> Path:
     return out
 
 
+LATEST_REPORT = Path(__file__).resolve().parent / "report.html"   # eval/report.html
+
+
+def _is_full(run_dir: Path) -> bool:
+    """Scored with both the judge and RAGAS (not an offline routing-only run)."""
+    try:
+        meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return bool(meta.get("judge_model") and meta.get("ragas")) and (run_dir / "scores.jsonl").exists()
+
+
+def write_latest(runs_dir: str | Path, out: str | Path | None = None) -> Path | None:
+    """Write the newest fully scored run's dashboard to eval/report.html (a fixed place to look).
+
+    Offline runs (--no-judge / --no-ragas) are skipped, so they never replace a full report with empty
+    correctness columns. Returns None when no full run exists yet.
+    """
+    runs = sorted((d for d in Path(runs_dir).iterdir() if d.is_dir() and _is_full(d)), key=lambda d: d.name, reverse=True)
+    if not runs:
+        return None
+    src = runs[0] / "report.html"
+    if not src.exists():
+        write_report(runs[0])
+    out = Path(out) if out else LATEST_REPORT
+    out.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    return out
+
+
 def write_comparison(run_a: str | Path, run_b: str | Path) -> Path:
     a, b = Path(run_a), Path(run_b)
     ra, rb = _run_data(a), _run_data(b)

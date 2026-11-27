@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   getChatMessagesWithMetadata,
@@ -9,15 +9,12 @@ import {
   updateChatSession,
 } from "@/lib/api";
 import {
-  Send,
   ArrowUp,
   ArrowDown,
   Loader2,
-  FileText,
   FileSpreadsheet,
   ChevronDown,
   ChevronUp,
-  MessageSquare,
   Sparkles,
   Trash2,
   Pencil,

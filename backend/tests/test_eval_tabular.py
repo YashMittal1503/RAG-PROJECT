@@ -231,3 +231,22 @@ async def test_no_tabular_data_falls_through_to_rag(monkeypatch, docs, tmp_path)
     calls = _install_fakes(monkeypatch, arrivals, qc=QueryClassification())
     pred = await VanillaRAG(docs).answer(SQL_ITEM)
     assert pred.route == "rag" and calls.get("rag") is True
+
+
+@pytest.mark.anyio
+async def test_text_document_never_goes_to_sql_even_when_spreadsheets_exist(monkeypatch, docs, eval_store):
+    """The guard chat.py and the adapter share: SQL only when scope resolved to a spreadsheet.
+
+    An aggregation-style question ("how many...") about a PDF must be answered from its text, even though
+    the user's DuckDB holds tables that SQL could run against.
+    """
+    from app.services.query import QueryClassification
+
+    text_doc = next(d for d in docs if not d.is_tabular)
+    calls = _install_fakes(monkeypatch, text_doc, qc=QueryClassification("retrieve", "targeted", True),
+                           sql_replies=["SELECT 1"])
+    item = GoldItem(id="t", question="How many lighthouse keepers were there?", docs=[text_doc.id], answer="3",
+                    evidence=[{"doc": text_doc.id, "quote": "x"}], expected_doc=text_doc.id)
+    pred = await VanillaRAG(docs).answer(item)
+    assert pred.route == "rag" and calls.get("rag") is True
+    assert calls["sql"] == [] and pred.sql is None

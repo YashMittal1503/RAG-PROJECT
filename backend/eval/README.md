@@ -54,7 +54,7 @@ Each run writes `eval/runs/<timestamp>_<system>/`:
 | `python -m eval rescore <run_dir> [same scoring flags]` | Re-score saved predictions (new judge, new metric) without re-running the system |
 | `python -m eval classify [--dataset eval/data/query_classification.jsonl]` | Accuracy of the query classifier (intent, scope, aggregation): one LLM call per question, with a confusion table and the mistakes. Use it while tuning the classifier prompt |
 | `python -m eval draft --corpus <manifest> --existing eval/data/golden.jsonl` | LLM-draft fact questions for you to review. Count per document is proportional to its length (1 per 4,000 tokens, 4–30), minus facts already in `--existing` |
-| `python -m eval view <run> [<run_b>]` | HTML dashboard: score cards, all metrics, by category/document, clickable items; two runs = comparison. `run`/`rescore` write `report.html` and `runs/index.html` automatically |
+| `python -m eval view <run> [<run_b>]` | HTML dashboard: score cards, all metrics, by category/document, clickable items; two runs = comparison. `run`/`rescore` write `report.html` and `runs/index.html` automatically, and refresh **`eval/report.html`: always the newest fully scored run** (offline `--no-judge`/`--no-ragas` runs never replace it) |
 | `python -m eval compare <run_a> <run_b>` | Paired bootstrap comparison on shared items |
 | `python -m eval calibrate export <run_dir> -n 50` | Export a CSV to hand-label |
 | `python -m eval calibrate score <csv>` | Judge-vs-human agreement and Cohen's kappa |

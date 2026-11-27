@@ -1,66 +1,59 @@
-# RAG Chatbot — Backend
+# DocTalk — Backend
 
-FastAPI backend for document Q&A with streaming answers and source citations.
+FastAPI service for DocTalk: document ingestion, hybrid retrieval, Text-to-SQL over spreadsheets, multi-provider LLM orchestration and the evaluation harness. See the [root README](../README.md) for the architecture.
 
-## Tech Stack
+## Layout
 
-- **Framework**: FastAPI (async)
-- **Database**: PostgreSQL (Supabase) via SQLAlchemy + Alembic
-- **Vector DB**: Qdrant Cloud (384-dim, cosine similarity)
-- **Embeddings**: FastEmbed (ONNX) — BAAI/bge-small-en-v1.5
-- **LLM**: Groq API — llama-3.3-70b-versatile
-- **Storage**: Supabase Storage (raw uploaded files)
-- **Auth**: Supabase Auth (JWT verification)
+| Path | Contents |
+|---|---|
+| `app/main.py` | App factory, lifespan (DB/auth warm-up, stale-job recovery), Logfire, CORS |
+| `app/routers/` | `documents` (upload/list/status/retry/delete), `chat` (sessions + SSE query), `health` |
+| `app/services/query.py` | Query classification, document routing, query rewriting, retrieval, contextual compression, answer streaming, citation checks |
+| `app/services/llm_provider.py` | Multi-key, multi-provider LLM fallback (Groq → NVIDIA NIM → Mistral → Gemini → OpenRouter) |
+| `app/services/tabular_qa.py`, `tabular_store.py` | Text-to-SQL planning and the sandboxed DuckDB store |
+| `app/services/ingestion.py`, `parsing.py`, `chunking.py` | Parse (PyMuPDF / pymupdf4llm / RapidOCR) → chunk → embed → index |
+| `app/services/embedding.py`, `vector_store.py`, `reranker.py` | FastEmbed dense + BM25, Qdrant hybrid search with RRF, FlashRank reranking |
+| `app/services/doc_profiles.py` | Distinctive-term profiles used to route questions to the right document |
+| `eval/` | Evaluation harness ([README](eval/README.md)) |
+| `tests/` | Pytest suite, no network or API keys needed |
 
-## Local Development
+## Run locally
 
 ```bash
-# 1. Create a virtual environment
-python -m venv venv 
-venv\Scripts\activate      # Windows
-# source venv/bin/activate  # macOS/Linux
-
-# 2. Install dependencies
+python -m venv venv
+venv\Scripts\activate          # Windows  (macOS/Linux: source venv/bin/activate)
 pip install -r requirements.txt
-
-# 3. Copy and fill in environment variables
-cp .env.example .env
-# Edit .env with your credentials
-
-# 4. Run database migrations
+cp .env.example .env           # fill in Supabase, Qdrant and at least one LLM provider key
 alembic upgrade head
-
-# 5. Start the dev server
 uvicorn app.main:app --reload --port 8000
 ```
 
-## Running Tests
+Interactive API docs: <http://localhost:8000/docs>.
+
+## Tests
 
 ```bash
-pytest tests/ -v
+pytest tests -q
 ```
 
-## Deploy to Render
+## Docker
 
-1. Push this `backend/` directory to a Git repository
-2. Create a **Web Service** on [render.com](https://render.com)
-3. Connect the repo, select **Docker** environment
-4. Set instance type to **Free**
-5. Add all environment variables from `.env.example`
-6. Render will build the Docker image and deploy automatically
+```bash
+docker build -t doctalk-backend .
+docker run --env-file .env -p 8000:10000 doctalk-backend   # the container listens on $PORT (default 10000)
+```
 
-The app binds to `$PORT` (provided by Render) automatically.
-
-## API Endpoints
+## API
 
 | Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/health` | Health check |
-| POST | `/api/documents/upload` | Upload documents |
-| GET | `/api/documents` | List user's documents |
-| GET | `/api/documents/{id}/status` | Poll document status |
-| DELETE | `/api/documents/{id}` | Delete a document |
-| POST | `/api/chat/sessions` | Create chat session |
-| GET | `/api/chat/sessions` | List chat sessions |
-| GET | `/api/chat/sessions/{id}/messages` | Get messages |
-| POST | `/api/chat/sessions/{id}/query` | Query (SSE stream) |
+|---|---|---|
+| GET | `/api/health` | Health check and model-load status |
+| POST | `/api/documents/upload` | Upload up to 10 files (multipart) |
+| GET | `/api/documents` | List the user's documents |
+| GET | `/api/documents/{id}/status` | Poll ingestion status |
+| POST | `/api/documents/{id}/retry` | Re-run ingestion for a failed document |
+| DELETE | `/api/documents/{id}` | Delete a document, its vectors, tables and stored file |
+| POST / GET | `/api/chat/sessions` | Create / list chat sessions |
+| GET / PATCH / DELETE | `/api/chat/sessions/{id}` | Get / rename / delete a session |
+| GET | `/api/chat/sessions/{id}/messages` | Message history |
+| POST | `/api/chat/sessions/{id}/query` | Ask a question (SSE stream: `token`, `sql_query`, `citations`, `title`, `done`, `error`) |

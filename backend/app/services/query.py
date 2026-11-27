@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 from app.services.llm_provider import (
     call_llm_with_cross_provider_fallback as call_llm_with_fallback,
     stream_llm_with_cross_provider_fallback as stream_llm_with_fallback,
-    get_groq_client as _get_groq,
     get_generation_targets,
     get_fast_targets,
     is_recoverable_error as _is_rate_limit_or_recoverable,
@@ -531,8 +530,6 @@ async def generate_direct_response(
     Stream a direct conversational response without document retrieval.
     Used for chitchat, greetings, and meta-questions about the assistant.
     """
-    groq = _get_groq()
-
     messages: list[dict] = [
         {"role": "system", "content": CHITCHAT_SYSTEM_PROMPT},
     ]
@@ -1199,8 +1196,6 @@ async def generate_answer_stream(
     """
     with logfire.span("🤖 Stream RAG Answer | '{q_short}'", q_short=question[:50], question=question, chunks_count=len(chunks)) as span:
         context = _build_context(chunks, query=question)
-
-        groq = _get_groq()
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
