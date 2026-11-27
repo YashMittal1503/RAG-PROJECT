@@ -1,64 +1,101 @@
 name: CI
 
+# Runs on every pull request, and as the first stage of the release pipeline (deploy.yml calls it),
+# so nothing reaches production without passing these checks.
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   backend-tests:
-    name: Run Backend Unit Tests
+    name: Backend tests
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.12 (same as the Docker image)
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
+          cache: pip
           cache-dependency-path: backend/requirements.txt
 
-      - name: Install System Dependencies (libmagic)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libmagic1
+      - name: Install system dependencies (libmagic)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libmagic1
 
-      - name: Install Python Dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt
 
-      - name: Run Pytest Suite
+      - name: Run tests
+        working-directory: backend
+        run: pytest tests -q
+
+  deploy-scripts:
+    name: Deploy scripts (shellcheck + agent tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck deploy/server/*.sh
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test the deploy agent against a fake Docker
         run: |
-          pytest backend/tests -v
+          pip install -q pytest
+          pytest deploy/tests -q
 
   frontend-check:
-    name: Validate Frontend Lint & Types
+    name: Frontend lint & build
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js 20
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: "npm"
+          cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install Node Dependencies
-        working-directory: ./frontend
+      - name: Install dependencies
+        working-directory: frontend
         run: npm ci
 
-      - name: Run Next.js Lint
-        working-directory: ./frontend
+      - name: Lint
+        working-directory: frontend
         run: npm run lint
 
-      - name: Build Next.js Application
-        working-directory: ./frontend
+      - name: Build
+        working-directory: frontend
         run: npm run build
+
+  docker-build:
+    # On pull requests only: the release pipeline builds (and pushes) the image itself.
+    if: github.event_name == 'pull_request'
+    name: Backend image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: false
+          build-args: GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

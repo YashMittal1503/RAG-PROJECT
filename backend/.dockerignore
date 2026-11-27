@@ -1,0 +1,19 @@
+# Keep secrets, local data and dev tooling out of the image (and out of the build context).
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+data/
+eval/
+tests/
+scratch/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+requirements-eval.txt
+Dockerfile
+.dockerignore

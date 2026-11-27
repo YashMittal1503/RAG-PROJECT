@@ -1,0 +1,6 @@
+[Unit]
+Description=Back up DocTalk's on-disk data (DuckDB spreadsheets)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/doctalk/backup.sh

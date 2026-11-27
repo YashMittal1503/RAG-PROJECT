@@ -1,37 +1,96 @@
-name: Build & Deploy Backend
+name: Release backend
 
+# main -> tests -> image -> `production` tag -> the EC2 deploy agent picks it up -> this workflow waits
+# until the live API reports the new commit. A red run means the new version is NOT live (the agent
+# keeps or restores the previous one); see deploy/README.md.
 on:
   push:
     branches: [main]
     paths:
-      - 'backend/**'
-      - '.github/workflows/deploy.yml'
+      - "backend/**"
+      - "deploy/**"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# One release at a time; a newer push waits instead of cancelling a deploy halfway.
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/yashmittal1503/doctalk-backend
+  PRODUCTION_URL: ${{ vars.PRODUCTION_URL || 'https://yash--mittal.duckdns.org' }}
+
 jobs:
-  build-and-push:
-    name: Build & Push Docker Image
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build & push image
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: Build and push (tagged by commit; not live yet)
         uses: docker/build-push-action@v6
         with:
           context: ./backend
           push: true
-          tags: |
-            ghcr.io/yashmittal1503/doctalk-backend:latest
-            ghcr.io/yashmittal1503/doctalk-backend:${{ github.sha }}
+          build-args: GIT_SHA=${{ github.sha }}
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: Release to production
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ env.PRODUCTION_URL }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point the production tag at this commit
+        run: docker buildx imagetools create -t "$IMAGE:production" "$IMAGE:$GITHUB_SHA"
+
+      - name: Wait for the server to run it
+        run: |
+          # The agent checks every 2 minutes, then migrates and waits for the new container.
+          deadline=$((SECONDS + 15 * 60))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            live="$(curl -fsS --max-time 10 "$PRODUCTION_URL/api/health" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("commit",""))' 2>/dev/null || true)"
+            if [ "$live" = "$GITHUB_SHA" ]; then
+              echo "Live: $GITHUB_SHA"
+              exit 0
+            fi
+            echo "Live commit: ${live:-unreachable}; waiting for $GITHUB_SHA"
+            sleep 20
+          done
+          echo "::error::$GITHUB_SHA is not live after 15 minutes. On the server: journalctl -u doctalk-deploy -n 100"
+          exit 1

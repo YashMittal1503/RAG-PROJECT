@@ -1,9 +1,11 @@
 """
 Health check endpoint.
 
-Used by the frontend to detect whether the backend is awake
-(Render free tier sleeps after 15 min of inactivity).
+Used by the frontend to detect whether the backend is awake, by Docker's HEALTHCHECK, and by the
+deploy pipeline, which waits until `commit` reports the commit it just shipped.
 """
+
+import os
 
 from fastapi import APIRouter
 
@@ -26,4 +28,5 @@ async def health_check():
         model_loaded=is_model_loaded(),
         version="2.1.0",
         max_chunk_tokens=512,
+        commit=os.environ.get("GIT_SHA", "dev"),
     )

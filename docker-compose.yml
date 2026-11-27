@@ -1,14 +1,25 @@
+# Run the backend locally in Docker, the same image as production:
+#   docker compose up --build
+# The one-shot `migrate` service applies database migrations first; the backend starts after it succeeds.
+# (Production does not use this file: see deploy/README.md.)
 services:
+  migrate:
+    build:
+      context: ./backend
+    env_file: ./backend/.env
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
   backend:
     build:
       context: ./backend
-      dockerfile: Dockerfile
     container_name: doctalk-backend
     restart: unless-stopped
-    env_file:
-      - ./backend/.env
+    env_file: ./backend/.env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     ports:
-      - "8000:10000"
-      - "10000:10000"
+      - "127.0.0.1:8000:10000"
     volumes:
       - ./backend/data:/app/data

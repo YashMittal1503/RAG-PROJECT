@@ -118,3 +118,4 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     version: str = "2.1.0"
     max_chunk_tokens: int = 512
+    commit: str = "dev"   # git commit the running image was built from (the deploy pipeline checks it)
