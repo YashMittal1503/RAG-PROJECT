@@ -99,3 +99,18 @@ def test_failed_judge_call_is_recorded_not_fatal():
     assert s.judge_label is None and s.scoring_errors and "429" in s.scoring_errors[0]
     assert s.exact_match == 1.0                                   # offline metrics still computed
     assert retry_wait(RuntimeError("Error code: 429"), 0) == 15 and retry_wait(ValueError("bad json"), 1) == 2
+
+
+def test_latest_report_is_newest_fully_scored_run(tmp_path):
+    from eval.view import write_latest
+
+    full = _run(tmp_path, "20260101T000000Z_vanilla", judge=True)
+    offline = _run(tmp_path, "20260102T000000Z_vanilla", judge=False)
+    for d, meta in ((full, {"judge_model": "m", "ragas": {"model": "m"}}), (offline, {"judge_model": None, "ragas": None})):
+        (d / "meta.json").write_text(json.dumps({"run_id": d.name, **meta}), encoding="utf-8")
+    out = write_latest(tmp_path / "runs", tmp_path / "report.html")
+    assert _payload(out.read_text(encoding="utf-8"))["run"]["name"] == full.name   # newer offline run skipped
+
+    empty = tmp_path / "no_full_runs"
+    empty.mkdir()
+    assert write_latest(empty, tmp_path / "x.html") is None                    # nothing fully scored yet

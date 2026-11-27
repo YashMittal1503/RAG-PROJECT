@@ -15,11 +15,8 @@ from groq import APIError as GroqAPIError, RateLimitError as GroqRateLimitError
 from openai import APIError as OpenAIAPIError, RateLimitError as OpenAIRateLimitError
 import httpx
 
-from app.config import settings
 from app.services.llm_provider import (
     LLMTarget,
-    get_generation_targets,
-    get_fast_targets,
     is_recoverable_error,
     call_llm_with_cross_provider_fallback,
     stream_llm_with_cross_provider_fallback,
@@ -55,54 +52,6 @@ def _make_chunk(content: str):
     chunk = MagicMock()
     chunk.choices = [choice]
     return chunk
-
-
-class TestLLMTargetBuilding:
-    """Test resolution of multi-tier provider chains."""
-
-    def test_default_targets_groq_only(self):
-        import app.services.llm_provider as lp
-        from app.config import Settings
-        lp.reset_pools()
-        with patch.object(Settings, "get_mistral_keys", return_value=[]), \
-             patch.object(Settings, "get_nvidia_keys", return_value=[]), \
-             patch.object(Settings, "get_gemini_keys", return_value=[]), \
-             patch.object(Settings, "get_openrouter_keys", return_value=[]), \
-             patch("app.services.llm_provider._mistral_client", None), \
-             patch("app.services.llm_provider._gemini_client", None), \
-             patch("app.services.llm_provider._openrouter_client", None):
-            targets = get_generation_targets()
-            assert len(targets) > 0
-            assert all(t.provider == "groq" for t in targets)
-
-    def test_targets_with_gemini_and_openrouter(self):
-        with patch("app.services.llm_provider.settings.gemini_api_key", "mock-gemini-key"), \
-             patch("app.services.llm_provider.settings.openrouter_api_key", "mock-openrouter-key"), \
-             patch("app.services.llm_provider._gemini_client", MagicMock()), \
-             patch("app.services.llm_provider._openrouter_client", MagicMock()):
-            targets = get_generation_targets()
-            providers = [t.provider for t in targets]
-            assert "groq" in providers
-            assert "gemini" in providers
-            assert "openrouter" in providers
-
-            # Check tier order: Groq first, then Gemini, then OpenRouter
-            first_groq_idx = providers.index("groq")
-            first_gemini_idx = providers.index("gemini")
-            first_openrouter_idx = providers.index("openrouter")
-            assert first_groq_idx < first_gemini_idx < first_openrouter_idx
-
-    def test_fast_targets_tiering(self):
-        with patch("app.services.llm_provider.settings.gemini_api_key", "mock-gemini-key"), \
-             patch("app.services.llm_provider.settings.openrouter_api_key", "mock-openrouter-key"), \
-             patch("app.services.llm_provider._gemini_client", MagicMock()), \
-             patch("app.services.llm_provider._openrouter_client", MagicMock()):
-            fast_targets = get_fast_targets()
-            assert len(fast_targets) > 0
-            providers = [t.provider for t in fast_targets]
-            assert "groq" in providers
-            assert "gemini" in providers
-            assert "openrouter" in providers
 
 
 class TestRecoverableErrors:

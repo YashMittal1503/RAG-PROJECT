@@ -16,10 +16,17 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# The Supabase client is created once and reused.
-# We use the service-role key (not the anon key) because the backend
-# needs full access to Storage regardless of RLS policies.
-_supabase = create_client(settings.supabase_url, settings.supabase_key)
+# The Supabase client is created on first use and reused. (Not at import: importing the app must not need
+# valid credentials, or tests and tooling can't load it.) We use the service-role key (not the anon key)
+# because the backend needs full access to Storage regardless of RLS policies.
+_supabase_client = None
+
+
+def _storage():
+    global _supabase_client
+    if _supabase_client is None:
+        _supabase_client = create_client(settings.supabase_url, settings.supabase_key)
+    return _supabase_client.storage.from_(BUCKET_NAME)
 
 BUCKET_NAME = "documents"
 
@@ -36,11 +43,13 @@ async def upload_file(
 
     Returns the storage path (relative to the bucket root).
     """
-    storage_path = f"{user_id}/{doc_id}/{filename}"
+    # Keep only the base name: a client-supplied "../../<other user>/x.pdf" must not escape this user's folder
+    safe_name = filename.replace("\\", "/").rsplit("/", 1)[-1].strip().lstrip(".") or "upload"
+    storage_path = f"{user_id}/{doc_id}/{safe_name}"
 
     try:
         await asyncio.to_thread(
-            _supabase.storage.from_(BUCKET_NAME).upload,
+            _storage().upload,
             path=storage_path,
             file=file_bytes,
             file_options={"content-type": content_type, "upsert": "true"},
@@ -60,7 +69,7 @@ async def download_file(storage_path: str) -> bytes:
     """
     try:
         response = await asyncio.to_thread(
-            _supabase.storage.from_(BUCKET_NAME).download,
+            _storage().download,
             storage_path,
         )
         return response
@@ -73,7 +82,7 @@ async def delete_file(storage_path: str) -> None:
     """Delete a file from Supabase Storage."""
     try:
         await asyncio.to_thread(
-            _supabase.storage.from_(BUCKET_NAME).remove,
+            _storage().remove,
             [storage_path],
         )
     except Exception as e:

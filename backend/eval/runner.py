@@ -75,10 +75,12 @@ def write_outputs(run_dir: Path, items, preds, scores, meta: dict) -> dict:
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
     (run_dir / "report.md").write_text(render_markdown(summary, meta), encoding="utf-8")
     try:  # the dashboard is a convenience: never fail a run because of it
-        from eval.view import write_index, write_report
+        from eval.view import write_index, write_latest, write_report
 
         write_report(run_dir)
         write_index(run_dir.parent)
+        if run_dir.parent.resolve() == (Path(__file__).resolve().parent / "runs"):
+            write_latest(run_dir.parent)   # eval/report.html: newest fully scored run
     except Exception as e:
         logger.warning(f"Could not write the HTML report: {e}")
     return summary

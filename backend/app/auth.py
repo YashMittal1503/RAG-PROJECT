@@ -97,7 +97,7 @@ async def get_current_user(
         payload = jwt.decode(
             token,
             signing_key.key,
-            algorithms=["ES256", "RS256", "HS256"],
+            algorithms=["ES256", "RS256"],  # asymmetric only: HS256 uses the legacy secret below
             audience="authenticated",
         )
     except jwt.ExpiredSignatureError:

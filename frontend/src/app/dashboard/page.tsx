@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { useRouter } from "next/navigation";
 import {
   getDocuments,
   deleteDocument,
@@ -118,7 +117,6 @@ export default function DashboardPage() {
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [uploadErrors, setUploadErrors] = useState<{ filename: string; error: string }[]>([]);
-  const router = useRouter();
 
   const loadDocuments = useCallback(async () => {
     try {
@@ -216,7 +214,7 @@ export default function DashboardPage() {
 
   const handleRetry = async (docId: string) => {
     try {
-      const retried = await retryDocument(docId);
+      await retryDocument(docId);
       // Update the document in the list to show it's re-queued
       setDocuments((prev) =>
         prev.map((d) =>

@@ -221,3 +221,23 @@ def test_daily_quota_reset_times():
     noon_utc = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
     assert seconds_until_reset("UTC", noon_utc) == 12 * 3600
     assert seconds_until_reset("America/Los_Angeles", noon_utc) == 20 * 3600   # 04:00 PST -> midnight
+
+
+def test_full_chain_order_and_missing_providers_are_skipped(monkeypatch):
+    """Groq -> NVIDIA -> Mistral -> Gemini -> OpenRouter, from configured keys only (not the local .env)."""
+    from app.config import Settings
+
+    def chain(configured):
+        lp.reset_pools()
+        for p in ("groq", "nvidia", "mistral", "gemini", "openrouter"):
+            monkeypatch.setattr(Settings, f"get_{p}_keys", lambda self, p=p: [f"{p}-k1"] if p in configured else [])
+        try:
+            return {kind: list(dict.fromkeys(t.provider for t in targets))
+                    for kind, targets in (("generation", lp.get_generation_targets()), ("fast", lp.get_fast_targets()))}
+        finally:
+            lp.reset_pools()
+
+    everything = chain({"groq", "nvidia", "mistral", "gemini", "openrouter"})
+    assert everything["generation"] == ["groq", "nvidia", "mistral", "gemini", "openrouter"]
+    assert everything["fast"][0] == "groq" and set(everything["fast"]) == set(everything["generation"])
+    assert chain({"groq", "openrouter"})["generation"] == ["groq", "openrouter"]
