@@ -6,6 +6,7 @@ Each file is stored under the user's UUID to enforce data isolation:
     documents/{user_id}/{doc_id}/{filename}
 """
 
+import asyncio
 import logging
 from uuid import UUID
 
@@ -38,7 +39,8 @@ async def upload_file(
     storage_path = f"{user_id}/{doc_id}/{filename}"
 
     try:
-        _supabase.storage.from_(BUCKET_NAME).upload(
+        await asyncio.to_thread(
+            _supabase.storage.from_(BUCKET_NAME).upload,
             path=storage_path,
             file=file_bytes,
             file_options={"content-type": content_type, "upsert": "true"},
@@ -57,7 +59,10 @@ async def download_file(storage_path: str) -> bytes:
     Returns the raw file bytes.
     """
     try:
-        response = _supabase.storage.from_(BUCKET_NAME).download(storage_path)
+        response = await asyncio.to_thread(
+            _supabase.storage.from_(BUCKET_NAME).download,
+            storage_path,
+        )
         return response
     except Exception as e:
         logger.error(f"Failed to download {storage_path}: {e}")
@@ -67,7 +72,10 @@ async def download_file(storage_path: str) -> bytes:
 async def delete_file(storage_path: str) -> None:
     """Delete a file from Supabase Storage."""
     try:
-        _supabase.storage.from_(BUCKET_NAME).remove([storage_path])
+        await asyncio.to_thread(
+            _supabase.storage.from_(BUCKET_NAME).remove,
+            [storage_path],
+        )
     except Exception as e:
         # Log but don't raise — if the file is already gone, that's fine
         logger.warning(f"Failed to delete {storage_path}: {e}")

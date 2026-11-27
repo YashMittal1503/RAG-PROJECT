@@ -207,9 +207,7 @@ async def search(
     name = _collection_name(user_id)
 
     # Check if collection exists
-    collections = await client.get_collections()
-    existing_names = [c.name for c in collections.collections]
-    if name not in existing_names:
+    if not await client.collection_exists(name):
         return []
 
     # Build optional filter conditions
@@ -300,9 +298,7 @@ async def delete_by_document(user_id: str, doc_id: str) -> None:
         name = _collection_name(user_id)
 
         # Check if collection exists before trying to delete
-        collections = await client.get_collections()
-        existing_names = [c.name for c in collections.collections]
-        if name not in existing_names:
+        if not await client.collection_exists(name):
             return
 
         await client.delete(
@@ -331,9 +327,7 @@ async def get_summary_chunks(user_id: str, doc_id_filter: str | None = None) -> 
     name = _collection_name(user_id)
 
     # Check if collection exists
-    collections = await client.get_collections()
-    existing_names = [c.name for c in collections.collections]
-    if name not in existing_names:
+    if not await client.collection_exists(name):
         return []
 
     must_conditions = [

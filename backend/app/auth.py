@@ -5,7 +5,10 @@ Verifies Supabase Auth JWTs locally using the project's JWKS endpoint (for asymm
 with fallbacks to legacy HS256 secret or Supabase API verification.
 """
 
+import logging
 import time
+from collections import OrderedDict
+
 import jwt
 from jwt import PyJWKClient
 from fastapi import Depends, HTTPException, status
@@ -13,6 +16,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from supabase import create_client
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # HTTPBearer extracts the token from the "Authorization: Bearer <token>" header.
 security = HTTPBearer()
@@ -31,9 +36,11 @@ def warm_up_auth() -> None:
 
 _supabase_admin = None
 
-# In-memory cache for verified tokens: token -> (user_id, expire_time)
-# Avoids re-verifying crypto signatures or calling Supabase Auth on rapid requests/polling
-_verified_token_cache: dict[str, tuple[str, float]] = {}
+# In-memory LRU cache for verified tokens: token -> (user_id, expire_time)
+# Avoids re-verifying crypto signatures or calling Supabase Auth on rapid requests/polling.
+# Uses OrderedDict to evict the least-recently used entry when reaching capacity.
+_MAX_TOKEN_CACHE_SIZE = 1000
+_verified_token_cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
 
 
 def _get_cached_user(token: str) -> str | None:
@@ -41,18 +48,22 @@ def _get_cached_user(token: str) -> str | None:
     if cached:
         user_id, exp = cached
         if time.time() < exp:
+            _verified_token_cache.move_to_end(token)
             return user_id
         _verified_token_cache.pop(token, None)
     return None
 
 
 def _cache_user(token: str, user_id: str, exp: float | None = None) -> None:
-    if len(_verified_token_cache) > 1000:
-        _verified_token_cache.clear()
     now = time.time()
     ttl = min(60.0, (exp - now) if exp else 60.0)
-    if ttl > 0:
-        _verified_token_cache[token] = (user_id, now + ttl)
+    if ttl <= 0:
+        return
+    if token in _verified_token_cache:
+        _verified_token_cache.move_to_end(token)
+    _verified_token_cache[token] = (user_id, now + ttl)
+    while len(_verified_token_cache) > _MAX_TOKEN_CACHE_SIZE:
+        _verified_token_cache.popitem(last=False)
 
 
 def get_supabase_admin():
@@ -122,7 +133,7 @@ async def get_current_user(
                 _cache_user(token, uid)
                 return uid
         except Exception as api_err:
-            print(f"[AUTH ERROR] Supabase API verification failed: {api_err}")
+            logger.error(f"Supabase API verification failed: {api_err}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Could not validate credentials.",

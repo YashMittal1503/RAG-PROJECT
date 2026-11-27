@@ -69,5 +69,10 @@ backend/data/
 *.duckdb.wal
 
 # Evaluation raw dumps (scores are summarized in README.md)
-backend/ragas_raw_results.json
-backend/ragas_results.json
+
+# Eval harness outputs and downloaded corpora
+backend/eval/runs/
+backend/eval/data/corpus/
+backend/eval/data/corpus.yaml
+# Real eval documents: copyrighted books and private business data, never commit them
+backend/eval/eval_files/

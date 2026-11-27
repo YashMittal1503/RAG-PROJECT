@@ -1,0 +1,4 @@
+# Extra dependencies for the evaluation harness (backend/eval). Not needed to run the app.
+#   pip install -r requirements-eval.txt
+-r requirements.txt
+ragas==0.4.3

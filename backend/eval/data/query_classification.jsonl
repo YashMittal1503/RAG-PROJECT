@@ -1,0 +1,45 @@
+// Labelled questions for `python -m eval classify` (query classifier accuracy). Weighted toward cases keyword matching got wrong.
+{"id":"qc-001","question":"Summarize Verity","expected_intent":"retrieve","expected_scope":"global","expected_aggregation":false}
+{"id":"qc-002","question":"what's this pdf about?","expected_intent":"retrieve","expected_scope":"global","expected_aggregation":false,"notes":"no keyword from the old list"}
+{"id":"qc-003","question":"tl;dr of the report please","expected_intent":"retrieve","expected_scope":"global","expected_aggregation":false}
+{"id":"qc-004","question":"What are the key takeaways from the SWE-bench paper?","expected_intent":"retrieve","expected_scope":"global","expected_aggregation":false}
+{"id":"qc-005","question":"Give me the gist of the novel in a few lines","expected_intent":"retrieve","expected_scope":"global","expected_aggregation":false}
+{"id":"qc-006","question":"What is the main theme of It Ends With Us?","expected_intent":"retrieve","expected_scope":"global","expected_aggregation":false}
+{"id":"qc-007","question":"Describe the plot of the lighthouse story from start to finish","expected_intent":"retrieve","expected_scope":"global","expected_aggregation":false}
+{"id":"qc-008","question":"What does my sales spreadsheet contain?","expected_intent":"retrieve","expected_scope":"global","expected_aggregation":false}
+{"id":"qc-009","question":"Give me an overview of the churn dataset","expected_intent":"retrieve","expected_scope":"global","expected_aggregation":false}
+{"id":"qc-010","question":"What are all my documents about?","expected_intent":"retrieve","expected_scope":"global","expected_aggregation":false}
+{"id":"qc-011","question":"Tell me about Ryle","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false,"notes":"'tell me about' a character is not a summary"}
+{"id":"qc-012","question":"Tell me about the narrator's relationship with Crane","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false}
+{"id":"qc-013","question":"Who is the main character's best friend?","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false,"notes":"contains 'main character' but asks one fact"}
+{"id":"qc-014","question":"Give me an overview of the transport layer chapter","expected_intent":"retrieve","expected_scope":"section","expected_aggregation":false,"notes":"overview of one part, not the whole document"}
+{"id":"qc-015","question":"Explain the methodology section of the paper","expected_intent":"retrieve","expected_scope":"section","expected_aggregation":false}
+{"id":"qc-016","question":"Summarize chapter 3","expected_intent":"retrieve","expected_scope":"section","expected_aggregation":false}
+{"id":"qc-017","question":"What does the subnetting part of the course notes cover?","expected_intent":"retrieve","expected_scope":"section","expected_aggregation":false}
+{"id":"qc-018","question":"Who wrote this paper?","expected_intent":"retrieve","expected_scope":"metadata","expected_aggregation":false,"notes":"author questions need the title page, not a summary"}
+{"id":"qc-019","question":"When was The Kiss Quotient published?","expected_intent":"retrieve","expected_scope":"metadata","expected_aggregation":false}
+{"id":"qc-020","question":"How many pages does the handbook have?","expected_intent":"retrieve","expected_scope":"metadata","expected_aggregation":false,"notes":"'how many' but about the document itself"}
+{"id":"qc-021","question":"What is the title of the uploaded report?","expected_intent":"retrieve","expected_scope":"metadata","expected_aggregation":false}
+{"id":"qc-022","question":"What is the salary mentioned in the offer letter?","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false}
+{"id":"qc-023","question":"Where did Lily go after the restaurant?","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false}
+{"id":"qc-024","question":"What does a Python list comprehension look like?","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false}
+{"id":"qc-025","question":"What is the probability of a successful edit after the first failed edit?","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false}
+{"id":"qc-026","question":"How many customers churned?","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":true}
+{"id":"qc-027","question":"Total revenue by region","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":true}
+{"id":"qc-028","question":"Which product sold the most units last quarter?","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":true,"notes":"ranking, no aggregation keyword"}
+{"id":"qc-029","question":"What's the average monthly charge for customers on fiber?","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":true}
+{"id":"qc-030","question":"Break down the number of arrivals per vessel type","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":true,"notes":"no keyword from the old list"}
+{"id":"qc-031","question":"Is churn higher for month-to-month contracts than for yearly ones?","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":true,"notes":"comparison of rates across groups"}
+{"id":"qc-032","question":"Top 5 customers by lifetime value","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":true}
+{"id":"qc-033","question":"What is the email address of customer 7590-VHVEG?","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false,"notes":"single record lookup in a spreadsheet"}
+{"id":"qc-034","question":"Show me the rows where the berth is C","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false}
+{"id":"qc-035","question":"What was the total cost of the project mentioned on page 4?","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false,"notes":"'total' but a single stated fact in a text document"}
+{"id":"qc-036","question":"Overall, what did the inspector conclude about the light?","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false,"notes":"'overall' used to be an aggregation keyword"}
+{"id":"qc-037","question":"Hi there!","expected_intent":"chitchat"}
+{"id":"qc-038","question":"thanks, that was helpful","expected_intent":"chitchat"}
+{"id":"qc-039","question":"What can you do for me?","expected_intent":"chitchat"}
+{"id":"qc-040","question":"Who are you?","expected_intent":"chitchat"}
+{"id":"qc-041","question":"Explain how recursion works","expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false,"notes":"a topic question is retrieval, documents may cover it"}
+{"id":"qc-042","question":"and what about the total for 2024?","history":[{"role":"user","content":"What is the total revenue for 2023 in my sales sheet?"},{"role":"assistant","content":"Total revenue for 2023 was $1.2M."}],"expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":true}
+{"id":"qc-043","question":"Can you summarize it?","history":[{"role":"user","content":"What is The Ultimate Python Handbook?"},{"role":"assistant","content":"It is a beginner's guide to Python programming."}],"expected_intent":"retrieve","expected_scope":"global","expected_aggregation":false}
+{"id":"qc-044","question":"tell me more about him","history":[{"role":"user","content":"Who was the old keeper?"},{"role":"assistant","content":"The old keeper was Thaddeus Crane."}],"expected_intent":"retrieve","expected_scope":"targeted","expected_aggregation":false}

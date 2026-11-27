@@ -1,33 +1,14 @@
 """
-Unit tests for Overview / Synopsis Query Intent and Lead-Chunk Anchoring.
+Unit tests for reranker candidate retention on overview-style queries.
 
-Verifies:
-1. is_overview_query detects overview inquiries ('tell me about', 'summary', 'synopsis', 'overview', etc.).
-2. rerank_chunks preserves up to top_k candidates without context starvation.
+Verifies that rerank_chunks preserves up to top_k candidates without context starvation.
+(Overview detection itself is now the LLM query classifier: see test_query_classification.py.)
 """
 
 from unittest.mock import MagicMock, patch
 import pytest
 
-from app.services.query import is_overview_query
 from app.services.reranker import rerank_chunks
-
-
-class TestOverviewQueryDetection:
-    """Test detection of broad document overview/synopsis questions."""
-
-    def test_overview_phrases(self):
-        assert is_overview_query("Tell me about it ends with us")
-        assert is_overview_query("What is this book about?")
-        assert is_overview_query("Can you give me an overview of the document?")
-        assert is_overview_query("Summarize the novel")
-        assert is_overview_query("Who wrote this paper and what is the synopsis?")
-        assert is_overview_query("What is the plot summary?")
-
-    def test_specific_questions_not_overview(self):
-        assert not is_overview_query("What is Lily's phone number?")
-        assert not is_overview_query("How much did the revenue increase in Q2?")
-        assert not is_overview_query("Where did Ryle go after the restaurant?")
 
 
 class TestRerankerCandidateRetention:

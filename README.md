@@ -8,7 +8,7 @@
 [![Qdrant Cloud](https://img.shields.io/badge/Qdrant-Hybrid%20Search%20(RRF)-red?logo=qdrant&logoColor=white)](https://qdrant.tech/)
 [![DuckDB](https://img.shields.io/badge/DuckDB-OLAP%20SQL-FFF000?logo=duckdb&logoColor=black)](https://duckdb.org/)
 [![4-Tier LLM Fallback](https://img.shields.io/badge/LLM%20Orchestrator-4--Tier%20Failover-success)](https://github.com/YashMittal1503/RAG-PROJECT)
-[![Mistral AI](https://img.shields.io/badge/Mistral%20AI-RAGAS%20Judge-FD6F00?logo=mistralai&logoColor=white)](https://mistral.ai/)
+[![Mistral AI](https://img.shields.io/badge/Mistral%20AI-Tier%202%20LLM-FD6F00?logo=mistralai&logoColor=white)](https://mistral.ai/)
 [![Pydantic Logfire](https://img.shields.io/badge/Logfire-Observability-E92063?logo=pydantic&logoColor=white)](https://logfire.pydantic.dev/)
 [![Tests: 78 Passing](https://img.shields.io/badge/Tests-78%20Passing-brightgreen)](backend/tests/)
 
@@ -28,31 +28,38 @@ In production RAG systems, relying on a single LLM API key or a single provider 
               ▼
   ┌────────────────────────────────────────────────────────────────────────┐
   │ TIER 1: Groq Cloud LPUs (Ultra-fast, sub-second TTFT)                  │
-  │ Models: llama-3.3-70b-versatile, gpt-oss-120b, qwen3.8-27b            │
+  │ Models: gpt-oss-120b, qwen3.8-27b (free limits are per model)          │
   │ Key Pool: GROQ_API_KEY, GROQ_API_KEY_2, GROQ_API_KEY_3...              │
   │ ↳ Round-Robin selection across active keys                             │
-  │ ↳ On 429/TPM: Key quarantined for 60s cooldown; rotate to next key    │
+  │ ↳ On 429/TPM: key quarantined for 60s for that model only              │
   └───────────────────────────────────┬────────────────────────────────────┘
-                                      │ (All Tier 1 keys rate-limited / failed)
+                                      │ (Tier 1 rate-limited / failed)
                                       ▼
   ┌────────────────────────────────────────────────────────────────────────┐
-  │ TIER 2: Mistral AI (Generous 500,000 TPM & 12.5 RPS tier)              │
+  │ TIER 2: NVIDIA NIM (free, ~40 RPM, large open models)                  │
+  │ Models: nemotron-3-ultra-550b, minimax-m3.1-flash (NVIDIA_*_MODEL)    │
+  │ Key Pool: NVIDIA_API_KEY, NVIDIA_API_KEY_2...                          │
+  └───────────────────────────────────┬────────────────────────────────────┘
+                                      │ (Tier 2 rate-limited / failed)
+                                      ▼
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │ TIER 3: Mistral AI                                                      │
   │ Models: ministral-3b-2512, mistral-small-latest                       │
   │ Key Pool: MISTRAL_API_KEY, MISTRAL_API_KEY_2, MISTRAL_API_KEY_3...     │
   │ ↳ Round-Robin selection; automatic 60s quarantine on 429               │
   └───────────────────────────────────┬────────────────────────────────────┘
-                                      │ (All Tier 2 keys rate-limited / failed)
+                                      │ (Tier 3 rate-limited / failed)
                                       ▼
   ┌────────────────────────────────────────────────────────────────────────┐
-  │ TIER 3: Google Gemini Flash (Massive 1M+ token context window)         │
+  │ TIER 4: Google Gemini Flash (Massive 1M+ token context window)         │
   │ Models: gemini-flash-latest, gemini-3.6-flash                          │
   │ Key Pool: GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3...       │
   │ ↳ Round-Robin selection; automatic 60s quarantine on 429               │
   └───────────────────────────────────┬────────────────────────────────────┘
-                                      │ (All Tier 3 keys rate-limited / failed)
+                                      │ (Tier 4 rate-limited / failed)
                                       ▼
   ┌────────────────────────────────────────────────────────────────────────┐
-  │ TIER 4: OpenRouter (Universal fail-safe multi-model fallback)          │
+  │ TIER 5: OpenRouter (Universal fail-safe multi-model fallback)          │
   │ Models: deepseek/deepseek-chat, meta-llama/llama-3.3-70b-instruct      │
   │ Key Pool: OPENROUTER_API_KEY, OPENROUTER_API_KEY_2...                  │
   └────────────────────────────────────────────────────────────────────────┘
@@ -60,11 +67,12 @@ In production RAG systems, relying on a single LLM API key or a single provider 
 
 ### Key Capabilities of the LLM Orchestrator:
 1. **Multi-Key Pooling Per Tier:** Up to 3+ API keys configured per tier (`_KEY`, `_KEY_2`, `_KEY_3` or comma-separated lists) distributed in round-robin sequence.
-2. **429 / TPM Quarantine Cooldown:** If an API key hits rate limits (HTTP 429, RPM, or TPM quota exhaustion), it is quarantined for 60 seconds. Active non-cooling keys are picked first.
-3. **Intra-Tier Exhaustion Before Escalation:** All healthy keys in Tier 1 are exhausted before escalating to Tier 2 (Mistral), Tier 3 (Gemini), or Tier 4 (OpenRouter).
-4. **All-Quarantined Soonest Recovery:** If all keys in a tier are cooling down, the orchestrator automatically picks the key whose cooldown expires soonest, or falls through to the next available tier.
-5. **Zero SDK Retry Freezes:** All clients are instantiated with `max_retries=0`. Instead of freezing for 10–60 seconds in SDK exponential backoff loops, rate limits trigger immediate failover in milliseconds.
-6. **Mid-Stream Failure Resilience:** If an error occurs before streaming begins, it seamlessly re-routes to the next provider. If a provider aborts mid-stream, the system appends a non-breaking inline notification without dropping the SSE connection.
+2. **Per-Model 429 / TPM Quarantine:** If a key hits a rate limit (HTTP 429, RPM or TPM), it is quarantined for 60 seconds *for that model only*. Groq's free limits are per model, so the key keeps serving the other models.
+3. **Healthy Keys First, Across Every Tier:** Every ready key on every tier (Groq → NVIDIA NIM → Mistral → Gemini → OpenRouter) is tried before any key that is still cooling down.
+4. **All-Quarantined Soonest Recovery:** If every key everywhere is cooling down, keys are retried in order of soonest recovery.
+5. **Dead Models Are Skipped:** A model that returns 404 / "decommissioned" is skipped for the rest of the request without quarantining the key.
+6. **Zero SDK Retry Freezes:** All clients are instantiated with `max_retries=0`. Instead of freezing for 10–60 seconds in SDK exponential backoff loops, rate limits trigger immediate failover in milliseconds.
+7. **Mid-Stream Failure Resilience:** If an error occurs before streaming begins, it seamlessly re-routes to the next provider. If a provider aborts mid-stream, the system appends a non-breaking inline notification without dropping the SSE connection.
 7. **Universal Credential Masking:** Every API key is automatically masked (`gsk_...9cYD`, `AIza...3a4f`) across all Logfire spans and console logs to prevent secret leakage.
 
 ---
@@ -73,7 +81,7 @@ In production RAG systems, relying on a single LLM API key or a single provider 
 
 ### 1. Dual-Engine Pipeline: Hybrid RAG + Analytical Text-to-SQL
 - **Unstructured Documents (PDF / TXT):** Extracted via PyMuPDF, split with token-bounded sentence chunking, dual-embedded locally via FastEmbed for dense vectors (`BAAI/bge-small-en-v1.5`) and sparse lexical vectors (`Qdrant/bm25`), and indexed into user-isolated Qdrant Cloud collections.
-- **Tabular Datasets (CSV / XLSX):** Ingested into an embedded columnar **DuckDB** engine per user. Natural language queries are dynamically translated into safe `SELECT` SQL statements, executed in microseconds against in-memory Parquet/DuckDB tables, and summarized with LLM insights.
+- **Tabular Datasets (CSV / XLSX):** Ingested into an embedded columnar **DuckDB** engine per user. Natural language queries are translated into `SELECT` SQL, executed in a sandboxed read-only connection, and answered with a short interpretation plus the exact result table.
 
 ### 2. SOTA Hybrid Retrieval with Qdrant Reciprocal Rank Fusion (RRF)
 - **Dense + BM25 Sparse Hybrid Search:** Queries Qdrant concurrently with 384-dimensional dense vectors (semantic intent) and sparse BM25 vectors (exact keywords, model numbers, IDs, acronyms).
@@ -87,16 +95,16 @@ In production RAG systems, relying on a single LLM API key or a single provider 
 - **Guaranteed Zero Data Loss:** Short chunks ($\le 4$ sentences), spreadsheet summary chunks, and chunks without query overlap safely bypass compression. Citation anchors (`[Page X]`, `[Rows Y-Z]`) remain intact.
 
 ### 4. Conversational Intelligence & Deterministic Verification
-- **Zero-Vector Chitchat Routing:** Intent classifier separates social pleasantries (`"Hi"`, `"Thanks"`, `"What can you do?"`) from factual questions, eliminating unnecessary vector queries.
+- **LLM Query Classification:** one fast call per question decides the intent (chitchat vs retrieval), the scope (whole document, one section, document metadata, or a targeted fact) and whether it aggregates over many records. It drives chitchat routing, summary-chunk retrieval for whole-document questions, and Text-to-SQL planning. Measured with `python -m eval classify` on a labelled question set.
 - **Context-Aware Query Rewriting:** Rewrites multi-turn conversational follow-ups (e.g. `"tell me more"`, `"continue"`, `"what about his salary?"`) into standalone search queries under 20 words.
 - **Mathematical Citation Validation:** Algorithmic regex verification verifies that every cited page (`[Page X]`), row range (`[Rows Y-Z]`), or summary (`[Summary]`) genuinely exists in the retrieved context chunks, preventing hallucinated citations.
 - **Adaptive Multi-Turn Chat Auto-Naming:** Generates clean 2-to-5 word chat titles from user inquiries and assistant responses. Defeats initial conversational noise (`"hi"`) by remaining `"New conversation"` until substantive questions are asked, refining the title across turns 1–3, persisting to PostgreSQL, and streaming real-time updates via SSE with zero TTFT delay. Supports manual inline renaming.
 
-### 5. Dynamic Synthetic Testset Generator & Parallel RAGAS Evaluation
-- **Corpus Auto-Discovery:** Scans Qdrant collections to discover all uploaded documents and generates grounded synthetic `{question, ground_truth}` pairs for newly added files using Mistral AI (`ministral-3b-2512`).
-- **Persistent Evaluation Dataset:** Caches generated benchmarks in `backend/evaluation_dataset.json` so test suites expand incrementally.
-- **Concurrency-Scaled Pipeline:** Executes Phase 1 RAG retrieval concurrently across the Groq key pool (`min(len(GROQ_KEYS), 3)`), bypassing intent classification on known testset queries.
-- **Parallel Mistral Judge:** Evaluates Faithfulness, Answer Relevancy, Context Precision, and Context Recall in parallel across Mistral API keys.
+### 5. Evaluation Harness with RAGAS
+- **Hand-verified golden set:** every item has a gold answer and verbatim evidence quotes, checked against the corpus by `python -m eval validate`. LLM-drafted candidates (`python -m eval draft`) are tagged for review and never used unchecked.
+- **Layer-by-layer scoring:** judge correctness, RAGAS faithfulness / answer relevancy / context precision / context recall, evidence recall@k and MRR, citations, refusals, routing, Text-to-SQL execution accuracy, latency.
+- **Isolated eval tenant:** its own Qdrant collection and DuckDB file; never touches real users' data.
+- **Comparable runs:** bootstrap confidence intervals, paired run-vs-run comparison, per-category and per-document breakdowns, and a cross-provider judge (Gemini by default) with key rotation and on-disk caching.
 
 ### 6. Production Security & Data Isolation
 - **Magic Byte File Signature Validation:** Inspects binary headers via `python-magic` to defeat extension spoofing (e.g. executable disguised as PDF).
@@ -129,26 +137,27 @@ flowchart TD
         Rewrite --> DataCheck{Tabular Data Available?}
         DataCheck -->|Yes| TextToSQL[DuckDB Text-to-SQL Pipeline]
         TextToSQL --> GenSQL[LLM Generates SQL SELECT]
-        GenSQL --> ExecSQL[Execute in DuckDB Read-Only]
-        ExecSQL --> StreamSQL[Stream SQL Explanation + Table Result]
+        GenSQL --> ExecSQL[Execute in Sandboxed Read-Only DuckDB]
+        ExecSQL --> StreamSQL[Stream Interpretation + Exact Markdown Result Table]
         DataCheck -->|No / Vector RAG| HybridSearch[Qdrant Hybrid Search: Dense + BM25 Prefetch]
         HybridSearch --> RRF[Server-Side Reciprocal Rank Fusion RRF]
         RRF --> CrossEncoder[FlashRank Cross-Encoder Top-5]
         CrossEncoder --> Compression[Extractive Contextual Compression -25% to -45% Tokens]
         Compression --> RouterLLM[4-Tier Multi-Key LLM Fallback Orchestrator]
         RouterLLM -->|Tier 1| Groq[Groq LPU Pool: 3+ Keys]
-        RouterLLM -->|Tier 2 Fallback| Mistral[Mistral AI Pool: 12.5 RPS]
-        RouterLLM -->|Tier 3 Fallback| Gemini[Gemini Flash Pool: 3+ Keys]
-        RouterLLM -->|Tier 4 Fallback| OpenRouter[OpenRouter Pool]
+        RouterLLM -->|Tier 2 Fallback| NVIDIA[NVIDIA NIM Pool: ~40 RPM]
+        RouterLLM -->|Tier 3 Fallback| Mistral[Mistral AI Pool]
+        RouterLLM -->|Tier 4 Fallback| Gemini[Gemini Flash Pool: 3+ Keys]
+        RouterLLM -->|Tier 5 Fallback| OpenRouter[OpenRouter Pool]
         RouterLLM --> CitCheck[Deterministic Citation Validation]
         CitCheck --> StreamAns[Stream Tokens & Page Citations]
     end
 
-    subgraph Dynamic Evaluation Suite
-        Scan[Qdrant Corpus Scanner] --> DatasetStore[(evaluation_dataset.json)]
-        DatasetStore -->|Missing Doc| Synth[Ministral-3b-2512 QA Synthesizer]
-        Synth --> DatasetStore
-        DatasetStore --> Ragas[RAGAS Parallel Judge: Mistral AI Multi-Key]
+    subgraph Evaluation Harness
+        Golden[(Golden JSONL + corpus manifest)] --> EvalTenant[Isolated eval tenant: Qdrant + DuckDB]
+        EvalTenant --> Vanilla[Vanilla pipeline adapter]
+        Vanilla --> Scorers[Judge correctness + RAGAS + retrieval / SQL / routing metrics]
+        Scorers --> Reports[Reports with 95% CIs and paired comparison]
     end
 
     DirectLLM --> User
@@ -158,50 +167,11 @@ flowchart TD
 
 ---
 
-## Quantitative RAGAS Benchmark Scorecard
+## Benchmark Results
 
-Evaluated across **14 test samples spanning 4 diverse uploaded documents** (`The Ultimate Python Handbook.pdf`, `Yash_Mittal_Offer_Letter_signed.pdf`, `Can We Be Strangers Again.pdf`, and `2405.15793v3.pdf`) using `ministral-3b-2512` as the parallel Judge LLM:
+Scores come from the evaluation harness in [`backend/eval/`](backend/eval/README.md) and are published per run in `eval/runs/<run>/report.md`. The golden set is being built; numbers will appear here once it has been run.
 
-| Metric | Overall Benchmark Score | Target / Industry Standard | Status | Assessment |
-| :--- | :---: | :---: | :---: | :--- |
-| **Context Recall** | **0.9762 (97.6%)** | > 0.85 | Passed | **Flawless:** Complete retrieval coverage of ground-truth reference facts. |
-| **LLM Context Precision** | **0.9384 (93.8%)** | > 0.70 | Passed | **High Signal:** RRF + FlashRank filters out irrelevant distractors. |
-| **Faithfulness** | **0.9257 (92.6%)** | > 0.80 | Passed | **Hallucination-Free:** Generated claims strictly adhere to retrieved contexts. |
-| **Answer Relevancy** | **0.8518 (85.2%)** | > 0.80 | Passed | **On-Topic:** Answers directly address user intent without divergence. |
-| **Factual Correctness (F1)**| **0.5207 (52.1%)** | > 0.50 | Passed | **Grounded:** Strong factual alignment with synthetic reference answers. |
-
-### Per-Document Performance Breakdown
-
-```text
-======================================================================
-  PER-DOCUMENT AGGREGATES
-======================================================================
-
-  Document: Can We Be Strangers Again.pdf (2 questions)
-    [OK] faithfulness:                           1.0000
-    [OK] answer_relevancy:                       0.9135
-    [OK] llm_context_precision_without_reference: 1.0000
-    [OK] context_recall:                         1.0000
-
-  Document: 2405.15793v3.pdf (2 questions)
-    [OK] faithfulness:                           0.9445
-    [OK] answer_relevancy:                       0.8667
-    [OK] llm_context_precision_without_reference: 0.9437
-    [OK] context_recall:                         1.0000
-
-  Document: The Ultimate Python Handbook.pdf (7 questions)
-    [OK] faithfulness:                           0.9388
-    [OK] answer_relevancy:                       0.9264
-    [OK] llm_context_precision_without_reference: 0.8929
-    [OK] context_recall:                         0.9524
-
-  Document: Yash_Mittal_Offer_Letter_signed.pdf (3 questions)
-    [OK] faithfulness:                           0.8333
-    [WARN] answer_relevancy:                     0.6264
-    [OK] llm_context_precision_without_reference: 1.0000
-    [OK] context_recall:                         1.0000
-======================================================================
-```
+Earlier README figures came from the retired `ragas_eval.py`, which scored LLM-generated single-chunk questions with a 3B judge. They aren't comparable with harness results, so they were removed (the last run is recorded in the harness README for reference).
 
 ---
 
@@ -246,11 +216,11 @@ Retrieved chunks often contain several paragraphs of background information surr
 
 ### 3. In-Process DuckDB Text-to-SQL
 When a user uploads a `.csv` or `.xlsx` file:
-1. Parsed DataFrames are stored as named tables (`t_{doc_id}_{sheet}`) in `{user_id}.duckdb`.
-2. The user's table schemas, column types, and first 3 sample rows are dynamically extracted.
-3. The LLM synthesizes a DuckDB-compliant `SELECT` statement (with `TRY_CAST` numeric guards).
-4. The query executes in microseconds inside a read-only DuckDB connection (non-`SELECT` statements rejected).
-5. The LLM streams an analytical summary of the query result, and the frontend displays the executable SQL query with transparency badges.
+1. Parsed DataFrames are stored as named tables (`t_{doc_id}_{sheet}`) in `{user_id}.duckdb`. Column names become plain SQL identifiers (original headers kept as column comments) and ISO-format date columns are stored as real `DATE`/`TIMESTAMP` values.
+2. At question time the schema is described to the LLM as Markdown: types, value ranges, the exact allowed values of category columns, missing-value share and sample rows.
+3. The query classifier decides the path: whole-dataset questions ("what's in my data?") are answered from that profile without SQL; others get a DuckDB `SELECT`/`WITH` query, generated with a hint about whether the question aggregates. A failing query is repaired once using the error message.
+4. Queries run in a **sandboxed**, read-only DuckDB connection: file and network access are disabled at the engine level (so a prompt can't make the SQL read server files), one statement only, a 15-second timeout and a 100-row cap.
+5. The LLM streams a short interpretation, then the exact result is appended as a Markdown table, and the frontend shows the executed SQL.
 
 ---
 
@@ -266,10 +236,11 @@ When a user uploads a `.csv` or `.xlsx` file:
 | **Contextual Compression** | Custom Extractive Engine | Distractor sentence pruning with window expansion ($\pm 1$) |
 | **Tabular OLAP Engine** | DuckDB | In-process analytical columnar Text-to-SQL |
 | **Tier 1 LLM (Primary)** | Groq Cloud LPUs | Sub-second inference, 3+ key round-robin pool, 60s quarantine |
-| **Tier 2 LLM (High-Throughput)**| Mistral AI (`ministral-3b-2512`) | 500k TPM / 12.5 RPS multi-key pool for fast generations |
-| **Tier 3 LLM (Large-Context)** | Google Gemini Flash (`gemini-flash-latest`) | 1M+ token context window, 3+ key project pool |
-| **Tier 4 LLM (Universal)** | OpenRouter (`deepseek-chat`, `llama-3.3-70b`) | Universal fallback tier with multi-key support |
-| **RAGAS Judge LLM** | Mistral AI (`ministral-3b-2512`) | Multi-key parallel evaluation judge |
+| **Tier 2 LLM (Free, large models)** | NVIDIA NIM (`nemotron-3-ultra-550b`, `minimax-m3.1-flash`) | Free ~40 RPM, OpenAI-compatible; also the recommended eval judge |
+| **Tier 3 LLM (High-Throughput)**| Mistral AI (`ministral-3b-2512`) | Multi-key pool for fast generations |
+| **Tier 4 LLM (Large-Context)** | Google Gemini Flash (`gemini-flash-latest`) | 1M+ token context window, 3+ key project pool |
+| **Tier 5 LLM (Universal)** | OpenRouter (`deepseek-chat`, `llama-3.3-70b`) | Universal fallback tier with multi-key support |
+| **Evaluation** | RAGAS 0.4 + custom harness | Judge: Gemini Flash by default (NVIDIA / Mistral / Groq selectable; NVIDIA recommended), multi-key rotation |
 | **Observability** | Pydantic Logfire | End-to-end distributed tracing with automatic key masking |
 | **Relational Database** | Supabase PostgreSQL | SQLAlchemy 2.0 Async + Alembic migrations |
 | **Authentication & Storage** | Supabase Auth & Storage | JWT session auth & document storage |
@@ -309,30 +280,24 @@ backend/tests/test_parsing.py ..                                         [100%]
 ### Test Suite Directory:
 - `tests/test_chat_title.py`: Normalization/cleaning of LLM title outputs (2–5 words), social pleasantry detection, substantive topic synthesis from question + answer, error fallbacks, and session PATCH endpoint.
 - `tests/test_llm_key_rotation.py`: Multi-key round-robin rotation, 429 quarantine isolation, cooldown recovery, and all-keys-quarantined graceful fallback.
-- `tests/test_llm_fallback.py`: 4-tier cascading cross-provider fallback (Groq $\rightarrow$ Mistral $\rightarrow$ Gemini $\rightarrow$ OpenRouter) for streaming and non-streaming calls, mid-stream failure recovery.
+- `tests/test_llm_fallback.py`: cascading cross-provider fallback (Groq $\rightarrow$ NVIDIA NIM $\rightarrow$ Mistral $\rightarrow$ Gemini $\rightarrow$ OpenRouter); `tests/test_llm_provider_tiers.py`: per-model cooldowns, dead-model skipping, healthy-keys-first ordering for streaming and non-streaming calls, mid-stream failure recovery.
 - `tests/test_contextual_compression.py`: Sentence keyword scoring, density bonus, window expansion ($\pm 1$), short-chunk bypass, zero-match fallback, and citation preservation.
 - `tests/test_hybrid_search.py`: Dense + BM25 sparse vector generation, Qdrant payload schema indexing, and RRF prefetch validation.
 - `tests/test_file_validation.py`: Magic byte binary header identification, macro-enabled file blocking, and spoofed extension defense.
-- `tests/test_chunking.py`: Token-bounded sentence splitting, abbreviation preservation (`Dr.`, `e.g.`), and summary chunk creation.
+- `tests/test_chunking.py`: Token-bounded sentence splitting, abbreviation preservation (`Dr.`, `e.g.`), and page-boundary-aware chunking.
 - `tests/test_citation_validation.py`: Regex claim verification for `[Page X]`, `[Rows Y-Z]`, and `[Summary]` citation tags.
 
 ---
 
-## Running Dynamic RAGAS Evaluation
+## Evaluation Harness
 
-The project includes an autonomous RAGAS evaluation harness (`ragas_eval.py`):
+Architecture comparisons and regression checks use the evaluation harness in [`backend/eval/`](backend/eval/README.md). It runs on a hand-verified golden dataset with an isolated eval tenant, and reports per-category and per-document metrics (judge correctness, RAGAS faithfulness / answer relevancy / context precision / context recall, evidence recall, MRR, citations, abstention, routing, Text-to-SQL accuracy, latency) with confidence intervals and paired run-vs-run comparison.
 
 ```bash
 cd backend
-.\venv\Scripts\python.exe ragas_eval.py
+pip install -r requirements-eval.txt
+python -m eval run --system vanilla
 ```
-
-### What Happens When You Run `ragas_eval.py`:
-1. **Dynamic Corpus Discovery:** Automatically connects to your Qdrant collection, scans all uploaded documents, and checks `backend/evaluation_dataset.json`.
-2. **Synthetic Question Generation:** For any newly discovered document without test cases, synthesizes 2 grounded questions and ground-truth answers using Mistral AI (`ministral-3b-2512`) and saves them to the dataset.
-3. **Optimized Phase 1 Generation:** Concurrently runs the live RAG pipeline across your Groq key pool (`min(len(GROQ_KEYS), 3)`), using direct factual retrieval (skipping chitchat classification) with zero artificial delay.
-4. **Parallel Mistral Judge:** Uses Langchain `ChatMistralAI` distributed across your Mistral API keys to compute Faithfulness, Answer Relevancy, Context Precision, and Context Recall in parallel.
-5. **Per-Document Export:** Prints aggregate metrics and saves full granular metrics to `backend/ragas_results.json`.
 
 ---
 
@@ -345,9 +310,10 @@ cd backend
 - Qdrant Cloud Cluster URL & API Key
 - API Key(s) for LLM Tiers:
   - **Groq Cloud API Key(s)** (Primary Tier 1)
-  - **Mistral AI API Key(s)** (Tier 2 & RAGAS Judge)
-  - **Google Gemini API Key(s)** (Tier 3 Fallback)
-  - **OpenRouter API Key(s)** (Tier 4 Fallback)
+  - **NVIDIA NIM API Key(s)** (Tier 2; free at build.nvidia.com; recommended eval judge)
+  - **Mistral AI API Key(s)** (Tier 3; optional eval judge)
+  - **Google Gemini API Key(s)** (Tier 4 Fallback; default eval judge)
+  - **OpenRouter API Key(s)** (Tier 5 Fallback)
 
 ---
 
@@ -394,13 +360,16 @@ cd backend
    GROQ_API_KEY_3=gsk_key_3
    GROQ_MODEL=openai/gpt-oss-120b
 
-   # ── Tier 2: Mistral AI (High-Throughput & RAGAS Judge) ───────────────────
+   # ── Tier 2: NVIDIA NIM (free, ~40 RPM: https://build.nvidia.com) ────────
+   NVIDIA_API_KEY=nvapi-your_key
+
+   # ── Tier 3: Mistral AI (High-Throughput; optional eval judge) ───────────
    MISTRAL_API_KEY=your_mistral_key_1
    MISTRAL_API_KEY_2=your_mistral_key_2
    MISTRAL_API_KEY_3=your_mistral_key_3
    MISTRAL_MODEL=ministral-3b-2512
 
-   # ── Tier 3: Google Gemini Flash (Large Context Fallback) ─────────────────
+   # ── Tier 4: Google Gemini Flash (Large Context Fallback) ─────────────────
    GEMINI_API_KEY=AIza_key_1
    GEMINI_API_KEY_2=AIza_key_2
    GEMINI_API_KEY_3=AIza_key_3

@@ -61,8 +61,11 @@ class TestLLMTargetBuilding:
     """Test resolution of multi-tier provider chains."""
 
     def test_default_targets_groq_only(self):
+        import app.services.llm_provider as lp
         from app.config import Settings
+        lp.reset_pools()
         with patch.object(Settings, "get_mistral_keys", return_value=[]), \
+             patch.object(Settings, "get_nvidia_keys", return_value=[]), \
              patch.object(Settings, "get_gemini_keys", return_value=[]), \
              patch.object(Settings, "get_openrouter_keys", return_value=[]), \
              patch("app.services.llm_provider._mistral_client", None), \
