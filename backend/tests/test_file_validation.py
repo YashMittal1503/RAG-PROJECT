@@ -68,16 +68,15 @@ class TestValidateFileType:
         file_type, mime = validate_file_type(buf.getvalue(), "data.xlsx")
         assert file_type == "xlsx"
 
-    def test_generic_zip_named_xlsx_is_accepted(self):
+    def test_generic_zip_named_xlsx_is_accepted(self, monkeypatch):
         """Some libmagic versions report an XLSX as plain application/zip; the .xlsx name decides."""
-        import io
-        import zipfile
+        # What libmagic reports differs between versions, so pin its answer and test our own branch.
+        from app.utils import file_validation
 
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w") as z:
-            z.writestr("sheet.txt", "a,b\n1,2\n")
-        file_type, mime = validate_file_type(buf.getvalue(), "data.xlsx")
+        monkeypatch.setattr(file_validation.magic, "from_buffer", lambda *a, **k: "application/zip")
+        file_type, mime = validate_file_type(b"PK\x03\x04" + b"\x00" * 64, "data.xlsx")
         assert file_type == "xlsx"
+        assert mime == "application/zip"
 
     def test_empty_filename_handling(self):
         """Should handle files with unusual names gracefully."""
