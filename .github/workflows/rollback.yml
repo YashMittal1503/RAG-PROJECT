@@ -1,0 +1,69 @@
+name: Roll back backend
+
+# Actions tab -> "Roll back backend" -> Run workflow -> paste the commit to go back to.
+# Moves the `production` tag to that commit's image; the EC2 agent deploys it within ~2 minutes.
+# Database migrations are not undone: roll back only to a commit that works with the current schema.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit SHA to put back in production (full 40 characters, from the commit list or an earlier release run)"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/yashmittal1503/doctalk-backend
+  PRODUCTION_URL: ${{ vars.PRODUCTION_URL || 'https://yash--mittal.duckdns.org' }}
+
+jobs:
+  rollback:
+    name: Roll back production
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ env.PRODUCTION_URL }}
+    steps:
+      - name: Check the commit
+        env:
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          if ! printf '%s' "$COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::Give the full 40-character commit SHA"
+            exit 1
+          fi
+          echo "COMMIT=$COMMIT" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point the production tag at that commit
+        run: |
+          if ! docker buildx imagetools inspect "$IMAGE:$COMMIT" >/dev/null 2>&1; then
+            echo "::error::No image for $COMMIT. Only commits released by the 'Release backend' workflow have one."
+            exit 1
+          fi
+          docker buildx imagetools create -t "$IMAGE:production" "$IMAGE:$COMMIT"
+
+      - name: Wait for the server to run it
+        run: |
+          deadline=$((SECONDS + 15 * 60))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            live="$(curl -fsS --max-time 10 "$PRODUCTION_URL/api/health" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("commit",""))' 2>/dev/null || true)"
+            if [ "$live" = "$COMMIT" ]; then echo "Live: $COMMIT"; exit 0; fi
+            echo "Live commit: ${live:-unreachable}; waiting for $COMMIT"
+            sleep 20
+          done
+          echo "::error::$COMMIT is not live after 15 minutes. If that image was marked bad, on the server: sudo FORCE=1 /opt/doctalk/doctalk-deploy.sh"
+          exit 1

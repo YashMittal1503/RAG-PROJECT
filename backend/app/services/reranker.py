@@ -7,6 +7,7 @@ search to significantly improve Context Precision.
 """
 
 import logging
+import os
 import threading
 import time
 from typing import Optional
@@ -29,7 +30,8 @@ def init_ranker(model_name: str = "ms-marco-TinyBERT-L-2-v2") -> Ranker:
     if _ranker is None:
         logger.info(f"Loading FlashRank reranker model: {model_name}")
         t0 = time.time()
-        ranker = Ranker(model_name=model_name)
+        # FLASHRANK_CACHE_DIR: the Docker image bakes the model in, so a restart doesn't download it again.
+        ranker = Ranker(model_name=model_name, cache_dir=os.environ.get("FLASHRANK_CACHE_DIR", "/tmp"))
 
         # Optimize the underlying ONNX Runtime session
         try:

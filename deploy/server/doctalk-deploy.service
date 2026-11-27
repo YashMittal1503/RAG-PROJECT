@@ -1,0 +1,11 @@
+[Unit]
+Description=DocTalk deploy agent (pull the production image, migrate, health-check, roll back on failure)
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/doctalk/doctalk-deploy.sh
+# A deploy waits up to HEALTH_TIMEOUT for the new container, twice if it has to roll back.
+TimeoutStartSec=15min
