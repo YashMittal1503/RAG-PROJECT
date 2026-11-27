@@ -7,7 +7,7 @@
 ![Next.js](https://img.shields.io/badge/Next.js-16-black?logo=next.js&logoColor=white)
 ![Qdrant](https://img.shields.io/badge/Qdrant-Hybrid%20Search-DC244C)
 ![DuckDB](https://img.shields.io/badge/DuckDB-Text--to--SQL-FFF000?logo=duckdb&logoColor=black)
-![Tests](https://img.shields.io/badge/tests-235%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-242%20passing-brightgreen)
 
 DocTalk is a full-stack, multi-tenant assistant for asking questions about your own files. Upload PDFs, text files and spreadsheets, ask in plain English, and get a streamed answer grounded in your documents, with page citations for text and the exact SQL and result table for spreadsheets.
 
@@ -201,7 +201,7 @@ The baseline run was also scored by the LLM judge and RAGAS (judge: NVIDIA Nemot
 │   ├── alembic/                 # database migrations
 │   ├── eval/                    # evaluation harness, golden set, scorers, dashboard
 │   ├── scripts/                 # re-index existing documents
-│   └── tests/                   # 235 tests
+│   └── tests/                   # 242 tests
 ├── frontend/                    # Next.js app (login, dashboard, streaming chat)
 ├── .github/workflows/           # CI and Docker image publishing
 ├── docker-compose.yml
@@ -272,7 +272,7 @@ cd backend
 pytest tests -q
 ```
 
-235 tests run in under a minute with no network access or API keys: LLM clients, Qdrant and storage are mocked. They cover key rotation and cooldowns, cross-provider failover (streaming and non-streaming, including mid-stream failures), error classification, query classification, document routing and clarification, the spreadsheet routing guard, the SQL sandbox and validator, Text-to-SQL planning, chunking, PDF parsing and OCR fallback, compression, hybrid search, file validation, chat titles and the evaluation harness itself.
+242 tests run in about a minute with no network access or API keys: LLM clients, Qdrant and storage are mocked. They cover the HTTP API, JWT authentication, key rotation and cooldowns, cross-provider failover (streaming and non-streaming, including mid-stream failures), error classification, query classification, document routing and clarification, the spreadsheet routing guard, the SQL sandbox and validator, Text-to-SQL planning, chunking, PDF parsing and OCR fallback, compression, hybrid search, file validation, chat titles and the evaluation harness itself.
 
 CI (GitHub Actions) runs the backend tests and the frontend lint and production build on every push and pull request; pushes to `main` also build the backend Docker image and publish it to GHCR, where Watchtower on the EC2 host picks it up.
 
